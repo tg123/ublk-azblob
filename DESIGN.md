@@ -110,7 +110,7 @@ with explicit flush on `REQ_FUA` / `REQ_FLUSH` is a Phase 2 optimization.
 SharedKey path with Azurite's well-known development account key.  The `SharedKeyPolicy`
 is injected into the SDK's `ClientOptions::per_try_policies` — this lets us sign
 requests with HMAC-SHA256 without going through the `TokenCredential` interface
-(which only covers ******
+(which only covers Bearer-token / Entra ID credentials, not SharedKey HMAC signing).
 
 ### 5. Concurrency
 

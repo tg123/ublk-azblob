@@ -27,13 +27,11 @@ echo "Size     : $BLOB_SIZE bytes"
 echo ""
 
 echo "--- Running BlobBackend smoke test against Azurite ---"
-ublk-azblob test \
-  --storage-account   "$AZURE_STORAGE_ACCOUNT" \
-  --storage-key       "$AZURE_STORAGE_KEY" \
-  --storage-endpoint  "$AZURE_STORAGE_ENDPOINT" \
-  --container         "$AZURE_STORAGE_CONTAINER" \
-  --blob              "$AZURE_STORAGE_BLOB" \
-  --size              "$BLOB_SIZE"
+# The CLI reads account/key/endpoint/container/blob from environment variables
+# (AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY, AZURE_STORAGE_ENDPOINT,
+#  AZURE_STORAGE_CONTAINER, AZURE_STORAGE_BLOB) set by docker-compose.
+# Only --size is passed explicitly (no env-var equivalent for the test subcommand).
+ublk-azblob test --size "$BLOB_SIZE"
 
 echo ""
 echo "=== All e2e assertions passed ==="

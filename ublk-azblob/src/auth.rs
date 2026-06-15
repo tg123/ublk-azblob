@@ -100,7 +100,7 @@ pub fn build_container_client(
             debug!(account = %account_name, "using SharedKey credential");
             let policy = SharedKeyPolicy::new(account_name.clone(), account_key.clone())
                 .context("create SharedKeyPolicy")?;
-            // Use `None` credential so the SDK doesn't add a ******;
+            // Use `None` credential so the SDK doesn't add a Bearer-token Authorization header;
             // our SharedKeyPolicy is injected via `client_options.per_try_policies`.
             let mut container_opts = BlobContainerClientOptions::default();
             container_opts

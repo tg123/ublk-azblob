@@ -8,6 +8,8 @@ jobs:
   lint-and-unit:
     name: fmt / clippy / unit tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +31,8 @@ jobs:
   e2e:
     name: e2e (BlobBackend ↔ Azurite)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
