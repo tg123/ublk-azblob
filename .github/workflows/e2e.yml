@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-unit:
+    name: fmt / clippy / unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: cargo test (unit tests, MemBackend — no kernel required)
+        run: cargo test
+
+  e2e:
+    name: e2e (BlobBackend ↔ Azurite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run docker-compose e2e pipeline
+        run: |
+          docker compose -f tests/e2e/docker-compose.yml \
+            up --build --abort-on-container-exit --exit-code-from test-runner
+        # NOTE: The full kernel ublk device path (/dev/ublkbN) is SKIPPED here.
+        # GitHub-hosted runners do not provide ublk_drv or CAP_SYS_ADMIN.
+        # This job tests the AzurePageBlobBackend ↔ Azurite REST path only.
+        # To run the full kernel path, use a self-hosted runner with:
+        #   - Linux kernel ≥ 6.0
+        #   - `modprobe ublk_drv`
+        #   - root / CAP_SYS_ADMIN
+        #   - `cargo build --features ublk && sudo ./target/release/ublk-azblob run ...`
+
+      - name: Print docker-compose logs on failure
+        if: failure()
+        run: docker compose -f tests/e2e/docker-compose.yml logs

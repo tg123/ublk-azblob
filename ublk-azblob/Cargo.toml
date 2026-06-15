@@ -1,0 +1,59 @@
+[package]
+name = "ublk-azblob"
+version = "0.1.0"
+edition = "2021"
+description = "Linux ublk userspace block device backed by Azure Page Blob"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tg123/ublk-azblob"
+
+[[bin]]
+name = "ublk-azblob"
+path = "src/main.rs"
+
+[dependencies]
+# Azure SDK — pinned exact versions; the SDK is 0.x/preview and API churn is expected.
+# Wrap all SDK types behind BlobBackend trait so SDK upgrades don't ripple into the I/O loop.
+azure_core = "1.0.0"
+azure_storage_blob = "1.0.0"
+azure_identity = "1.0.0"
+
+# Async runtime
+tokio = { version = "1.52.3", features = ["full"] }
+
+# Async traits
+async-trait = "0.1.89"
+
+# Byte buffers
+bytes = "1.11.1"
+
+# Error handling
+anyhow = "1.0.102"
+
+# CLI argument parsing
+clap = { version = "4.6.1", features = ["derive", "env"] }
+
+# Logging / tracing
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# HMAC-SHA256 for Azure Storage SharedKey authentication (Azurite / account-key mode)
+hmac-sha256 = "1.1.14"
+
+# Base64 encoding for SharedKey auth and HMAC digests
+base64 = "0.22.1"
+
+# Time handling (for x-ms-date header in SharedKey auth)
+time = { version = "0.3", features = ["formatting"] }
+
+# ublk Rust binding — Linux userspace block driver over io_uring.
+# Requires Linux ≥6.0 with ublk_drv loaded and root/CAP_SYS_ADMIN.
+# The ublk target is conditionally compiled; set UBLK_AVAILABLE=1 or use the
+# --features ublk flag.  Without it, the I/O loop is stubbed with TODOs.
+libublk = { version = "0.4.6", optional = true }
+
+[features]
+# Enable the real ublk target (requires Linux ≥6.0 + ublk_drv loaded).
+ublk = ["dep:libublk"]
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["full", "test-util"] }
