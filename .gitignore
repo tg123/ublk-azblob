@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Env / secrets
+.env
+*.env.local
+
+# Logs
+*.log
+
+# e2e generated artifacts
+/tests/e2e/certs/*.crt
+/tests/e2e/certs/*.key
+
+# Editor
+.vscode/
+.idea/
+*.swp
