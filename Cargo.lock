@@ -2540,6 +2540,7 @@ dependencies = [
  "bytes",
  "clap",
  "hmac-sha256",
+ "libc",
  "libublk",
  "time",
  "tokio",

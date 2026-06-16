@@ -51,9 +51,12 @@ time = { version = "0.3", features = ["formatting"] }
 # --features ublk flag.  Without it, the I/O loop is stubbed with TODOs.
 libublk = { version = "0.4.6", optional = true }
 
+# Raw libc bindings — only needed by the ublk I/O loop (errno constants, signals).
+libc = { version = "0.2.186", optional = true }
+
 [features]
 # Enable the real ublk target (requires Linux ≥6.0 + ublk_drv loaded).
-ublk = ["dep:libublk"]
+ublk = ["dep:libublk", "dep:libc"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full", "test-util"] }

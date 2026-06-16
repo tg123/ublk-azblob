@@ -92,6 +92,11 @@ enum Command {
         /// Queue depth (concurrent in-flight I/Os per queue).
         #[arg(long, default_value = "64")]
         queue_depth: u16,
+
+        /// ublk device id to request (`-1` lets the kernel auto-allocate the
+        /// next free `/dev/ublkbN`).
+        #[arg(long, default_value = "-1")]
+        id: i32,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -133,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
             create,
             nr_queues,
             queue_depth,
+            id,
         } => {
             if create {
                 info!(size, blob = %cli.blob, "creating page blob");
@@ -147,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
                 dev_size: actual_size,
                 nr_queues,
                 queue_depth,
+                id,
             };
             ublk_target::run_ublk_target(backend, cfg)
                 .await
