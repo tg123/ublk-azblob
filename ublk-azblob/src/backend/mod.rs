@@ -5,6 +5,7 @@
 
 pub mod azure;
 pub mod buffered;
+pub mod file;
 pub mod mem;
 
 use async_trait::async_trait;
