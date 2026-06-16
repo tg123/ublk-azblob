@@ -25,9 +25,11 @@ use auth::{AuthConfig, UserAssignedIdentity};
 use backend::{
     azure::AzurePageBlobBackend,
     buffered::{BufferedBackend, BufferedConfig},
+    file::{FileCacheBackend, FileCacheConfig},
     BlobBackend,
 };
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -184,6 +186,22 @@ enum Command {
         /// `HOSTNAME`, then `unknown-node`).
         #[arg(long, env = "UBLK_LEASE_HOLDER")]
         lease_holder: Option<String>,
+
+        /// Directory for the persistent local-disk cache.
+        ///
+        /// When set, a local-disk cache layer is inserted between the in-memory
+        /// write-back buffer and Azure, forming a multi-level cache
+        /// (memory → local disk → blob).  Cached pages — including unflushed
+        /// *dirty* pages — survive a restart: on startup the cache is recovered
+        /// from disk and any recovered dirty pages are flushed to the blob.
+        #[arg(long, env = "UBLK_CACHE_DIR")]
+        cache_dir: Option<PathBuf>,
+
+        /// Local-disk cache page size in bytes (must be a multiple of 512).
+        ///
+        /// Only used when `--cache-dir` is set.
+        #[arg(long, default_value = "1048576", env = "UBLK_CACHE_PAGE_SIZE")]
+        cache_page_size: u64,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -246,6 +264,8 @@ async fn main() -> anyhow::Result<()> {
             ref lease_namespace,
             ref lease_name,
             ref lease_holder,
+            ref cache_dir,
+            cache_page_size,
         } => {
             let backend = build_azure_backend(&cli, &endpoint)?;
             if create {
@@ -274,6 +294,44 @@ async fn main() -> anyhow::Result<()> {
                 )
             } else {
                 None
+            };
+
+            // Optional local-disk cache layer (memory → local disk → blob).
+            let backend: Arc<dyn BlobBackend> = if let Some(dir) = cache_dir.clone() {
+                info!(
+                    cache_dir = %dir.display(),
+                    cache_page_size,
+                    "local-disk cache enabled"
+                );
+                let (cache, recovered_dirty) = FileCacheBackend::open(
+                    backend,
+                    FileCacheConfig {
+                        dir,
+                        name: cache_file_name(
+                            &cli.container,
+                            cli.blob.as_deref().unwrap_or_default(),
+                        ),
+                        page_size: cache_page_size,
+                    },
+                    actual_size,
+                )
+                .context("open local-disk cache")?;
+                let cache: Arc<dyn BlobBackend> = Arc::new(cache);
+                // Recovered dirty pages (written before a previous restart but
+                // never flushed) are pushed to the blob now that we are back up.
+                if recovered_dirty > 0 {
+                    info!(
+                        recovered_dirty,
+                        "flushing recovered dirty cache pages to blob"
+                    );
+                    cache
+                        .flush()
+                        .await
+                        .context("flush recovered dirty cache pages")?;
+                }
+                cache
+            } else {
+                backend
             };
 
             // Wrap with write-back buffer if page_size > 0.
@@ -467,6 +525,23 @@ async fn acquire_coordination(
 }
 
 // ── Auth builder ─────────────────────────────────────────────────────────────
+
+/// Build a filesystem-safe cache file base name from the container and blob.
+///
+/// Container/blob names may contain `/` and other characters; sanitizing to a
+/// fixed alphabet (alphanumerics plus `-` and `_`) keeps the cache files inside
+/// the chosen `--cache-dir` and prevents path traversal (e.g. `..`).
+fn cache_file_name(container: &str, blob: &str) -> String {
+    let mut name = String::with_capacity(container.len() + blob.len() + 1);
+    for ch in format!("{container}-{blob}").chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            name.push(ch);
+        } else {
+            name.push('_');
+        }
+    }
+    name
+}
 
 fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
     if let Some(key) = &cli.account_key {

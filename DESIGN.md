@@ -81,8 +81,17 @@ the `BlobBackend` trait:
 ```
 BlobBackend::read/write/clear/flush/size  ←  only interface the I/O loop sees
 AzurePageBlobBackend                      ←  all SDK types live here
+BufferedBackend                           ←  in-memory write-back cache (wraps any backend)
+FileCacheBackend                          ←  persistent local-disk cache (wraps any backend)
 MemBackend                                ←  in-memory, no network, for unit tests
 ```
+
+Because every layer implements `BlobBackend`, they compose into a *multi-level*
+cache — for example `BufferedBackend` (memory) → `FileCacheBackend` (local disk)
+→ `AzurePageBlobBackend` (blob).  The local-disk cache persists its `present` /
+`dirty` page bitmaps so that **dirty pages survive a restart**: on startup the
+cache is recovered from disk and any recovered dirty pages are flushed to the
+blob.
 
 A future SDK upgrade only requires modifying `src/backend/azure.rs`.
 
@@ -207,6 +216,9 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 
 ### Phase 2 — Performance
 - Read cache (LRU, configurable size)
+- ✅ Persistent local-disk cache (`FileCacheBackend`), composable into a
+  multi-level cache (memory → local disk → blob) with crash-recoverable dirty
+  pages that are flushed to the blob on restart
 - Write coalescing (merge adjacent pages before `upload_pages`)
 - Multiple queues / true async (one Tokio task per queue)
 - FLUSH / FUA handling (drain write buffer before responding)

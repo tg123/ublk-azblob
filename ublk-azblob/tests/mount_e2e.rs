@@ -49,6 +49,24 @@ const DEV_ID: &str = "0";
 const BLOB_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 const NUM_FILES: usize = 8;
 
+/// Parameters identifying a single device instance for a test run.
+///
+/// Each test uses its own `dev_id`, container and blob so independent tests
+/// never collide on `/dev/ublkbN` or on the backing blob.  `cache_dir`, when
+/// `Some`, enables the persistent local-disk cache layer.
+struct DeviceSpec {
+    dev_id: String,
+    container: String,
+    blob: String,
+    cache_dir: Option<PathBuf>,
+}
+
+impl DeviceSpec {
+    fn dev_path(&self) -> String {
+        format!("/dev/ublkb{}", self.dev_id)
+    }
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -76,7 +94,7 @@ fn run(cmd: &str, args: &[&str]) {
 }
 
 /// Common Azure environment passed to the `ublk-azblob` child process.
-fn azure_env(cmd: &mut Command) {
+fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
     cmd.env(
         "AZURE_STORAGE_ACCOUNT",
         env_or("AZURE_STORAGE_ACCOUNT", DEFAULT_ACCOUNT),
@@ -89,14 +107,8 @@ fn azure_env(cmd: &mut Command) {
         "AZURE_STORAGE_ENDPOINT",
         env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT),
     )
-    .env(
-        "AZURE_STORAGE_CONTAINER",
-        env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
-    )
-    .env(
-        "AZURE_STORAGE_BLOB",
-        env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB),
-    );
+    .env("AZURE_STORAGE_CONTAINER", container)
+    .env("AZURE_STORAGE_BLOB", blob);
 }
 
 /// Start the ublk device as a child process and wait for `/dev/ublkbN` to
@@ -105,32 +117,40 @@ fn azure_env(cmd: &mut Command) {
 /// The returned `Child` is always `wait()`ed on by the caller (via
 /// `stop_device`), so the zombie-process lint does not apply.
 #[allow(clippy::zombie_processes)]
-fn start_device(dev: &str, create: bool) -> Child {
+fn start_device(spec: &DeviceSpec, create: bool) -> Child {
+    let dev = spec.dev_path();
     log(&format!(
-        "starting ublk device {dev} ({})",
+        "starting ublk device {dev} ({}{})",
         if create {
             "--create"
         } else {
             "reuse existing blob"
-        }
+        },
+        match &spec.cache_dir {
+            Some(d) => format!(", cache_dir={}", d.display()),
+            None => String::new(),
+        },
     ));
     let bin = env!("CARGO_BIN_EXE_ublk-azblob");
     let mut cmd = Command::new(bin);
     cmd.arg("run")
         .arg("--id")
-        .arg(DEV_ID)
+        .arg(&spec.dev_id)
         .arg("--size")
         .arg(BLOB_SIZE.to_string());
     if create {
         cmd.arg("--create");
     }
-    azure_env(&mut cmd);
+    if let Some(dir) = &spec.cache_dir {
+        cmd.arg("--cache-dir").arg(dir);
+    }
+    azure_env(&mut cmd, &spec.container, &spec.blob);
 
     let mut child = cmd.spawn().expect("failed to spawn ublk-azblob");
 
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        if Path::new(dev).exists() {
+        if Path::new(&dev).exists() {
             log(&format!("device {dev} is up (pid {})", child.id()));
             return child;
         }
@@ -227,11 +247,51 @@ fn mount_roundtrip() {
         return;
     }
 
-    let dev = format!("/dev/ublkb{DEV_ID}");
+    run_mount_roundtrip(DeviceSpec {
+        dev_id: DEV_ID.to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB),
+        cache_dir: None,
+    });
+}
+
+/// Same write → flush → remount → verify cycle, but with the persistent
+/// local-disk cache (`--cache-dir`) enabled.  This proves that writes routed
+/// through the file-based cache layer are flushed to the page blob and survive
+/// tearing the device down and bringing it back up over the same blob.
+///
+/// A *fresh* cache directory is used for the second boot so the verification
+/// reads must come from the page blob (via the cache's read-through), not from
+/// stale local cache data left over from phase 1.
+#[test]
+fn mount_roundtrip_file_cache() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_roundtrip_file_cache: requires root and a loaded \
+             ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let cache_dir = tempdir("ublk-azblob-cache");
+    run_mount_roundtrip(DeviceSpec {
+        // Distinct device id, container and blob so this test never collides
+        // with `mount_roundtrip`.
+        dev_id: "1".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-fcache", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: Some(cache_dir.clone()),
+    });
+    let _ = fs::remove_dir_all(&cache_dir);
+}
+
+/// Drive a full mount/write/flush/remount/verify cycle for the given device.
+fn run_mount_roundtrip(spec: DeviceSpec) {
+    let dev = spec.dev_path();
     let mnt = tempdir("ublk-azblob-mnt");
 
     // ── Phase 1: provision device, make a filesystem, write random files ──────
-    let child = start_device(&dev, true);
+    let child = start_device(&spec, true);
 
     log(&format!("mkfs.ext4 on {dev}"));
     run("mkfs.ext4", &["-q", "-F", "-E", "nodiscard", &dev]);
@@ -264,7 +324,13 @@ fn mount_roundtrip() {
     stop_device(&dev, child);
 
     // ── Phase 3: remount over the same blob and verify checksums ──────────────
-    let child = start_device(&dev, false);
+    // Use a *fresh* cache directory for the remount so the verification reads
+    // must come from the page blob (via the cache's read-through), not from
+    // stale local cache data left over from phase 1.
+    if let Some(dir) = &spec.cache_dir {
+        fs::remove_dir_all(dir).unwrap_or_else(|e| panic!("clear cache dir {dir:?}: {e}"));
+    }
+    let child = start_device(&spec, false);
 
     log(&format!("remounting {dev} at {}", mnt.display()));
     run("mount", &[&dev, mnt.to_str().unwrap()]);
