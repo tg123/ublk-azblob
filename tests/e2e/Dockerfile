@@ -5,9 +5,7 @@
 # the bind-mounted source tree (see the `runner` service in docker-compose.yml),
 # so this image only provides the environment, not the compiled binary.
 #
-# rust:1.88 is required: the pinned Azure SDK crates (azure_core 1.0.0,
-# azure_storage_blob 1.0.0, typespec 1.0.0, time 0.3.49) need rustc ≥ 1.88.
-FROM rust:1.88-slim
+FROM rust:1.96-slim
 
 # - e2fsprogs : mkfs.ext4
 # - util-linux: mount / umount
