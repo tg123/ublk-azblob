@@ -21,9 +21,11 @@ use auth::{AuthConfig, UserAssignedIdentity};
 use backend::{
     azure::AzurePageBlobBackend,
     buffered::{BufferedBackend, BufferedConfig},
+    file::{FileCacheBackend, FileCacheConfig},
     BlobBackend,
 };
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -120,6 +122,22 @@ enum Command {
         /// flushed to Azure automatically.  Total memory cap ≈ page_size × max_dirty_pages.
         #[arg(long, default_value = "64", env = "UBLK_MAX_DIRTY_PAGES")]
         max_dirty_pages: usize,
+
+        /// Directory for the persistent local-disk cache.
+        ///
+        /// When set, a local-disk cache layer is inserted between the in-memory
+        /// write-back buffer and Azure, forming a multi-level cache
+        /// (memory → local disk → blob).  Cached pages — including unflushed
+        /// *dirty* pages — survive a restart: on startup the cache is recovered
+        /// from disk and any recovered dirty pages are flushed to the blob.
+        #[arg(long, env = "UBLK_CACHE_DIR")]
+        cache_dir: Option<PathBuf>,
+
+        /// Local-disk cache page size in bytes (must be a multiple of 512).
+        ///
+        /// Only used when `--cache-dir` is set.
+        #[arg(long, default_value = "1048576", env = "UBLK_CACHE_PAGE_SIZE")]
+        cache_page_size: u64,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -164,6 +182,8 @@ async fn main() -> anyhow::Result<()> {
             id,
             page_size,
             max_dirty_pages,
+            cache_dir,
+            cache_page_size,
         } => {
             if create {
                 info!(size, blob = %cli.blob, "creating page blob");
@@ -172,6 +192,41 @@ async fn main() -> anyhow::Result<()> {
 
             let actual_size = backend.size().await.context("get blob size")?;
             info!(size = actual_size, blob = %cli.blob, "blob ready");
+
+            // Optional local-disk cache layer (memory → local disk → blob).
+            let backend: Arc<dyn BlobBackend> = if let Some(dir) = cache_dir {
+                info!(
+                    cache_dir = %dir.display(),
+                    cache_page_size,
+                    "local-disk cache enabled"
+                );
+                let (cache, recovered_dirty) = FileCacheBackend::open(
+                    backend,
+                    FileCacheConfig {
+                        dir,
+                        name: format!("{}-{}", cli.container, cli.blob).replace('/', "_"),
+                        page_size: cache_page_size,
+                    },
+                    actual_size,
+                )
+                .context("open local-disk cache")?;
+                let cache: Arc<dyn BlobBackend> = Arc::new(cache);
+                // Recovered dirty pages (written before a previous restart but
+                // never flushed) are pushed to the blob now that we are back up.
+                if recovered_dirty > 0 {
+                    info!(
+                        recovered_dirty,
+                        "flushing recovered dirty cache pages to blob"
+                    );
+                    cache
+                        .flush()
+                        .await
+                        .context("flush recovered dirty cache pages")?;
+                }
+                cache
+            } else {
+                backend
+            };
 
             // Wrap with write-back buffer if page_size > 0.
             let backend: Arc<dyn BlobBackend> = if page_size > 0 {
