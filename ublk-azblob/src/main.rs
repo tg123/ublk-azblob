@@ -93,7 +93,7 @@ struct Cli {
     /// `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_FEDERATED_TOKEN_FILE`
     /// environment variables injected by the workload-identity webhook.
     /// Mutually exclusive with --account-key and the --msi* flags.
-    #[arg(long, env = "AZURE_USE_WORKLOAD_IDENTITY", conflicts_with_all = ["msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
+    #[arg(long, env = "AZURE_USE_WORKLOAD_IDENTITY", conflicts_with_all = ["account_key", "msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
     workload_identity: bool,
 
     /// Workload Identity client ID (overrides `AZURE_CLIENT_ID`).
