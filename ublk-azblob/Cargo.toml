@@ -43,7 +43,7 @@ hmac-sha256 = "1.1.14"
 base64 = "0.22.1"
 
 # Time handling (for x-ms-date header in SharedKey auth)
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
 
 # ublk Rust binding — Linux userspace block driver over io_uring.
 # Requires Linux ≥6.0 with ublk_drv loaded and root/CAP_SYS_ADMIN.

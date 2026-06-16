@@ -3,8 +3,12 @@
 //! # Usage
 //!
 //! ```text
-//! ublk-azblob [OPTIONS] --account <ACCOUNT> --container <CONTAINER> --blob <BLOB> --size <SIZE>
+//! ublk-azblob [GLOBAL OPTIONS] --account <ACCOUNT> --container <CONTAINER> --blob <BLOB> \
+//!     <run|test> --size <SIZE>
 //! ```
+//!
+//! `--size` (and other per-command options) belong to the `run`/`test`
+//! subcommands; auth and storage selectors are global options.
 //!
 //! See `--help` and `README.md` for full documentation.
 
@@ -49,8 +53,8 @@ struct Cli {
 
     /// Storage account key (base64).  Enables SharedKey auth mode.
     ///
-    /// Mutually exclusive with --msi-*.  Use for Azurite and local dev.
-    #[arg(long, env = "AZURE_STORAGE_KEY", conflicts_with_all = ["msi_client_id", "msi_object_id", "msi_resource_id"])]
+    /// Mutually exclusive with --msi / --msi-*.  Use for Azurite and local dev.
+    #[arg(long, env = "AZURE_STORAGE_KEY", conflicts_with_all = ["msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
     account_key: Option<String>,
 
     /// Enable system-assigned Managed Identity.

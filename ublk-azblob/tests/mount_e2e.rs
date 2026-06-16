@@ -140,6 +140,7 @@ fn start_device(dev: &str, create: bool) -> Child {
         sleep(Duration::from_secs(1));
     }
     let _ = child.kill();
+    let _ = child.wait();
     panic!("timed out waiting for {dev}");
 }
 
@@ -160,6 +161,12 @@ fn stop_device(dev: &str, mut child: Child) {
     while Instant::now() < deadline && Path::new(dev).exists() {
         sleep(Duration::from_secs(1));
     }
+    // The node must actually be gone; otherwise a subsequent `start_device`
+    // would see the stale node and falsely conclude the device is already up.
+    assert!(
+        !Path::new(dev).exists(),
+        "device node {dev} still present 30s after stopping the device"
+    );
 }
 
 /// SHA-256 of a file, as a lowercase hex string.

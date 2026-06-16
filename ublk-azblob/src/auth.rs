@@ -27,7 +27,7 @@ use azure_identity::{ManagedIdentityCredential, ManagedIdentityCredentialOptions
 use azure_storage_blob::{BlobContainerClient, BlobContainerClientOptions, BlobServiceClient};
 use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine as _};
 use std::sync::Arc;
-use time::{format_description::well_known::Rfc2822, OffsetDateTime};
+use time::{macros::format_description, OffsetDateTime};
 use tracing::debug;
 
 // ── Credential types ──────────────────────────────────────────────────────────
@@ -263,10 +263,16 @@ impl Policy for SharedKeyPolicy {
             ))
             .is_none()
         {
-            // RFC 2822 / RFC 1123 date format required by Azure Storage
+            // RFC 1123 / HTTP-date format required by Azure Storage, e.g.
+            // "Mon, 02 Jan 2006 15:04:05 GMT". `time`'s `Rfc2822` formatter
+            // renders the zone as "+0000" rather than "GMT", which strict
+            // endpoints/emulators reject, so format the HTTP-date explicitly.
             let now = OffsetDateTime::now_utc();
-            // Format: "Mon, 02 Jan 2006 15:04:05 GMT"
-            let date_str = now.format(&Rfc2822).unwrap_or_else(|_| now.to_string());
+            let http_date = format_description!(
+                "[weekday repr:short], [day] [month repr:short] [year] \
+                 [hour]:[minute]:[second] GMT"
+            );
+            let date_str = now.format(http_date).unwrap_or_else(|_| now.to_string());
             request.insert_header("x-ms-date", date_str);
         }
 
