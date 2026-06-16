@@ -266,6 +266,8 @@ async fn run_phase(
                 }
                 let block = match phase.access {
                     Access::Sequential => idx % nblocks,
+                    // Modulo introduces a negligible bias when nblocks is not a
+                    // power of two; acceptable for spreading benchmark offsets.
                     Access::Random => next_rand(idx.wrapping_add(worker_id)) % nblocks,
                 };
                 let offset = block * block_size;
@@ -336,13 +338,14 @@ fn validate(cfg: &BenchConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Deterministic, fast pseudo-random number (SplitMix64) — avoids pulling in a
-/// `rand` dependency just to spread out block offsets.  Constants are from the
-/// reference SplitMix64 implementation (https://prng.di.unimi.it/splitmix64.c).
+/// Deterministic stateless hash of `seed` using the SplitMix64 finalizer —
+/// avoids pulling in a `rand` dependency just to spread out block offsets.
+/// This is the SplitMix64 output (mix) function applied to `state = seed + GAMMA`;
+/// constants are from the reference implementation
+/// (https://prng.di.unimi.it/splitmix64.c).  Distinct seeds yield well-distributed
+/// distinct outputs, which is all the benchmark needs to scatter block offsets.
 fn next_rand(seed: u64) -> u64 {
-    let mut z = seed
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
