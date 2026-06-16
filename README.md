@@ -135,6 +135,39 @@ All CLI flags have environment-variable equivalents:
 | `--account-key` | `AZURE_STORAGE_KEY` |
 | `--container` | `AZURE_STORAGE_CONTAINER` |
 | `--blob` | `AZURE_STORAGE_BLOB` |
+| `--cache-dir` | `UBLK_CACHE_DIR` |
+| `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
+
+---
+
+## Multi-level cache (memory → local disk → blob)
+
+`ublk-azblob` can stack a persistent **local-disk cache** between the in-memory
+write-back buffer and Azure, giving a three-level cache:
+
+```
+BufferedBackend (memory) ──► FileCacheBackend (local disk) ──► AzurePageBlobBackend (blob)
+```
+
+Enable it by pointing `--cache-dir` at a directory on a local disk:
+
+```bash
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount \
+  --container mydisks \
+  --blob myvm.vhd \
+  --msi \
+  run --size 10737418240 \
+  --cache-dir /var/cache/ublk-azblob \
+  --cache-page-size 1048576
+```
+
+The local-disk cache stores pages in a sparse `<container>-<blob>.dat` file with a
+companion `.meta` file holding `present`/`dirty` bitmaps. Page data is `fsync`ed
+before a page is marked dirty, and the dirty bitmap is `fsync`ed on every change,
+so **unflushed dirty data survives a crash or restart**. On startup the cache is
+recovered from disk and any recovered dirty pages are flushed to the blob, so
+in-flight writes are never silently lost.
 
 ---
 
@@ -275,6 +308,8 @@ ublk-azblob/
 │   │   └── backend/
 │   │       ├── mod.rs          # BlobBackend trait (SDK isolation boundary)
 │   │       ├── azure.rs        # AzurePageBlobBackend (real SDK impl)
+│   │       ├── buffered.rs     # BufferedBackend (in-memory write-back cache)
+│   │       ├── file.rs         # FileCacheBackend (persistent local-disk cache)
 │   │       └── mem.rs          # MemBackend (in-memory, for unit tests)
 │   └── tests/
 │       └── mount_e2e.rs        # full mount → write → flush → remount → verify
