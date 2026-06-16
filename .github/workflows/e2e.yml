@@ -80,9 +80,9 @@ jobs:
 
       - name: Run mount e2e (mount → write → flush → unmount → remount → verify)
         run: |
-          sudo env BIN="$PWD/target/release/ublk-azblob" \
+          sudo -E env "PATH=$PATH" \
             AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
-            bash tests/e2e/mount_test.sh
+            cargo test --release --features ublk -p ublk-azblob --test mount_e2e -- --nocapture --test-threads=1
 
       - name: Azurite logs on failure
         if: failure()

@@ -3,7 +3,7 @@ name = "ublk-azblob"
 version = "0.1.0"
 edition = "2021"
 description = "Linux ublk userspace block device backed by Azure Page Blob"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/tg123/ublk-azblob"
 
 [[bin]]
@@ -60,3 +60,8 @@ ublk = ["dep:libublk", "dep:libc"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full", "test-util"] }
+
+# Used by the Rust mount e2e test (tests/mount_e2e.rs): SHA-256 checksums of the
+# random files, and signals (SIGUSR1/SIGINT) to the ublk device child process.
+hmac-sha256 = "1.1.14"
+libc = "0.2.186"

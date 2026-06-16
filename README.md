@@ -146,12 +146,14 @@ sudo modprobe ublk_drv
 cargo build --release --features ublk -p ublk-azblob
 
 # 3. Run the mount → write → flush → unmount → remount → verify cycle
-sudo env BIN="$PWD/target/release/ublk-azblob" \
+sudo -E env "PATH=$PATH" \
   AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
-  bash tests/e2e/mount_test.sh
+  cargo test --release --features ublk -p ublk-azblob --test mount_e2e -- --nocapture --test-threads=1
 ```
 
-See [tests/e2e/](tests/e2e/) for the full setup.
+The e2e test lives in [ublk-azblob/tests/mount_e2e.rs](ublk-azblob/tests/mount_e2e.rs);
+it is gated behind the `ublk` feature and skips itself when not run as root with
+`ublk_drv` loaded.
 
 ---
 
@@ -189,15 +191,15 @@ ublk-azblob/
 ├── README.md                   # this file
 ├── ublk-azblob/
 │   ├── Cargo.toml              # pinned dependencies
-│   └── src/
-│       ├── main.rs             # CLI entry point (clap)
-│       ├── auth.rs             # MSI + SharedKey credential factory
-│       ├── ublk_target.rs      # ublk device I/O loop (gated on --features ublk)
-│       └── backend/
-│           ├── mod.rs          # BlobBackend trait (SDK isolation boundary)
-│           ├── azure.rs        # AzurePageBlobBackend (real SDK impl)
-│           └── mem.rs          # MemBackend (in-memory, for unit tests)
-└── tests/
-    └── e2e/
-        └── mount_test.sh       # full mount → write → flush → remount → verify
+│   ├── src/
+│   │   ├── main.rs             # CLI entry point (clap)
+│   │   ├── auth.rs             # MSI + SharedKey credential factory
+│   │   ├── ublk_target.rs      # ublk device I/O loop (gated on --features ublk)
+│   │   └── backend/
+│   │       ├── mod.rs          # BlobBackend trait (SDK isolation boundary)
+│   │       ├── azure.rs        # AzurePageBlobBackend (real SDK impl)
+│   │       └── mem.rs          # MemBackend (in-memory, for unit tests)
+│   └── tests/
+│       └── mount_e2e.rs        # full mount → write → flush → remount → verify
+└── LICENSE.md                  # MIT license
 ```
