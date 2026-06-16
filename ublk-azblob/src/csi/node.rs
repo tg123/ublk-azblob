@@ -96,6 +96,28 @@ impl NodeService {
                 "no auth configured for node publish: provide secret 'accountKey' or enable MSI"
             );
         }
+
+        // Cluster coordination: when the StorageClass opts in (volume context
+        // `coordination: "true"`), enable the cluster lease + blob lock in the
+        // child `run` process so at most one node serves the volume.  The holder
+        // identity is this node; the lease namespace defaults to the driver
+        // pod's namespace (POD_NAMESPACE) unless the context overrides it.
+        let coordination = get("coordination")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        if coordination {
+            env.push(("UBLK_COORDINATION".to_string(), "1".to_string()));
+            env.push(("UBLK_LEASE_HOLDER".to_string(), self.node_id.clone()));
+            let namespace = get("leaseNamespace")
+                .or_else(|| std::env::var("POD_NAMESPACE").ok())
+                .filter(|n| !n.is_empty());
+            if let Some(ns) = namespace {
+                env.push(("UBLK_LEASE_NAMESPACE".to_string(), ns));
+            }
+            if let Some(secs) = get("recoveryTimeoutSecs").filter(|s| !s.is_empty()) {
+                env.push(("UBLK_RECOVERY_TIMEOUT_SECS".to_string(), secs));
+            }
+        }
         Ok(env)
     }
 }

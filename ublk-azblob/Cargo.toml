@@ -68,6 +68,13 @@ prost-types = { version = "0.13.4", optional = true }
 tokio-stream = { version = "0.1.17", features = ["net"], optional = true }
 uuid = { version = "1.11.0", features = ["v4"], optional = true }
 
+# ── Cluster coordination (Kubernetes Lease) ─────────────────────────────────
+# Gated behind the `coordination` feature.  The Azure blob-lease half of the
+# coordinator uses the always-present azure_storage_blob SDK; the cluster-lease
+# half talks to the Kubernetes `coordination.k8s.io` API via `kube`.
+kube = { version = "0.99.0", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.24.0", features = ["latest"], optional = true }
+
 [build-dependencies]
 # Only used when the `csi` feature is enabled (build.rs checks CARGO_FEATURE_CSI).
 tonic-build = "0.12.3"
@@ -76,10 +83,16 @@ tonic-build = "0.12.3"
 # Enable the real ublk target (requires Linux ≥6.0 + ublk_drv loaded).
 ublk = ["dep:libublk", "dep:libc"]
 
+# Enable cluster coordination (Kubernetes coordination.k8s.io Lease + Azure blob
+# lease) so that at most one node mounts a given page blob at a time.  The Azure
+# blob-lease half is always compiled; this feature adds the Kubernetes client.
+coordination = ["dep:kube", "dep:k8s-openapi"]
+
 # Enable the Kubernetes CSI driver (`csi` subcommand).  The node side also needs
 # the `ublk` feature to actually attach block devices; enable both together with
-# `--features "ublk csi"` for a fully functional node plugin.
-csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "dep:uuid", "dep:libc"]
+# `--features "ublk csi"` for a fully functional node plugin.  CSI implies
+# `coordination` so node mounts are guarded by the cluster + blob locks.
+csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "dep:uuid", "dep:libc", "coordination"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full", "test-util"] }

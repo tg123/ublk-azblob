@@ -6,10 +6,14 @@
 //! type crosses the `BlobBackend` boundary into the rest of the crate.
 
 use super::BlobBackend;
+use crate::coordination::{BlobLock, LockError};
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use azure_storage_blob::{
-    models::{BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders, HttpRange},
+    models::{
+        BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
+        BlobClientGetPropertiesResultHeaders, HttpRange,
+    },
     BlobContainerClient,
 };
 use bytes::Bytes;
@@ -180,5 +184,100 @@ impl BlobBackend for AzurePageBlobBackend {
             )
         })?;
         Ok(len)
+    }
+}
+
+// ── Blob lease (cluster coordination "blob lock") ─────────────────────────────
+
+/// Azure blob-lease implementation of [`BlobLock`].
+///
+/// Holds its own `BlobContainerClient` (with the auth pipeline wired in) and the
+/// target blob name.  Kept next to [`AzurePageBlobBackend`] so all Azure SDK
+/// types stay inside this module.
+pub struct AzureBlobLock {
+    container: BlobContainerClient,
+    blob_name: String,
+}
+
+impl AzureBlobLock {
+    /// Construct a blob lock for `blob_name` from an already-configured
+    /// `BlobContainerClient`.
+    pub fn new(container: BlobContainerClient, blob_name: impl Into<String>) -> Self {
+        Self {
+            container,
+            blob_name: blob_name.into(),
+        }
+    }
+
+    /// Map an Azure SDK error to a [`LockError`], classifying lease conflicts
+    /// (HTTP 409 Conflict / 412 Precondition Failed) as [`LockError::Held`].
+    fn classify(err: azure_core::Error, what: &str) -> LockError {
+        match err.http_status() {
+            Some(azure_core::http::StatusCode::Conflict)
+            | Some(azure_core::http::StatusCode::PreconditionFailed) => LockError::Held,
+            _ => LockError::Other(anyhow::Error::new(err).context(what.to_string())),
+        }
+    }
+}
+
+#[async_trait]
+impl BlobLock for AzureBlobLock {
+    #[instrument(skip(self), fields(blob = %self.blob_name, duration_secs))]
+    async fn acquire(&self, duration_secs: i32) -> Result<String, LockError> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!(duration_secs, "acquiring blob lease");
+        let result = blob_client
+            .acquire_lease(duration_secs, None)
+            .await
+            .map_err(|e| Self::classify(e, "acquire blob lease"))?;
+        let lease_id = result
+            .lease_id()
+            .map_err(|e| LockError::Other(anyhow::Error::new(e).context("read lease id")))?
+            .ok_or_else(|| {
+                LockError::Other(anyhow::anyhow!(
+                    "acquire lease response missing x-ms-lease-id header"
+                ))
+            })?;
+        Ok(lease_id)
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn renew(&self, lease_id: &str) -> anyhow::Result<()> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("renewing blob lease");
+        blob_client
+            .renew_lease(lease_id.to_string(), None)
+            .await
+            .with_context(|| format!("renew blob lease '{}'", self.blob_name))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn release(&self, lease_id: &str) -> anyhow::Result<()> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("releasing blob lease");
+        blob_client
+            .release_lease(lease_id.to_string(), None)
+            .await
+            .with_context(|| format!("release blob lease '{}'", self.blob_name))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn break_lock(&self) -> anyhow::Result<()> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("breaking blob lease");
+        // No options ⇒ default break period (the lease breaks at the end of its
+        // remaining period).  We pass a 0 break period so the lease becomes
+        // available immediately for take-over.
+        let opts = azure_storage_blob::models::BlobClientBreakLeaseOptions {
+            break_period: Some(0),
+            ..Default::default()
+        };
+        blob_client
+            .break_lease(Some(opts))
+            .await
+            .with_context(|| format!("break blob lease '{}'", self.blob_name))?;
+        Ok(())
     }
 }

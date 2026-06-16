@@ -14,6 +14,7 @@
 
 mod auth;
 mod backend;
+mod coordination;
 #[cfg(feature = "csi")]
 mod csi;
 mod ublk_target;
@@ -126,6 +127,38 @@ enum Command {
         /// flushed to Azure automatically.  Total memory cap ≈ page_size × max_dirty_pages.
         #[arg(long, default_value = "64", env = "UBLK_MAX_DIRTY_PAGES")]
         max_dirty_pages: usize,
+
+        /// Enable cluster coordination: acquire both the Azure blob lease
+        /// ("blob lock") and a Kubernetes `coordination.k8s.io` Lease ("cluster
+        /// lease") before mounting, so at most one node serves the volume.
+        /// Requires the `coordination` build feature.
+        #[arg(long, env = "UBLK_COORDINATION")]
+        coordination: bool,
+
+        /// Recovery timeout (seconds): how long a holder's cluster lease may go
+        /// un-renewed before another node may break its blob lease and take the
+        /// volume over.
+        #[arg(long, default_value_t = coordination::DEFAULT_RECOVERY_TIMEOUT.as_secs(), env = "UBLK_RECOVERY_TIMEOUT_SECS")]
+        recovery_timeout_secs: u64,
+
+        /// Blob lease duration in seconds (clamped to Azure's 15..=60s window).
+        #[arg(long, default_value_t = coordination::DEFAULT_LEASE_DURATION.as_secs(), env = "UBLK_LEASE_DURATION_SECS")]
+        lease_duration_secs: u64,
+
+        /// Kubernetes namespace for the cluster lease (defaults to
+        /// `POD_NAMESPACE`, then `default`).
+        #[arg(long, env = "UBLK_LEASE_NAMESPACE")]
+        lease_namespace: Option<String>,
+
+        /// Cluster lease object name (defaults to a sanitized
+        /// `<container>-<blob>`).
+        #[arg(long, env = "UBLK_LEASE_NAME")]
+        lease_name: Option<String>,
+
+        /// Holder identity recorded in the cluster lease (defaults to
+        /// `HOSTNAME`, then `unknown-node`).
+        #[arg(long, env = "UBLK_LEASE_HOLDER")]
+        lease_holder: Option<String>,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -182,6 +215,12 @@ async fn main() -> anyhow::Result<()> {
             id,
             page_size,
             max_dirty_pages,
+            coordination,
+            recovery_timeout_secs,
+            lease_duration_secs,
+            ref lease_namespace,
+            ref lease_name,
+            ref lease_holder,
         } => {
             let backend = build_azure_backend(&cli, &endpoint)?;
             if create {
@@ -191,6 +230,26 @@ async fn main() -> anyhow::Result<()> {
 
             let actual_size = backend.size().await.context("get blob size")?;
             info!(size = actual_size, "blob ready");
+
+            // Acquire cluster + blob coordination locks before mounting (after
+            // the blob exists, so its lease can be taken).
+            let guard = if coordination {
+                Some(
+                    acquire_coordination(
+                        &cli,
+                        &endpoint,
+                        recovery_timeout_secs,
+                        lease_duration_secs,
+                        lease_namespace.clone(),
+                        lease_name.clone(),
+                        lease_holder.clone(),
+                    )
+                    .await
+                    .context("acquire coordination locks")?,
+                )
+            } else {
+                None
+            };
 
             // Wrap with write-back buffer if page_size > 0.
             let backend: Arc<dyn BlobBackend> = if page_size > 0 {
@@ -217,9 +276,15 @@ async fn main() -> anyhow::Result<()> {
                 queue_depth,
                 id,
             };
-            ublk_target::run_ublk_target(backend, cfg)
+            let result = ublk_target::run_ublk_target(backend, cfg)
                 .await
-                .context("ublk target")?;
+                .context("ublk target");
+
+            // Release the leases so another node can take over immediately.
+            if let Some(guard) = guard {
+                guard.release().await;
+            }
+            result?;
         }
 
         Command::Test { size } => {
@@ -279,6 +344,97 @@ fn hostname() -> String {
         .ok()
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "unknown-node".to_string())
+}
+
+/// Acquire the cluster lease + blob lock for the selected blob and return the
+/// guard that keeps them renewed.  Requires the `coordination` build feature.
+#[cfg(feature = "coordination")]
+#[allow(clippy::too_many_arguments)]
+async fn acquire_coordination(
+    cli: &Cli,
+    endpoint: &str,
+    recovery_timeout_secs: u64,
+    lease_duration_secs: u64,
+    lease_namespace: Option<String>,
+    lease_name: Option<String>,
+    lease_holder: Option<String>,
+) -> anyhow::Result<coordination::CoordinationGuard> {
+    use coordination::{
+        k8s::{sanitize_lease_name, K8sClusterLease},
+        CoordinationConfig, Coordinator,
+    };
+    use std::time::Duration;
+
+    let blob = cli
+        .blob
+        .clone()
+        .context("--blob (AZURE_STORAGE_BLOB) is required for coordination")?;
+    let auth = build_auth(cli)?;
+    let container_client = auth::build_container_client(endpoint, &cli.container, &auth)
+        .context("build container client for blob lock")?;
+    let blob_lock = Arc::new(backend::azure::AzureBlobLock::new(
+        container_client,
+        blob.clone(),
+    ));
+
+    let holder = lease_holder
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "unknown-node".to_string());
+    let namespace = lease_namespace
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            std::env::var("POD_NAMESPACE")
+                .ok()
+                .filter(|n| !n.is_empty())
+        })
+        .unwrap_or_else(|| "default".to_string());
+    let name = lease_name
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| sanitize_lease_name(&format!("{}-{}", cli.container, blob)));
+
+    let config = CoordinationConfig::new(
+        holder.clone(),
+        Duration::from_secs(lease_duration_secs),
+        Duration::from_secs(recovery_timeout_secs),
+    );
+
+    info!(
+        %namespace, %name, %holder,
+        recovery_timeout_secs, "connecting to cluster lease"
+    );
+    let cluster = Arc::new(
+        K8sClusterLease::connect(
+            &namespace,
+            name,
+            holder,
+            config.lease_duration,
+            config.recovery_timeout,
+        )
+        .await
+        .context("connect kubernetes cluster lease")?,
+    );
+
+    Coordinator::new(cluster, blob_lock, config).acquire().await
+}
+
+/// Stub used when the `coordination` feature is not compiled in: fail loudly so
+/// `--coordination` is never silently ignored.
+#[cfg(not(feature = "coordination"))]
+#[allow(clippy::too_many_arguments)]
+async fn acquire_coordination(
+    _cli: &Cli,
+    _endpoint: &str,
+    _recovery_timeout_secs: u64,
+    _lease_duration_secs: u64,
+    _lease_namespace: Option<String>,
+    _lease_name: Option<String>,
+    _lease_holder: Option<String>,
+) -> anyhow::Result<coordination::CoordinationGuard> {
+    anyhow::bail!(
+        "--coordination requires the `coordination` build feature; \
+         rebuild with `--features coordination` (or `--features csi`)"
+    )
 }
 
 // ── Auth builder ─────────────────────────────────────────────────────────────
