@@ -747,6 +747,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_page_write_preserves_neighbouring_data_on_flush() {
+        // A sub-page write must read-modify-write the whole page so a later
+        // full-page flush does not clobber the bytes it did not touch.
+        let dir = tmp_dir("rmw");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        // Seed the inner backend so page 0 already has known content.
+        inner.write(0, Bytes::from(vec![0x11; 1024])).await.unwrap();
+
+        let (b, _) = open(inner.clone(), &dir, 1024, 4096);
+        // Overwrite only the first 512 bytes of page 0.
+        b.write(0, Bytes::from(vec![0x22; 512])).await.unwrap();
+        b.flush().await.unwrap();
+
+        // First half updated, second half (loaded from inner) preserved.
+        let page = inner.read(0, 1024).await.unwrap();
+        assert!(page[..512].iter().all(|&x| x == 0x22));
+        assert!(page[512..].iter().all(|&x| x == 0x11));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn multi_page_write_flushes_all_pages() {
+        let dir = tmp_dir("multipage");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        let (b, _) = open(inner.clone(), &dir, 1024, 4096);
+
+        // Write across all four 1 KiB pages in one call.
+        let data = Bytes::from(vec![0x9C; 4096]);
+        b.write(0, data.clone()).await.unwrap();
+        assert_eq!(b.dirty_count().await, 4);
+
+        b.flush().await.unwrap();
+        assert_eq!(b.dirty_count().await, 0);
+        assert_eq!(inner.read(0, 4096).await.unwrap(), data);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn overwrite_dirty_page_flushes_latest_value() {
+        let dir = tmp_dir("overwrite");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        let (b, _) = open(inner.clone(), &dir, 1024, 4096);
+
+        // Two writes to the same page before any flush.
+        b.write(0, Bytes::from(vec![0x01; 512])).await.unwrap();
+        b.write(0, Bytes::from(vec![0x02; 512])).await.unwrap();
+        // Still a single dirty page.
+        assert_eq!(b.dirty_count().await, 1);
+
+        b.flush().await.unwrap();
+        // The most recent write wins on the inner backend.
+        assert_eq!(
+            inner.read(0, 512).await.unwrap(),
+            Bytes::from(vec![0x02; 512])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_to_last_short_page() {
+        // dev_size (2560) is not a multiple of page_size (1024): the last page
+        // is a short 512-byte page.  Writing it must flush only its valid bytes.
+        let dir = tmp_dir("shortpage");
+        let inner = Arc::new(MemBackend::new(2560).unwrap());
+        let (b, _) = open(inner.clone(), &dir, 1024, 2560);
+
+        let payload = Bytes::from(vec![0x77; 512]);
+        b.write(2048, payload.clone()).await.unwrap();
+        b.flush().await.unwrap();
+
+        assert_eq!(inner.read(2048, 512).await.unwrap(), payload);
+        let read = b.read(2048, 512).await.unwrap();
+        assert_eq!(read, payload);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_after_write_hits_cache_without_touching_inner() {
+        // After a cached write, a read of that page is served from the local
+        // disk file, not the (still-empty) inner backend.
+        let dir = tmp_dir("cachehit");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        let (b, _) = open(inner.clone(), &dir, 1024, 4096);
+
+        let payload = Bytes::from(vec![0x3D; 512]);
+        b.write(512, payload.clone()).await.unwrap();
+
+        // Inner is still untouched (no flush yet) but the cache serves the data.
+        assert!(inner.read(512, 512).await.unwrap().iter().all(|&x| x == 0));
+        assert_eq!(b.read(512, 512).await.unwrap(), payload);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_miss_is_served_from_inner_without_caching() {
+        // A pure read of a never-written page comes straight from the inner
+        // backend and does not populate the cache (page stays absent).
+        let dir = tmp_dir("readmiss");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        inner.write(0, Bytes::from(vec![0x6E; 512])).await.unwrap();
+
+        let (b, _) = open(inner.clone(), &dir, 1024, 4096);
+        assert_eq!(b.read(0, 512).await.unwrap(), Bytes::from(vec![0x6E; 512]));
+        // Read does not dirty anything.
+        assert_eq!(b.dirty_count().await, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dirty_writes_survive_reopen_and_flush_once() {
+        // Writes that are persisted to the cache but never flushed are recovered
+        // as dirty after reopening the cache against the same directory, and the
+        // recovered data flushes correctly to a fresh inner backend.
+        let dir = tmp_dir("reopen");
+        let payload = Bytes::from(vec![0x4F; 2048]);
+        {
+            let inner = Arc::new(MemBackend::new(4096).unwrap());
+            let (b, recovered) = open(inner, &dir, 1024, 4096);
+            assert_eq!(recovered, 0);
+            b.write(0, payload.clone()).await.unwrap();
+            // Drop without flushing.
+        }
+        {
+            let inner = Arc::new(MemBackend::new(4096).unwrap());
+            let (b, recovered) = open(inner.clone(), &dir, 1024, 4096);
+            assert_eq!(recovered, 2);
+            // Cached data still readable from disk after reopen.
+            assert_eq!(b.read(0, 2048).await.unwrap(), payload);
+            b.flush().await.unwrap();
+            assert_eq!(inner.read(0, 2048).await.unwrap(), payload);
+            assert_eq!(b.dirty_count().await, 0);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn create_resets_cache() {
         let dir = tmp_dir("create");
         let inner = Arc::new(MemBackend::new(4096).unwrap());
