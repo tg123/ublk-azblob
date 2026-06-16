@@ -111,7 +111,7 @@ impl Access {
 /// Benchmark parameters.
 #[derive(Clone, Debug)]
 pub struct BenchConfig {
-    /// Size of the backing blob in bytes (multiple of `block_size`).
+    /// Size of the backing blob in bytes (must be ≥ `block_size`).
     pub size: u64,
     /// I/O size per operation in bytes (multiple of 512).
     pub block_size: u64,
@@ -167,7 +167,7 @@ pub struct LatencyStats {
 }
 
 impl LatencyStats {
-    fn from_sorted(mut samples: Vec<Duration>) -> Self {
+    fn from_samples(mut samples: Vec<Duration>) -> Self {
         if samples.is_empty() {
             return Self {
                 min: Duration::ZERO,
@@ -308,7 +308,7 @@ async fn run_phase(
         ops,
         bytes: ops * cfg.block_size,
         elapsed,
-        latencies: LatencyStats::from_sorted(latencies),
+        latencies: LatencyStats::from_samples(latencies),
     })
 }
 
