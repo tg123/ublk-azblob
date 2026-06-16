@@ -16,17 +16,32 @@ on:
         description: "How much of each device fio touches"
         default: "256M"
       fio_bs:
-        description: "Block size per I/O"
+        description: "Base block size per I/O"
         default: "4k"
       fio_iodepth:
-        description: "Queue depth"
+        description: "Base queue depth"
         default: "16"
+      fio_numjobs:
+        description: "Base thread (numjobs) count"
+        default: "1"
       fio_runtime:
         description: "Seconds per workload"
-        default: "15"
+        default: "10"
       fio_direct:
         description: "O_DIRECT (1) or buffered (0)"
         default: "1"
+      fio_bs_list:
+        description: "Phase 1 block-size sweep (space-separated)"
+        default: "4k 16k 64k 256k 1M"
+      fio_iodepth_list:
+        description: "Phase 1 queue-depth sweep (space-separated)"
+        default: "1 4 16 64 128"
+      fio_rwmix_list:
+        description: "Phase 1 read-percentage sweep (space-separated)"
+        default: "100 70 50"
+      fio_numjobs_list:
+        description: "Phase 4 thread sweep (space-separated)"
+        default: "1 4 16 64"
 
 jobs:
   bench:
@@ -52,8 +67,13 @@ jobs:
           FIO_SIZE: ${{ inputs.fio_size }}
           FIO_BS: ${{ inputs.fio_bs }}
           FIO_IODEPTH: ${{ inputs.fio_iodepth }}
+          FIO_NUMJOBS: ${{ inputs.fio_numjobs }}
           FIO_RUNTIME: ${{ inputs.fio_runtime }}
           FIO_DIRECT: ${{ inputs.fio_direct }}
+          FIO_BS_LIST: ${{ inputs.fio_bs_list }}
+          FIO_IODEPTH_LIST: ${{ inputs.fio_iodepth_list }}
+          FIO_RWMIX_LIST: ${{ inputs.fio_rwmix_list }}
+          FIO_NUMJOBS_LIST: ${{ inputs.fio_numjobs_list }}
         run: |
           docker compose -f tests/bench/docker-compose.yml up \
             --build --abort-on-container-exit --exit-code-from runner

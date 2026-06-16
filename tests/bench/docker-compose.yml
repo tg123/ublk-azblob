@@ -56,8 +56,14 @@ services:
       FIO_SIZE: "${FIO_SIZE:-256M}"
       FIO_BS: "${FIO_BS:-4k}"
       FIO_IODEPTH: "${FIO_IODEPTH:-16}"
-      FIO_RUNTIME: "${FIO_RUNTIME:-15}"
+      FIO_NUMJOBS: "${FIO_NUMJOBS:-1}"
+      FIO_RUNTIME: "${FIO_RUNTIME:-10}"
       FIO_DIRECT: "${FIO_DIRECT:-1}"
+      # Phase 1 / Phase 4 sweep lists (space-separated).
+      FIO_BS_LIST: "${FIO_BS_LIST:-4k 16k 64k 256k 1M}"
+      FIO_IODEPTH_LIST: "${FIO_IODEPTH_LIST:-1 4 16 64 128}"
+      FIO_RWMIX_LIST: "${FIO_RWMIX_LIST:-100 70 50}"
+      FIO_NUMJOBS_LIST: "${FIO_NUMJOBS_LIST:-1 4 16 64}"
     command:
       - bash
       - -c

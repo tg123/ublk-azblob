@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn percentile_nearest_rank() {
-        let samples: Vec<Duration> = (1..=100).map(|i| Duration::from_millis(i)).collect();
+        let samples: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
         assert_eq!(percentile(&samples, 50.0), Duration::from_millis(50));
         assert_eq!(percentile(&samples, 99.0), Duration::from_millis(99));
         assert_eq!(percentile(&samples, 100.0), Duration::from_millis(100));
@@ -441,6 +441,106 @@ mod tests {
         let nblocks = 16u64;
         for i in 0..1000 {
             assert!(next_rand(i) % nblocks < nblocks);
+        }
+    }
+
+    #[test]
+    fn latency_stats_from_samples_sorts_and_summarises() {
+        // Deliberately unsorted input — `from_samples` must sort internally.
+        let samples: Vec<Duration> = [50, 10, 100, 30, 20, 40, 90, 60, 80, 70]
+            .into_iter()
+            .map(Duration::from_millis)
+            .collect();
+        let stats = LatencyStats::from_samples(samples);
+        assert_eq!(stats.min, Duration::from_millis(10));
+        assert_eq!(stats.max, Duration::from_millis(100));
+        assert_eq!(stats.avg, Duration::from_millis(55));
+        // Nearest-rank over 10 samples: p50 -> rank 5 (50ms), p95/p99 -> 100ms.
+        assert_eq!(stats.p50, Duration::from_millis(50));
+        assert_eq!(stats.p95, Duration::from_millis(100));
+        assert_eq!(stats.p99, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn latency_stats_from_empty_is_zero() {
+        let stats = LatencyStats::from_samples(Vec::new());
+        assert_eq!(stats.min, Duration::ZERO);
+        assert_eq!(stats.avg, Duration::ZERO);
+        assert_eq!(stats.p50, Duration::ZERO);
+        assert_eq!(stats.p95, Duration::ZERO);
+        assert_eq!(stats.p99, Duration::ZERO);
+        assert_eq!(stats.max, Duration::ZERO);
+    }
+
+    #[test]
+    fn percentile_single_sample() {
+        let samples = vec![Duration::from_millis(7)];
+        assert_eq!(percentile(&samples, 0.0), Duration::from_millis(7));
+        assert_eq!(percentile(&samples, 50.0), Duration::from_millis(7));
+        assert_eq!(percentile(&samples, 100.0), Duration::from_millis(7));
+    }
+
+    #[test]
+    fn throughput_and_iops_are_consistent() {
+        let r = PhaseResult {
+            name: "seq-read".into(),
+            ops: 1024,
+            bytes: 1024 * 4096,
+            elapsed: Duration::from_secs(2),
+            latencies: LatencyStats::from_samples(Vec::new()),
+        };
+        // 4 MiB in 2 s -> 2 MiB/s; 1024 ops in 2 s -> 512 IOPS.
+        assert!((r.throughput_mib_s() - 2.0).abs() < 1e-9);
+        assert!((r.iops() - 512.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn throughput_and_iops_zero_elapsed_is_zero() {
+        let r = PhaseResult {
+            name: "seq-read".into(),
+            ops: 10,
+            bytes: 10 * 4096,
+            elapsed: Duration::ZERO,
+            latencies: LatencyStats::from_samples(Vec::new()),
+        };
+        assert_eq!(r.throughput_mib_s(), 0.0);
+        assert_eq!(r.iops(), 0.0);
+    }
+
+    #[test]
+    fn workload_phase_counts() {
+        assert_eq!(Workload::Seq.phases().len(), 2);
+        assert_eq!(Workload::Rand.phases().len(), 2);
+        assert_eq!(Workload::All.phases().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn rejects_size_not_multiple_of_512() {
+        let backend: Arc<dyn BlobBackend> = Arc::new(MemBackend::new(64 * 1024).unwrap());
+        let mut bad = cfg(Workload::Seq);
+        bad.size = 4096 + 500; // >= block_size but not a multiple of 512
+        assert!(run_bench(backend, bad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_size_below_block_size() {
+        let backend: Arc<dyn BlobBackend> = Arc::new(MemBackend::new(64 * 1024).unwrap());
+        let mut bad = cfg(Workload::Seq);
+        bad.block_size = 8192;
+        bad.size = 4096; // multiple of 512 but < block_size
+        assert!(run_bench(backend, bad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn single_worker_runs_all_ops() {
+        // concurrency == 1 exercises the serial path and exact op accounting.
+        let backend: Arc<dyn BlobBackend> = Arc::new(MemBackend::new(64 * 1024).unwrap());
+        let mut c = cfg(Workload::All);
+        c.concurrency = 1;
+        let results = run_bench(backend, c).await.unwrap();
+        assert_eq!(results.len(), 4);
+        for r in &results {
+            assert_eq!(r.ops, 64);
         }
     }
 }

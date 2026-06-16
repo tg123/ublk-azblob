@@ -227,10 +227,24 @@ Both targets are benchmarked as raw block devices (no filesystem):
 * **local disk** — a loopback (`losetup`) device backed by a file on the
   container's local filesystem, used as the reference baseline.
 
-The same fio jobs (sequential/random read/write) run against each target and the
-script prints a side-by-side comparison of throughput (MiB/s), IOPS, and mean
-latency.  Like the e2e test, the Rust build, `fio`, and Azurite all run inside
-docker compose:
+The same fio jobs run against each target and the script prints a side-by-side
+comparison of throughput (MiB/s), IOPS, and mean latency, with each ublk-azblob
+result also expressed as a **percentage of the raw-local-disk baseline** (the
+`vs local` column). The jobs are grouped into phases:
+
+* **Phase 1 — Raw block performance:** the four base patterns (sequential and
+  random read/write) plus sweeps over block size (`4k…1M`), queue depth
+  (`1…128`), and read/write mix (`100/0`, `70/30`, `50/50`).
+* **Phase 2 — Cache behaviour:** a cold-cache vs. warm-cache buffered read so the
+  read-cache speed-up is visible.
+* **Phase 4 — Scalability:** the random-read workload at increasing thread
+  (`numjobs`) counts.
+
+(Phase 3 — backend Azure Blob GET/PUT/flush latency — is covered by the
+`bench` subcommand above, which measures the `BlobBackend` directly.)
+
+Like the e2e test, the Rust build, `fio`, and Azurite all run inside docker
+compose:
 
 ```bash
 # 1. Load the kernel module on the host (a container can't do this for you)
@@ -245,12 +259,15 @@ docker compose -f tests/bench/docker-compose.yml down -v
 ```
 
 The comparison table is printed to stdout and written to `bench-results.md`.
-The benchmark is tunable via environment variables (block size, queue depth,
-runtime, direct vs. buffered I/O, etc.) — see the header of
-[tests/bench/bench.sh](tests/bench/bench.sh) for the full list, e.g.:
+The benchmark is tunable via environment variables — base block size, queue
+depth, threads, runtime, direct vs. buffered I/O, and the per-phase sweep lists
+(`FIO_BS_LIST`, `FIO_IODEPTH_LIST`, `FIO_RWMIX_LIST`, `FIO_NUMJOBS_LIST`) — see
+the header of [tests/bench/bench.sh](tests/bench/bench.sh) for the full list,
+e.g.:
 
 ```bash
-FIO_BS=64k FIO_IODEPTH=32 FIO_RUNTIME=30 \
+# Trim the sweeps for a quick run.
+FIO_BS_LIST="4k 64k" FIO_IODEPTH_LIST="1 16" FIO_NUMJOBS_LIST="1 4" \
   docker compose -f tests/bench/docker-compose.yml up \
     --build --abort-on-container-exit --exit-code-from runner
 ```
