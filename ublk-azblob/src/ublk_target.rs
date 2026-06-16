@@ -98,11 +98,24 @@ mod signals {
     }
 
     /// Install async-signal-safe handlers that only flip atomics.
+    ///
+    /// Uses `sigaction` rather than the deprecated `signal()` so behaviour is
+    /// well-defined in the presence of the threads spawned by Tokio and
+    /// `libublk`.
     pub fn install() {
         unsafe {
-            libc::signal(libc::SIGINT, on_stop as *const () as usize);
-            libc::signal(libc::SIGTERM, on_stop as *const () as usize);
-            libc::signal(libc::SIGUSR1, on_flush as *const () as usize);
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_stop as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+
+            let mut sa_flush: libc::sigaction = std::mem::zeroed();
+            sa_flush.sa_sigaction = on_flush as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut sa_flush.sa_mask);
+            sa_flush.sa_flags = libc::SA_RESTART;
+            libc::sigaction(libc::SIGUSR1, &sa_flush, std::ptr::null_mut());
         }
     }
 }
