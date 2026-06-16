@@ -6,6 +6,10 @@ description = "Linux ublk userspace block device backed by Azure Page Blob"
 license = "MIT"
 repository = "https://github.com/tg123/ublk-azblob"
 
+# Build script: generates Rust bindings from the vendored CSI proto, but only
+# when the `csi` feature is enabled (so the default build needs no `protoc`).
+build = "build.rs"
+
 [[bin]]
 name = "ublk-azblob"
 path = "src/main.rs"
@@ -54,9 +58,28 @@ libublk = { version = "0.4.6", optional = true }
 # Raw libc bindings — only needed by the ublk I/O loop (errno constants, signals).
 libc = { version = "0.2.186", optional = true }
 
+# ── CSI (Kubernetes PersistentVolume) driver ────────────────────────────────
+# Gated behind the `csi` feature.  Pulls in a gRPC stack (tonic/prost) used to
+# implement the Container Storage Interface so a Kubernetes PVC can be backed by
+# a ublk Azure Page Blob device.  Requires `protoc` at build time.
+tonic = { version = "0.12.3", optional = true }
+prost = { version = "0.13.4", optional = true }
+prost-types = { version = "0.13.4", optional = true }
+tokio-stream = { version = "0.1.17", features = ["net"], optional = true }
+uuid = { version = "1.11.0", features = ["v4"], optional = true }
+
+[build-dependencies]
+# Only used when the `csi` feature is enabled (build.rs checks CARGO_FEATURE_CSI).
+tonic-build = "0.12.3"
+
 [features]
 # Enable the real ublk target (requires Linux ≥6.0 + ublk_drv loaded).
 ublk = ["dep:libublk", "dep:libc"]
+
+# Enable the Kubernetes CSI driver (`csi` subcommand).  The node side also needs
+# the `ublk` feature to actually attach block devices; enable both together with
+# `--features "ublk csi"` for a fully functional node plugin.
+csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "dep:uuid", "dep:libc"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full", "test-util"] }

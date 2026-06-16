@@ -392,6 +392,14 @@ impl BlobBackend for BufferedBackend {
         self.inner.flush().await
     }
 
+    async fn delete(&self) -> anyhow::Result<()> {
+        // Drop any buffered dirty pages and delegate to the inner backend.
+        let mut state = self.state.lock().await;
+        state.pages.clear();
+        drop(state);
+        self.inner.delete().await
+    }
+
     async fn size(&self) -> anyhow::Result<u64> {
         let mut state = self.state.lock().await;
         if state.dev_size == 0 {

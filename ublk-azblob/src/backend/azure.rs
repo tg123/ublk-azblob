@@ -154,6 +154,19 @@ impl BlobBackend for AzurePageBlobBackend {
     }
 
     #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn delete(&self) -> anyhow::Result<()> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("deleting blob");
+        if let Err(err) = blob_client.delete(None).await {
+            // A 404 means the blob is already gone — treat delete as idempotent.
+            if err.http_status() != Some(azure_core::http::StatusCode::NotFound) {
+                return Err(err).with_context(|| format!("delete blob '{}'", self.blob_name));
+            }
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
     async fn size(&self) -> anyhow::Result<u64> {
         let blob_client = self.container.blob_client(&self.blob_name);
         let props = blob_client

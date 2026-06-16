@@ -14,6 +14,8 @@
 
 mod auth;
 mod backend;
+#[cfg(feature = "csi")]
+mod csi;
 mod ublk_target;
 
 use anyhow::Context as _;
@@ -45,8 +47,12 @@ struct Cli {
     container: String,
 
     /// Page blob name (path within the container).
+    ///
+    /// Required by the `run` and `test` subcommands.  The `csi` subcommand picks
+    /// a per-volume blob name from the Kubernetes volume id, so it is optional
+    /// there.
     #[arg(long, env = "AZURE_STORAGE_BLOB")]
-    blob: String,
+    blob: Option<String>,
 
     /// Azure Storage service endpoint URL.
     ///
@@ -128,6 +134,26 @@ enum Command {
         #[arg(long, default_value = "4096")]
         size: u64,
     },
+
+    /// Run the Kubernetes CSI driver (Container Storage Interface gRPC server).
+    ///
+    /// Lets a Kubernetes PersistentVolumeClaim be backed by an Azure Page Blob
+    /// exposed through a ublk device.  Requires the `csi` build feature (and the
+    /// `ublk` feature on the node side).
+    #[cfg(feature = "csi")]
+    Csi {
+        /// CSI endpoint to listen on (`unix:///csi/csi.sock` or `tcp://addr:port`).
+        #[arg(long, env = "CSI_ENDPOINT", default_value = "unix:///csi/csi.sock")]
+        csi_endpoint: String,
+
+        /// Node identifier reported to Kubernetes (typically the node name).
+        #[arg(long, env = "CSI_NODE_ID", default_value = "")]
+        node_id: String,
+
+        /// Which CSI services to serve: `controller`, `node`, or `all`.
+        #[arg(long, env = "CSI_ROLE", default_value = "all")]
+        role: csi::Role,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -142,18 +168,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let auth = build_auth(&cli)?;
     let endpoint = cli
         .endpoint
+        .clone()
         .unwrap_or_else(|| format!("https://{}.blob.core.windows.net/", cli.account));
-
-    let container_client = auth::build_container_client(&endpoint, &cli.container, &auth)
-        .context("build container client")?;
-
-    let backend: Arc<dyn BlobBackend> = Arc::new(AzurePageBlobBackend::new(
-        container_client,
-        cli.blob.clone(),
-    ));
 
     match cli.command {
         Command::Run {
@@ -165,13 +183,14 @@ async fn main() -> anyhow::Result<()> {
             page_size,
             max_dirty_pages,
         } => {
+            let backend = build_azure_backend(&cli, &endpoint)?;
             if create {
-                info!(size, blob = %cli.blob, "creating page blob");
+                info!(size, "creating page blob");
                 backend.create(size).await.context("create page blob")?;
             }
 
             let actual_size = backend.size().await.context("get blob size")?;
-            info!(size = actual_size, blob = %cli.blob, "blob ready");
+            info!(size = actual_size, "blob ready");
 
             // Wrap with write-back buffer if page_size > 0.
             let backend: Arc<dyn BlobBackend> = if page_size > 0 {
@@ -204,11 +223,62 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Test { size } => {
+            let backend = build_azure_backend(&cli, &endpoint)?;
             run_smoke_test(backend, size).await?;
+        }
+
+        #[cfg(feature = "csi")]
+        Command::Csi {
+            csi_endpoint,
+            node_id,
+            role,
+        } => {
+            let config = csi::DriverConfig {
+                account: cli.account.clone(),
+                endpoint: endpoint.clone(),
+                default_container: cli.container.clone(),
+                account_key: cli.account_key.clone(),
+                use_msi: cli.msi
+                    || cli.msi_client_id.is_some()
+                    || cli.msi_object_id.is_some()
+                    || cli.msi_resource_id.is_some(),
+                msi_client_id: cli.msi_client_id.clone(),
+            };
+            let node_id = if node_id.is_empty() {
+                hostname()
+            } else {
+                node_id
+            };
+            csi::run_csi(&csi_endpoint, role, node_id, config)
+                .await
+                .context("CSI driver")?;
         }
     }
 
     Ok(())
+}
+
+/// Build an `AzurePageBlobBackend` for the blob selected by the global CLI
+/// options.  Used by the `run` and `test` subcommands (which target a single,
+/// explicitly-named blob).
+fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<dyn BlobBackend>> {
+    let blob = cli
+        .blob
+        .clone()
+        .context("--blob (AZURE_STORAGE_BLOB) is required for this subcommand")?;
+    let auth = build_auth(cli)?;
+    let container_client = auth::build_container_client(endpoint, &cli.container, &auth)
+        .context("build container client")?;
+    Ok(Arc::new(AzurePageBlobBackend::new(container_client, blob)))
+}
+
+/// Best-effort node hostname for the CSI `--node-id` default.
+#[cfg(feature = "csi")]
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "unknown-node".to_string())
 }
 
 // ── Auth builder ─────────────────────────────────────────────────────────────
