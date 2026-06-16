@@ -204,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
                     backend,
                     FileCacheConfig {
                         dir,
-                        name: format!("{}-{}", cli.container, cli.blob).replace('/', "_"),
+                        name: cache_file_name(&cli.container, &cli.blob),
                         page_size: cache_page_size,
                     },
                     actual_size,
@@ -268,6 +268,22 @@ async fn main() -> anyhow::Result<()> {
 
 // ── Auth builder ─────────────────────────────────────────────────────────────
 
+/// Build a filesystem-safe cache file base name from the container and blob.
+///
+/// Container/blob names may contain `/` and other characters; sanitizing to a
+/// fixed alphabet (alphanumerics plus `-` and `_`) keeps the cache files inside
+/// the chosen `--cache-dir` and prevents path traversal (e.g. `..`).
+fn cache_file_name(container: &str, blob: &str) -> String {
+    let mut name = String::with_capacity(container.len() + blob.len() + 1);
+    for ch in format!("{container}-{blob}").chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            name.push(ch);
+        } else {
+            name.push('_');
+        }
+    }
+    name
+}
 fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
     if let Some(key) = &cli.account_key {
         return Ok(AuthConfig::SharedKey {

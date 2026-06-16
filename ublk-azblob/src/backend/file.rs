@@ -125,7 +125,7 @@ impl FileCacheBackend {
         cfg: FileCacheConfig,
         dev_size: u64,
     ) -> anyhow::Result<(Self, u64)> {
-        if cfg.page_size < 512 || !cfg.page_size.is_multiple_of(512) {
+        if cfg.page_size == 0 || !cfg.page_size.is_multiple_of(512) {
             bail!(
                 "page_size ({}) must be a non-zero multiple of 512",
                 cfg.page_size
@@ -266,9 +266,12 @@ impl FileCacheBackend {
         // is lost on crash it is simply re-read from the inner backend.
         let byte = page_idx / 8;
         let present_off = HEADER_SIZE + byte;
-        let _ = state
+        if let Err(err) = state
             .meta
-            .write_all_at(&[state.present[byte as usize]], present_off);
+            .write_all_at(&[state.present[byte as usize]], present_off)
+        {
+            warn!(page_idx, %err, "failed to persist clean present bit (non-fatal)");
+        }
 
         Ok(page_len)
     }
