@@ -1,0 +1,108 @@
+# Node plug-in: attaches the ublk device and mounts the filesystem on each node.
+#
+# Runs on every node as a DaemonSet alongside the upstream
+# node-driver-registrar sidecar.  The plug-in is privileged and shares the host
+# /dev (to create and see /dev/ublkbN) and /var/lib/kubelet with Bidirectional
+# mount propagation (so the filesystem it mounts is visible to the kubelet and
+# can be bind-mounted into application pods).
+#
+# The ublk_drv kernel module must already be loaded on the host
+# (`sudo modprobe ublk_drv`); a container cannot load it.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: csi-azblob-node
+  namespace: kube-system
+  labels:
+    app: csi-azblob-node
+spec:
+  selector:
+    matchLabels:
+      app: csi-azblob-node
+  template:
+    metadata:
+      labels:
+        app: csi-azblob-node
+    spec:
+      serviceAccountName: csi-azblob-node
+      containers:
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/azblob.ublk.csi.tg123.github.io/csi.sock"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+
+        - name: azblob
+          image: ghcr.io/tg123/ublk-azblob:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          args:
+            - "csi"
+            - "--role=node"
+            - "--csi-endpoint=unix:///csi/csi.sock"
+          env:
+            - name: CSI_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: AZURE_STORAGE_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: csi-azblob-secret
+                  key: account
+            - name: AZURE_STORAGE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: csi-azblob-secret
+                  key: accountKey
+                  optional: true
+            - name: AZURE_STORAGE_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: csi-azblob-config
+                  key: endpoint
+                  optional: true
+            - name: AZURE_STORAGE_CONTAINER
+              valueFrom:
+                configMapKeyRef:
+                  name: csi-azblob-config
+                  key: container
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: dev-dir
+              mountPath: /dev
+            - name: modules-dir
+              mountPath: /lib/modules
+              readOnly: true
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/azblob.ublk.csi.tg123.github.io
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: modules-dir
+          hostPath:
+            path: /lib/modules
+            type: DirectoryOrCreate

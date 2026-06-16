@@ -1,0 +1,70 @@
+# Controller plug-in: provisions / deletes the Azure Page Blob behind each PVC.
+#
+# Runs the ublk-azblob CSI controller service alongside the upstream
+# external-provisioner sidecar.  They communicate over a shared unix socket in
+# an emptyDir.  A single replica is sufficient (provisioning is idempotent).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csi-azblob-controller
+  namespace: kube-system
+  labels:
+    app: csi-azblob-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: csi-azblob-controller
+  template:
+    metadata:
+      labels:
+        app: csi-azblob-controller
+    spec:
+      serviceAccountName: csi-azblob-controller
+      containers:
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--extra-create-metadata"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        - name: azblob
+          image: ghcr.io/tg123/ublk-azblob:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "csi"
+            - "--role=controller"
+            - "--csi-endpoint=unix:///csi/csi.sock"
+          env:
+            - name: AZURE_STORAGE_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: csi-azblob-secret
+                  key: account
+            - name: AZURE_STORAGE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: csi-azblob-secret
+                  key: accountKey
+                  optional: true
+            - name: AZURE_STORAGE_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: csi-azblob-config
+                  key: endpoint
+                  optional: true
+            - name: AZURE_STORAGE_CONTAINER
+              valueFrom:
+                configMapKeyRef:
+                  name: csi-azblob-config
+                  key: container
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

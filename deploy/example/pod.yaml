@@ -1,0 +1,23 @@
+# Example pod that mounts the ublk-azblob PVC and writes to it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: azblob-app
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -e
+          echo "hello from ublk-azblob $(date)" >> /data/hello.txt
+          cat /data/hello.txt
+          sleep 3600
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: azblob-pvc
