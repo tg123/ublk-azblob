@@ -1,0 +1,67 @@
+# docker-compose for the ublk-azblob I/O benchmark.
+#
+# Mirrors tests/e2e/docker-compose.yml, but instead of the mount/checksum test
+# the `runner` builds `ublk-azblob` (`--features ublk`) and runs the fio
+# benchmark comparing the ublk-azblob block device against a raw local disk.
+#
+#   * `azurite`  — local Azure Storage emulator (the page-blob backend).
+#   * `runner`   — builds the binary and runs tests/bench/bench.sh.
+#
+# The `runner` shares the host kernel: it is `privileged` and bind-mounts `/dev`
+# and `/lib/modules`, so the ublk device plus the loopback (losetup) raw disk
+# work inside the container.  The `ublk_drv` kernel module must already be loaded
+# on the *host* (`sudo modprobe ublk_drv`).
+#
+# Usage (after `sudo modprobe ublk_drv` on the host):
+#   docker compose -f tests/bench/docker-compose.yml up --build \
+#     --abort-on-container-exit --exit-code-from runner
+#   docker compose -f tests/bench/docker-compose.yml down -v
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+    command: azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+    ports:
+      - "10000:10000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('net').connect(10000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  runner:
+    build:
+      context: ../..
+      dockerfile: tests/bench/Dockerfile
+    depends_on:
+      azurite:
+        condition: service_healthy
+    # Needs a real kernel with ublk_drv (loaded on the host) plus the ability to
+    # create the ublk device and set up loopback devices — hence privileged.
+    privileged: true
+    volumes:
+      - ../..:/workspace
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+    working_dir: /workspace
+    environment:
+      AZURE_STORAGE_ENDPOINT: "http://azurite:10000/devstoreaccount1"
+      CARGO_TERM_COLOR: "always"
+      # Benchmark tunables (override on the `docker compose` command line).
+      DEV_SIZE_MIB: "${DEV_SIZE_MIB:-512}"
+      FIO_SIZE: "${FIO_SIZE:-256M}"
+      FIO_BS: "${FIO_BS:-4k}"
+      FIO_IODEPTH: "${FIO_IODEPTH:-16}"
+      FIO_RUNTIME: "${FIO_RUNTIME:-15}"
+      FIO_DIRECT: "${FIO_DIRECT:-1}"
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        cargo build --release --features ublk -p ublk-azblob
+        bash tests/bench/bench.sh

@@ -182,6 +182,52 @@ it is gated behind the `ublk` feature and skips itself when not run as root with
 
 ---
 
+## Benchmarking I/O speed (ublk-azblob vs. raw local disk)
+
+The benchmark **pipeline** measures the block-device I/O speed of `ublk-azblob`
+against a **raw local disk** baseline using [`fio`](https://fio.readthedocs.io/).
+Both targets are benchmarked as raw block devices (no filesystem):
+
+* **ublk-azblob** — a real `/dev/ublkbN` device backed by an Azure Page Blob
+  (Azurite in CI).
+* **local disk** — a loopback (`losetup`) device backed by a file on the
+  container's local filesystem, used as the reference baseline.
+
+The same fio jobs (sequential/random read/write) run against each target and the
+script prints a side-by-side comparison of throughput (MiB/s), IOPS, and mean
+latency.  Like the e2e test, the Rust build, `fio`, and Azurite all run inside
+docker compose:
+
+```bash
+# 1. Load the kernel module on the host (a container can't do this for you)
+sudo modprobe ublk_drv
+
+# 2. Build + run the fio benchmark against both targets and print the comparison.
+docker compose -f tests/bench/docker-compose.yml up \
+  --build --abort-on-container-exit --exit-code-from runner
+
+# 3. Tear everything down when done
+docker compose -f tests/bench/docker-compose.yml down -v
+```
+
+The comparison table is printed to stdout and written to `bench-results.md`.
+The benchmark is tunable via environment variables (block size, queue depth,
+runtime, direct vs. buffered I/O, etc.) — see the header of
+[tests/bench/bench.sh](tests/bench/bench.sh) for the full list, e.g.:
+
+```bash
+FIO_BS=64k FIO_IODEPTH=32 FIO_RUNTIME=30 \
+  docker compose -f tests/bench/docker-compose.yml up \
+    --build --abort-on-container-exit --exit-code-from runner
+```
+
+In CI the benchmark runs on demand via the **`bench`** workflow
+(`workflow_dispatch` in the Actions tab); it is not run on every push/PR because
+fio benchmarks take minutes.  Results are attached as a `bench-results` artifact
+and rendered into the run's job summary.
+
+---
+
 ## Running unit tests
 
 ```bash
@@ -204,6 +250,10 @@ The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
 `linux-modules-extra`, and runs the mount/remount/checksum cycle as root.
 (`ubuntu-24.04` is avoided because its azure kernel currently Oopses in
 `ublk_drv` — see [actions/runner-images#14175](https://github.com/actions/runner-images/issues/14175).)
+
+A separate **`bench`** workflow (manual `workflow_dispatch`) runs the fio
+benchmark comparing the ublk-azblob device against a raw local disk, on the same
+`ubuntu-22.04` runner.
 
 ---
 
@@ -228,8 +278,12 @@ ublk-azblob/
 │   └── tests/
 │       └── mount_e2e.rs        # full mount → write → flush → remount → verify
 ├── tests/
-│   └── e2e/
-│       ├── docker-compose.yml  # Azurite + test runner for the e2e test
-│       └── Dockerfile          # build + test runner image (rust + e2fsprogs)
+│   ├── e2e/
+│   │   ├── docker-compose.yml  # Azurite + test runner for the e2e test
+│   │   └── Dockerfile          # build + test runner image (rust + e2fsprogs)
+│   └── bench/
+│       ├── bench.sh            # fio benchmark: ublk-azblob vs. raw local disk
+│       ├── docker-compose.yml  # Azurite + benchmark runner
+│       └── Dockerfile          # build + benchmark runner image (rust + fio + jq)
 └── LICENSE.md                  # MIT license
 ```

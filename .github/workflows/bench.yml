@@ -1,0 +1,83 @@
+name: bench
+
+# I/O benchmark: ublk-azblob block device vs. a raw local disk.
+#
+# Run manually from the Actions tab (workflow_dispatch).  It is intentionally
+# *not* run on every push/PR — fio benchmarks take minutes and the numbers are
+# only meaningful as an on-demand comparison.
+on:
+  workflow_dispatch:
+    inputs:
+      dev_size_mib:
+        description: "Device / blob size (MiB)"
+        default: "512"
+      fio_size:
+        description: "How much of each device fio touches"
+        default: "256M"
+      fio_bs:
+        description: "Block size per I/O"
+        default: "4k"
+      fio_iodepth:
+        description: "Queue depth"
+        default: "16"
+      fio_runtime:
+        description: "Seconds per workload"
+        default: "15"
+      fio_direct:
+        description: "O_DIRECT (1) or buffered (0)"
+        default: "1"
+
+jobs:
+  bench:
+    name: fio benchmark (ublk-azblob vs raw local disk)
+    # Same kernel constraint as the e2e job: ublk_drv Oopses on the ubuntu-24.04
+    # azure kernel (actions/runner-images#14175); 22.04 ships a stable 6.x kernel.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load ublk_drv kernel module
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe ublk_drv
+          ls -l /dev/ublk-control
+
+      - name: Run benchmark (build + fio in docker compose runner)
+        env:
+          DEV_SIZE_MIB: ${{ inputs.dev_size_mib }}
+          FIO_SIZE: ${{ inputs.fio_size }}
+          FIO_BS: ${{ inputs.fio_bs }}
+          FIO_IODEPTH: ${{ inputs.fio_iodepth }}
+          FIO_RUNTIME: ${{ inputs.fio_runtime }}
+          FIO_DIRECT: ${{ inputs.fio_direct }}
+        run: |
+          docker compose -f tests/bench/docker-compose.yml up \
+            --build --abort-on-container-exit --exit-code-from runner
+
+      - name: Publish results to job summary
+        if: always()
+        run: |
+          if [ -f bench-results.md ]; then
+            cat bench-results.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No bench-results.md produced (benchmark failed?)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.md
+          if-no-files-found: ignore
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose -f tests/bench/docker-compose.yml logs || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/bench/docker-compose.yml down -v || true
