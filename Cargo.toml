@@ -1,0 +1,3 @@
+[workspace]
+members = ["ublk-azblob"]
+resolver = "2"
