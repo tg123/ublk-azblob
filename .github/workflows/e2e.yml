@@ -59,21 +59,9 @@ jobs:
       - name: Install e2fsprogs (mkfs.ext4)
         run: sudo apt-get install -y e2fsprogs
 
-      - name: Start Azurite
+      - name: Start Azurite (docker compose)
         run: |
-          docker run -d --name azurite -p 10000:10000 \
-            mcr.microsoft.com/azure-storage/azurite:3.34.0 \
-            azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
-          # Wait for the blob endpoint to start responding (any HTTP status
-          # means Azurite is up; the account root returns 400 without auth).
-          for _ in $(seq 1 30); do
-            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/devstoreaccount1 || true)"
-            if [ "${code}" != "000" ]; then
-              echo "Azurite responding (HTTP ${code})"
-              break
-            fi
-            sleep 1
-          done
+          docker compose -f tests/e2e/docker-compose.yml up -d --wait
 
       - name: Build ublk-azblob (--features ublk)
         run: cargo build --release --features ublk -p ublk-azblob
@@ -86,4 +74,4 @@ jobs:
 
       - name: Azurite logs on failure
         if: failure()
-        run: docker logs azurite || true
+        run: docker compose -f tests/e2e/docker-compose.yml logs || true

@@ -1,0 +1,37 @@
+# docker-compose for the ublk-azblob e2e test dependencies.
+#
+# This brings up the one external service the mount e2e needs — Azurite, a
+# local Azure Storage emulator — so anyone can run the test locally with a
+# single `docker compose up`.  The ublk device, mkfs.ext4 and mount/umount
+# themselves run on the host (they need a real kernel with `ublk_drv` loaded
+# and root), not inside a container.
+#
+# Usage:
+#   docker compose -f tests/e2e/docker-compose.yml up -d
+#   sudo modprobe ublk_drv
+#   sudo -E env "PATH=$PATH" \
+#     AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
+#     cargo test --release --features ublk -p ublk-azblob --test mount_e2e \
+#       -- --nocapture --test-threads=1
+#   docker compose -f tests/e2e/docker-compose.yml down
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+    # --skipApiVersionCheck lets Azurite accept the (newer) API version emitted
+    # by the pinned azure_storage_blob SDK; --loose relaxes header validation.
+    command: azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+    ports:
+      - "10000:10000"
+    healthcheck:
+      # Azurite is node-based (alpine, no curl).  Use node to confirm the blob
+      # port is accepting connections on IPv4 (avoids the BusyBox localhost→IPv6
+      # pitfall).
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('net').connect(10000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 2s
+      timeout: 5s
+      retries: 30

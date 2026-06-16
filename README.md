@@ -136,10 +136,8 @@ It requires a Linux ≥6.0 host with `ublk_drv` loaded, root / `CAP_SYS_ADMIN`,
 `mkfs.ext4` (e2fsprogs), and a running Azurite:
 
 ```bash
-# 1. Start Azurite
-docker run -d --name azurite -p 10000:10000 \
-  mcr.microsoft.com/azure-storage/azurite:3.34.0 \
-  azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+# 1. Start Azurite (the only external dependency) via docker compose
+docker compose -f tests/e2e/docker-compose.yml up -d --wait
 
 # 2. Load the kernel module and build with the ublk feature
 sudo modprobe ublk_drv
@@ -149,6 +147,9 @@ cargo build --release --features ublk -p ublk-azblob
 sudo -E env "PATH=$PATH" \
   AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
   cargo test --release --features ublk -p ublk-azblob --test mount_e2e -- --nocapture --test-threads=1
+
+# 4. Tear Azurite down when done
+docker compose -f tests/e2e/docker-compose.yml down
 ```
 
 The e2e test lives in [ublk-azblob/tests/mount_e2e.rs](ublk-azblob/tests/mount_e2e.rs);
@@ -201,5 +202,8 @@ ublk-azblob/
 │   │       └── mem.rs          # MemBackend (in-memory, for unit tests)
 │   └── tests/
 │       └── mount_e2e.rs        # full mount → write → flush → remount → verify
+├── tests/
+│   └── e2e/
+│       └── docker-compose.yml  # Azurite service for the e2e test
 └── LICENSE.md                  # MIT license
 ```
