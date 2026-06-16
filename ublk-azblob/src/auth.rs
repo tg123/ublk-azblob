@@ -27,11 +27,11 @@
 //! this file.
 
 use anyhow::Context as _;
+use azure_core::credentials::Secret;
 use azure_core::http::{
     policies::{Policy, PolicyResult},
     Context, Request,
 };
-use azure_core::credentials::Secret;
 use azure_identity::{
     ClientSecretCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
     UserAssignedId, WorkloadIdentityCredential, WorkloadIdentityCredentialOptions,
