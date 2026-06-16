@@ -101,7 +101,7 @@ stop_device() {
 start_device "--create"
 
 log "mkfs.ext4 on ${DEV}"
-mkfs.ext4 -q -F "${DEV}"
+mkfs.ext4 -q -F -E nodiscard "${DEV}"
 
 log "mounting ${DEV} at ${MNT}"
 mount "${DEV}" "${MNT}"
