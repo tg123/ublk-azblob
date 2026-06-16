@@ -1,28 +1,28 @@
 # RBAC for the ublk-azblob CSI driver.
 #
 # Two service accounts:
-#   * csi-azblob-controller — used by the controller Deployment and its
+#   * csi-ublk-azblob-controller — used by the controller Deployment and its
 #     external-provisioner sidecar (needs to watch PVCs and create/delete PVs).
-#   * csi-azblob-node       — used by the node DaemonSet and its
+#   * csi-ublk-azblob-node       — used by the node DaemonSet and its
 #     node-driver-registrar sidecar (minimal permissions).
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: csi-azblob-controller
+  name: csi-ublk-azblob-controller
   namespace: kube-system
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: csi-azblob-node
+  name: csi-ublk-azblob-node
   namespace: kube-system
 ---
 # Permissions required by the external-provisioner sidecar.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: csi-azblob-provisioner-role
+  name: csi-ublk-azblob-provisioner-role
 rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
@@ -52,12 +52,12 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: csi-azblob-provisioner-binding
+  name: csi-ublk-azblob-provisioner-binding
 subjects:
   - kind: ServiceAccount
-    name: csi-azblob-controller
+    name: csi-ublk-azblob-controller
     namespace: kube-system
 roleRef:
   kind: ClusterRole
-  name: csi-azblob-provisioner-role
+  name: csi-ublk-azblob-provisioner-role
   apiGroup: rbac.authorization.k8s.io

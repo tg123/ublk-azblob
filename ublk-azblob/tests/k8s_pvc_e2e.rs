@@ -236,7 +236,7 @@ fn pvc_write_remount_verify() {
             NS,
             "rollout",
             "status",
-            "deployment/csi-azblob-controller",
+            "deployment/csi-ublk-azblob-controller",
             "--timeout=180s",
         ],
     );
@@ -247,7 +247,7 @@ fn pvc_write_remount_verify() {
             NS,
             "rollout",
             "status",
-            "daemonset/csi-azblob-node",
+            "daemonset/csi-ublk-azblob-node",
             "--timeout=180s",
         ],
     );
@@ -311,7 +311,7 @@ fn render_secret() -> String {
     writeln!(s, "apiVersion: v1").unwrap();
     writeln!(s, "kind: Secret").unwrap();
     writeln!(s, "metadata:").unwrap();
-    writeln!(s, "  name: csi-azblob-secret").unwrap();
+    writeln!(s, "  name: csi-ublk-azblob-secret").unwrap();
     writeln!(s, "  namespace: {NS}").unwrap();
     writeln!(s, "type: Opaque").unwrap();
     writeln!(s, "data:").unwrap();
@@ -327,7 +327,7 @@ fn render_config(endpoint: &str) -> String {
     writeln!(s, "apiVersion: v1").unwrap();
     writeln!(s, "kind: ConfigMap").unwrap();
     writeln!(s, "metadata:").unwrap();
-    writeln!(s, "  name: csi-azblob-config").unwrap();
+    writeln!(s, "  name: csi-ublk-azblob-config").unwrap();
     writeln!(s, "  namespace: {NS}").unwrap();
     writeln!(s, "data:").unwrap();
     writeln!(s, "  endpoint: {endpoint}").unwrap();
@@ -377,7 +377,7 @@ fn dump_diagnostics(app: &str) {
             NS,
             "logs",
             "-l",
-            "app=csi-azblob-node",
+            "app=csi-ublk-azblob-node",
             "-c",
             "azblob",
             "--tail=200",

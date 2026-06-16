@@ -6,21 +6,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: csi-azblob-controller
+  name: csi-ublk-azblob-controller
   namespace: kube-system
   labels:
-    app: csi-azblob-controller
+    app: csi-ublk-azblob-controller
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: csi-azblob-controller
+      app: csi-ublk-azblob-controller
   template:
     metadata:
       labels:
-        app: csi-azblob-controller
+        app: csi-ublk-azblob-controller
     spec:
-      serviceAccountName: csi-azblob-controller
+      serviceAccountName: csi-ublk-azblob-controller
       containers:
         - name: csi-provisioner
           image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
@@ -43,24 +43,24 @@ spec:
             - name: AZURE_STORAGE_ACCOUNT
               valueFrom:
                 secretKeyRef:
-                  name: csi-azblob-secret
+                  name: csi-ublk-azblob-secret
                   key: account
             - name: AZURE_STORAGE_KEY
               valueFrom:
                 secretKeyRef:
-                  name: csi-azblob-secret
+                  name: csi-ublk-azblob-secret
                   key: accountKey
                   optional: true
             - name: AZURE_STORAGE_ENDPOINT
               valueFrom:
                 configMapKeyRef:
-                  name: csi-azblob-config
+                  name: csi-ublk-azblob-config
                   key: endpoint
                   optional: true
             - name: AZURE_STORAGE_CONTAINER
               valueFrom:
                 configMapKeyRef:
-                  name: csi-azblob-config
+                  name: csi-ublk-azblob-config
                   key: container
           volumeMounts:
             - name: socket-dir

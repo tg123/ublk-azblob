@@ -11,20 +11,20 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: csi-azblob-node
+  name: csi-ublk-azblob-node
   namespace: kube-system
   labels:
-    app: csi-azblob-node
+    app: csi-ublk-azblob-node
 spec:
   selector:
     matchLabels:
-      app: csi-azblob-node
+      app: csi-ublk-azblob-node
   template:
     metadata:
       labels:
-        app: csi-azblob-node
+        app: csi-ublk-azblob-node
     spec:
-      serviceAccountName: csi-azblob-node
+      serviceAccountName: csi-ublk-azblob-node
       containers:
         - name: node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
@@ -55,24 +55,24 @@ spec:
             - name: AZURE_STORAGE_ACCOUNT
               valueFrom:
                 secretKeyRef:
-                  name: csi-azblob-secret
+                  name: csi-ublk-azblob-secret
                   key: account
             - name: AZURE_STORAGE_KEY
               valueFrom:
                 secretKeyRef:
-                  name: csi-azblob-secret
+                  name: csi-ublk-azblob-secret
                   key: accountKey
                   optional: true
             - name: AZURE_STORAGE_ENDPOINT
               valueFrom:
                 configMapKeyRef:
-                  name: csi-azblob-config
+                  name: csi-ublk-azblob-config
                   key: endpoint
                   optional: true
             - name: AZURE_STORAGE_CONTAINER
               valueFrom:
                 configMapKeyRef:
-                  name: csi-azblob-config
+                  name: csi-ublk-azblob-config
                   key: container
           volumeMounts:
             - name: socket-dir

@@ -192,10 +192,10 @@ The `ublk_drv` kernel module must be loaded on every node
 docker build -f deploy/Dockerfile -t ghcr.io/tg123/ublk-azblob:latest .
 
 # 2. Provide storage credentials + endpoint to the driver
-kubectl -n kube-system create secret generic csi-azblob-secret \
+kubectl -n kube-system create secret generic csi-ublk-azblob-secret \
   --from-literal=account=<storage-account> \
   --from-literal=accountKey=<storage-key>           # omit when using Managed Identity
-kubectl -n kube-system create configmap csi-azblob-config \
+kubectl -n kube-system create configmap csi-ublk-azblob-config \
   --from-literal=endpoint=https://<account>.blob.core.windows.net \
   --from-literal=container=pvc
 

@@ -85,5 +85,5 @@ jobs:
         if: failure()
         run: |
           kubectl get pods -A || true
-          kubectl -n kube-system logs -l app=csi-azblob-controller -c azblob --tail=200 || true
-          kubectl -n kube-system logs -l app=csi-azblob-node -c azblob --tail=200 || true
+          kubectl -n kube-system logs -l app=csi-ublk-azblob-controller -c azblob --tail=200 || true
+          kubectl -n kube-system logs -l app=csi-ublk-azblob-node -c azblob --tail=200 || true

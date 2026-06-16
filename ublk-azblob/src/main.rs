@@ -65,8 +65,9 @@ struct Cli {
 
     /// Storage account key (base64).  Enables SharedKey auth mode.
     ///
-    /// Mutually exclusive with --msi / --msi-*.  Use for Azurite and local dev.
-    #[arg(long, env = "AZURE_STORAGE_KEY", conflicts_with_all = ["msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
+    /// Mutually exclusive with --msi / --msi-* / --workload-identity.  Use for
+    /// Azurite and local dev.
+    #[arg(long, env = "AZURE_STORAGE_KEY", conflicts_with_all = ["msi", "msi_client_id", "msi_object_id", "msi_resource_id", "workload_identity"])]
     account_key: Option<String>,
 
     /// Enable system-assigned Managed Identity.
@@ -84,6 +85,29 @@ struct Cli {
     /// User-assigned Managed Identity — resource ID.
     #[arg(long, env = "AZURE_MSI_RESOURCE_ID")]
     msi_resource_id: Option<String>,
+
+    /// Enable Microsoft Entra Workload Identity (federated Kubernetes token).
+    ///
+    /// The recommended way to access Azure Storage from AKS pods. The client
+    /// id, tenant id and projected token file default to the standard
+    /// `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_FEDERATED_TOKEN_FILE`
+    /// environment variables injected by the workload-identity webhook.
+    /// Mutually exclusive with --account-key and the --msi* flags.
+    #[arg(long, env = "AZURE_USE_WORKLOAD_IDENTITY", conflicts_with_all = ["msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
+    workload_identity: bool,
+
+    /// Workload Identity client ID (overrides `AZURE_CLIENT_ID`).
+    #[arg(long, env = "AZURE_CLIENT_ID")]
+    azure_client_id: Option<String>,
+
+    /// Workload Identity tenant ID (overrides `AZURE_TENANT_ID`).
+    #[arg(long, env = "AZURE_TENANT_ID")]
+    azure_tenant_id: Option<String>,
+
+    /// Path to the projected federated token file (overrides
+    /// `AZURE_FEDERATED_TOKEN_FILE`).
+    #[arg(long, env = "AZURE_FEDERATED_TOKEN_FILE")]
+    azure_federated_token_file: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -309,6 +333,10 @@ async fn main() -> anyhow::Result<()> {
                     || cli.msi_object_id.is_some()
                     || cli.msi_resource_id.is_some(),
                 msi_client_id: cli.msi_client_id.clone(),
+                use_workload_identity: cli.workload_identity,
+                workload_identity_client_id: cli.azure_client_id.clone(),
+                workload_identity_tenant_id: cli.azure_tenant_id.clone(),
+                workload_identity_token_file: cli.azure_federated_token_file.clone(),
             };
             let node_id = if node_id.is_empty() {
                 hostname()
@@ -448,6 +476,14 @@ fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
         });
     }
 
+    if cli.workload_identity {
+        return Ok(AuthConfig::WorkloadIdentity {
+            client_id: cli.azure_client_id.clone(),
+            tenant_id: cli.azure_tenant_id.clone(),
+            token_file: cli.azure_federated_token_file.clone(),
+        });
+    }
+
     // Prefer user-assigned identities if given, fall back to system-assigned.
     let user_assigned = cli
         .msi_client_id
@@ -470,6 +506,7 @@ fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
 
     anyhow::bail!(
         "No auth method specified. Use --account-key for Azurite/dev, \
+         --workload-identity for AKS (federated token), \
          or --msi / --msi-client-id for production (Managed Identity)."
     );
 }

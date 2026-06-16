@@ -37,12 +37,11 @@ FROM debian:bookworm-slim
 
 # - e2fsprogs : mkfs.ext4 + blkid
 # - util-linux: mount / umount
-# - kmod      : modprobe / lsmod (the ublk_drv module is loaded on the host)
+# (the ublk_drv module is loaded on the host, so no kmod/modprobe is needed here)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         e2fsprogs \
         util-linux \
-        kmod \
         ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 

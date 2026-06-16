@@ -61,7 +61,7 @@ jobs:
         with:
           images: |
             ghcr.io/${{ github.repository }}
-            name=docker.io/${{ github.repository }},enable=${{ steps.dockerhub.outputs.enabled }}
+            name=docker.io/farmer1992/ublk-azblob,enable=${{ steps.dockerhub.outputs.enabled }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag

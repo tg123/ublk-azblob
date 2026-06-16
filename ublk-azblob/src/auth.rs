@@ -1,13 +1,21 @@
 //! Authentication helpers for Azure Storage.
 //!
-//! Supports two auth modes:
+//! Supports three auth modes:
 //!
 //! 1. **Managed Identity (MSI)** — uses [`azure_identity::ManagedIdentityCredential`].
 //!    Suitable for production workloads running on Azure VMs / AKS / App Service.
 //!    System-assigned and user-assigned (client/object/resource ID) identities are
 //!    both supported.
 //!
-//! 2. **Shared Key (account key)** — implements the Azure Storage
+//! 2. **Workload Identity** — uses [`azure_identity::WorkloadIdentityCredential`],
+//!    the recommended way to access Azure from AKS pods via a federated
+//!    Kubernetes service-account token (Microsoft Entra Workload ID). The
+//!    client id, tenant id and projected token file are taken from the standard
+//!    `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_FEDERATED_TOKEN_FILE`
+//!    environment variables injected by the workload-identity webhook, or from
+//!    explicit overrides.
+//!
+//! 3. **Shared Key (account key)** — implements the Azure Storage
 //!    `SharedKey` HMAC-SHA256 signing scheme as a pipeline [`Policy`].
 //!    Used for Azurite (the local emulator) and any environment where you have
 //!    the raw storage account key.  Azurite does **not** support Entra ID / MSI,
@@ -23,9 +31,13 @@ use azure_core::http::{
     policies::{Policy, PolicyResult},
     Context, Request,
 };
-use azure_identity::{ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId};
+use azure_identity::{
+    ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId,
+    WorkloadIdentityCredential, WorkloadIdentityCredentialOptions,
+};
 use azure_storage_blob::{BlobContainerClient, BlobContainerClientOptions, BlobServiceClient};
 use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine as _};
+use std::path::PathBuf;
 use std::sync::Arc;
 use time::{macros::format_description, OffsetDateTime};
 use tracing::debug;
@@ -46,6 +58,17 @@ pub enum UserAssignedIdentity {
 pub enum AuthConfig {
     /// Managed Identity (system-assigned or user-assigned).
     Msi(Option<UserAssignedIdentity>),
+
+    /// Microsoft Entra Workload Identity (federated Kubernetes token).
+    ///
+    /// Each field falls back to its standard environment variable when `None`:
+    /// `client_id` → `AZURE_CLIENT_ID`, `tenant_id` → `AZURE_TENANT_ID`,
+    /// `token_file` → `AZURE_FEDERATED_TOKEN_FILE`.
+    WorkloadIdentity {
+        client_id: Option<String>,
+        tenant_id: Option<String>,
+        token_file: Option<String>,
+    },
 
     /// Storage account shared key (HMAC-SHA256).
     ///
@@ -90,6 +113,29 @@ pub fn build_container_client(
                 ManagedIdentityCredential::new(opts).context("create ManagedIdentityCredential")?;
             let svc = BlobServiceClient::new(url, Some(cred), None)
                 .context("create BlobServiceClient (MSI)")?;
+            Ok(svc.blob_container_client(container_name))
+        }
+
+        AuthConfig::WorkloadIdentity {
+            client_id,
+            tenant_id,
+            token_file,
+        } => {
+            debug!(
+                client_id = ?client_id,
+                tenant_id = ?tenant_id,
+                "using Workload Identity credential"
+            );
+            let opts = WorkloadIdentityCredentialOptions {
+                client_id: client_id.clone(),
+                tenant_id: tenant_id.clone(),
+                token_file_path: token_file.clone().map(PathBuf::from),
+                ..Default::default()
+            };
+            let cred = WorkloadIdentityCredential::new(Some(opts))
+                .context("create WorkloadIdentityCredential")?;
+            let svc = BlobServiceClient::new(url, Some(cred), None)
+                .context("create BlobServiceClient (Workload Identity)")?;
             Ok(svc.blob_container_client(container_name))
         }
 
@@ -291,7 +337,7 @@ impl Policy for SharedKeyPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::SharedKeyPolicy;
+    use super::{build_container_client, AuthConfig, SharedKeyPolicy};
 
     #[test]
     fn canonicalized_resource_azurite_includes_account_in_path() {
@@ -321,5 +367,35 @@ mod tests {
         let resource = SharedKeyPolicy::canonicalized_resource("devstoreaccount1", &url);
 
         assert_eq!(resource, "/devstoreaccount1/mycontainer/myblob");
+    }
+
+    #[test]
+    fn build_container_client_workload_identity() {
+        // The Workload Identity credential reads the federated token file at
+        // construction time, so point it at a temp file and pass explicit
+        // client/tenant ids (so the test does not depend on ambient env vars).
+        let token_path = std::env::temp_dir().join(format!(
+            "ublk-azblob-wi-{}-{}.tok",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&token_path, "fake.federated.jwt").unwrap();
+
+        let auth = AuthConfig::WorkloadIdentity {
+            client_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
+            tenant_id: Some("contoso.onmicrosoft.com".to_string()),
+            token_file: Some(token_path.to_string_lossy().into_owned()),
+        };
+
+        let client = build_container_client(
+            "https://devstoreaccount1.blob.core.windows.net/",
+            "mycontainer",
+            &auth,
+        );
+
+        let ok = client.is_ok();
+        let err = client.err().map(|e| format!("{e:#}"));
+        std::fs::remove_file(&token_path).ok();
+        assert!(ok, "workload identity client failed: {err:?}");
     }
 }

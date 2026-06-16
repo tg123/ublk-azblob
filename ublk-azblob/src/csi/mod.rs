@@ -104,6 +104,14 @@ pub struct DriverConfig {
     pub use_msi: bool,
     /// Optional user-assigned Managed Identity client id.
     pub msi_client_id: Option<String>,
+    /// Use Microsoft Entra Workload Identity (federated Kubernetes token).
+    pub use_workload_identity: bool,
+    /// Optional Workload Identity client id (defaults to `AZURE_CLIENT_ID`).
+    pub workload_identity_client_id: Option<String>,
+    /// Optional Workload Identity tenant id (defaults to `AZURE_TENANT_ID`).
+    pub workload_identity_tenant_id: Option<String>,
+    /// Optional federated token file path (defaults to `AZURE_FEDERATED_TOKEN_FILE`).
+    pub workload_identity_token_file: Option<String>,
 }
 
 /// Run the CSI gRPC server, listening on `endpoint` until the process is
@@ -208,6 +216,12 @@ pub fn build_backend(
             account_name: config.account.clone(),
             account_key: key,
         }
+    } else if config.use_workload_identity {
+        AuthConfig::WorkloadIdentity {
+            client_id: config.workload_identity_client_id.clone(),
+            tenant_id: config.workload_identity_tenant_id.clone(),
+            token_file: config.workload_identity_token_file.clone(),
+        }
     } else if config.use_msi || config.msi_client_id.is_some() {
         AuthConfig::Msi(
             config
@@ -218,7 +232,8 @@ pub fn build_backend(
     } else {
         anyhow::bail!(
             "no auth configured: provide an account key (secret 'accountKey' or \
-             --account-key) or enable Managed Identity (--msi / --msi-client-id)"
+             --account-key), enable Workload Identity (--workload-identity), or \
+             enable Managed Identity (--msi / --msi-client-id)"
         );
     };
 
