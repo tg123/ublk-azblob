@@ -114,7 +114,7 @@ All CLI flags have environment-variable equivalents:
 | Mode | Flag | Notes |
 |------|------|-------|
 | Managed Identity (system) | `--msi` | Recommended on Azure VMs; no secrets on disk |
-| Managed Identity (user) | `--msi --msi-client-id <id>` | Multiple identities per host |
+| Managed Identity (user) | `--msi-client-id <id>` | Multiple identities per host |
 | Shared Key | `--account-key <key>` | Local dev, CI, Azurite |
 
 > **Note:** The Azure Rust SDK (`azure_identity`, `azure_storage_blob`) is

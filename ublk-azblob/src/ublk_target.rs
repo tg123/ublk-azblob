@@ -13,7 +13,8 @@
 //!
 //! Without the feature flag the module exposes a stub that prints a clear
 //! error and exits.  All `BlobBackend` logic (read/write/clear) can still be
-//! exercised through the integration tests without the kernel driver.
+//! exercised through unit tests and the `test` subcommand without the kernel
+//! driver.
 //!
 //! ## Signals (feature = "ublk")
 //! Once the device is up the process installs handlers for:
@@ -86,6 +87,7 @@ pub async fn run_ublk_target(backend: Arc<dyn BlobBackend>, cfg: UblkConfig) -> 
 #[cfg(feature = "ublk")]
 mod signals {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing::warn;
 
     pub static STOP: AtomicBool = AtomicBool::new(false);
     pub static FLUSH: AtomicBool = AtomicBool::new(false);
@@ -102,8 +104,8 @@ mod signals {
     ///
     /// Uses `sigaction` rather than the deprecated `signal()` so behaviour is
     /// well-defined in the presence of the threads spawned by Tokio and
-    /// `libublk`.  Returns an error if any handler fails to install so the
-    /// caller can avoid running a device that can't respond to signals.
+    /// `libublk`. Any installation failure is logged as a warning so the device
+    /// can continue running even if one signal hook is unavailable.
     fn set_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) -> std::io::Result<()> {
         // SAFETY: `sa` is fully initialised before use and the handler is
         // async-signal-safe (it only stores into an atomic).
@@ -121,11 +123,20 @@ mod signals {
         Ok(())
     }
 
-    pub fn install() -> std::io::Result<()> {
-        set_handler(libc::SIGINT, on_stop)?;
-        set_handler(libc::SIGTERM, on_stop)?;
-        set_handler(libc::SIGUSR1, on_flush)?;
-        Ok(())
+    pub fn install() {
+        for (sig, name, handler) in [
+            (
+                libc::SIGINT,
+                "SIGINT",
+                on_stop as extern "C" fn(libc::c_int),
+            ),
+            (libc::SIGTERM, "SIGTERM", on_stop),
+            (libc::SIGUSR1, "SIGUSR1", on_flush),
+        ] {
+            if let Err(e) = set_handler(sig, handler) {
+                warn!(signal = name, err = %e, "failed to install signal handler");
+            }
+        }
     }
 }
 
@@ -163,6 +174,8 @@ fn run_ublk_target_blocking(
 
     let dev_size = cfg.dev_size;
     let block_size = cfg.block_size;
+    let block_size_u64 = u64::from(block_size);
+    let block_size_usize = usize::try_from(block_size).expect("block size fits in usize");
     let tgt_init = move |dev: &mut UblkDev| {
         // Advertise a volatile write cache so the kernel issues FLUSH on
         // sync/umount, then honour the configured logical block size.
@@ -185,8 +198,10 @@ fn run_ublk_target_blocking(
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let op = iod.op_flags & 0xff;
-                let off = iod.start_sector << 9;
-                let len = (iod.nr_sectors << 9) as usize;
+                let off = iod.start_sector * block_size_u64;
+                let len = usize::try_from(iod.nr_sectors)
+                    .expect("nr_sectors fits in usize")
+                    * block_size_usize;
                 let buf = &bufs_io[tag as usize];
 
                 let res: i32 = match op {
@@ -275,10 +290,7 @@ fn run_ublk_target_blocking(
         let backend = backend.clone();
         let rt = rt.clone();
         move |ctrl: &UblkCtrl| {
-            if let Err(e) = signals::install() {
-                error!(err = %e, "failed to install signal handlers — shutting down");
-                signals::STOP.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
+            signals::install();
             info!(dev_id = ctrl.dev_info().dev_id, "ublk device ready");
             while !signals::STOP.load(std::sync::atomic::Ordering::SeqCst) {
                 if signals::FLUSH.swap(false, std::sync::atomic::Ordering::SeqCst) {

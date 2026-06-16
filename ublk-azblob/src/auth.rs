@@ -169,7 +169,17 @@ impl SharedKeyPolicy {
     /// Format: `/{account}/{path}\n{sorted query params}`
     fn canonicalized_resource(account: &str, url: &azure_core::http::Url) -> String {
         let path = url.path();
-        let mut result = format!("/{account}{path}");
+        let account_prefix = format!("/{account}");
+        let normalized_path = path
+            .strip_prefix(&account_prefix)
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+            .unwrap_or(path);
+        let normalized_path = if normalized_path.is_empty() {
+            "/"
+        } else {
+            normalized_path
+        };
+        let mut result = format!("/{account}{normalized_path}");
 
         // Collect and sort query parameters
         let mut params: Vec<(String, String)> = url
@@ -281,5 +291,34 @@ impl Policy for SharedKeyPolicy {
 
         // Continue down the pipeline
         next[0].send(ctx, request, &next[1..]).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SharedKeyPolicy;
+
+    #[test]
+    fn canonicalized_resource_strips_azurite_account_prefix() {
+        let url = azure_core::http::Url::parse(
+            "http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob",
+        )
+        .unwrap();
+
+        let resource = SharedKeyPolicy::canonicalized_resource("devstoreaccount1", &url);
+
+        assert_eq!(resource, "/devstoreaccount1/mycontainer/myblob");
+    }
+
+    #[test]
+    fn canonicalized_resource_keeps_normal_storage_paths() {
+        let url = azure_core::http::Url::parse(
+            "https://devstoreaccount1.blob.core.windows.net/mycontainer/myblob",
+        )
+        .unwrap();
+
+        let resource = SharedKeyPolicy::canonicalized_resource("devstoreaccount1", &url);
+
+        assert_eq!(resource, "/devstoreaccount1/mycontainer/myblob");
     }
 }

@@ -18,7 +18,11 @@ mod ublk_target;
 
 use anyhow::Context as _;
 use auth::{AuthConfig, UserAssignedIdentity};
-use backend::{azure::AzurePageBlobBackend, buffered::{BufferedBackend, BufferedConfig}, BlobBackend};
+use backend::{
+    azure::AzurePageBlobBackend,
+    buffered::{BufferedBackend, BufferedConfig},
+    BlobBackend,
+};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tracing::{error, info};

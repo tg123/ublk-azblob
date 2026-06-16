@@ -273,12 +273,13 @@ impl BlobBackend for BufferedBackend {
 
             self.ensure_page(&mut state, page_idx).await?;
 
+            state.seq_counter += 1;
+            let seq = state.seq_counter;
             let page = state.pages.get_mut(&page_idx).unwrap();
             page.data[page_offset..page_offset + chunk_len]
                 .copy_from_slice(&data[pos as usize..pos as usize + chunk_len]);
             page.dirty = true;
-            state.seq_counter += 1;
-            page.seq = state.seq_counter;
+            page.seq = seq;
 
             pos += chunk_len as u64;
         }
@@ -318,11 +319,12 @@ impl BlobBackend for BufferedBackend {
 
             self.ensure_page(&mut state, page_idx).await?;
 
+            state.seq_counter += 1;
+            let seq = state.seq_counter;
             let page = state.pages.get_mut(&page_idx).unwrap();
             page.data[page_offset..page_offset + chunk_len].fill(0);
             page.dirty = true;
-            state.seq_counter += 1;
-            page.seq = state.seq_counter;
+            page.seq = seq;
 
             pos += chunk_len as u64;
         }
