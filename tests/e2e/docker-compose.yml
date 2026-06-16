@@ -1,19 +1,22 @@
-# docker-compose for the ublk-azblob e2e test dependencies.
+# docker-compose for the ublk-azblob e2e test.
 #
-# This brings up the one external service the mount e2e needs — Azurite, a
-# local Azure Storage emulator — so anyone can run the test locally with a
-# single `docker compose up`.  The ublk device, mkfs.ext4 and mount/umount
-# themselves run on the host (they need a real kernel with `ublk_drv` loaded
-# and root), not inside a container.
+# This brings up the whole mount e2e:
 #
-# Usage:
-#   docker compose -f tests/e2e/docker-compose.yml up -d
-#   sudo modprobe ublk_drv
-#   sudo -E env "PATH=$PATH" \
-#     AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
-#     cargo test --release --features ublk -p ublk-azblob --test mount_e2e \
-#       -- --nocapture --test-threads=1
-#   docker compose -f tests/e2e/docker-compose.yml down
+#   * `azurite`  — a local Azure Storage emulator (the one external service the
+#     test talks to).
+#   * `runner`   — builds `ublk-azblob` (`--features ublk`) and runs the Rust
+#     mount e2e (`tests/mount_e2e.rs`) against Azurite.
+#
+# The `runner` shares the host kernel: it is `privileged` and bind-mounts
+# `/dev` and `/lib/modules`, so the ublk device it creates (plus `mkfs.ext4` and
+# `mount`) work inside the container.  The `ublk_drv` kernel module must already
+# be loaded on the *host* (`sudo modprobe ublk_drv`) — a container cannot load
+# kernel modules into a kernel that lacks them.
+#
+# Usage (after `sudo modprobe ublk_drv` on the host):
+#   docker compose -f tests/e2e/docker-compose.yml up --build \
+#     --abort-on-container-exit --exit-code-from runner
+#   docker compose -f tests/e2e/docker-compose.yml down -v
 
 services:
   azurite:
@@ -35,3 +38,31 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+
+  runner:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile
+    depends_on:
+      azurite:
+        condition: service_healthy
+    # Needs a real kernel with ublk_drv (loaded on the host) plus the ability to
+    # create the ublk device, mkfs.ext4 and mount — hence privileged + host /dev.
+    privileged: true
+    volumes:
+      - ../..:/workspace
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+    working_dir: /workspace
+    environment:
+      # Reach Azurite over the compose network rather than via localhost.
+      AZURE_STORAGE_ENDPOINT: "http://azurite:10000/devstoreaccount1"
+      CARGO_TERM_COLOR: "always"
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        cargo build --release --features ublk -p ublk-azblob
+        cargo test --release --features ublk -p ublk-azblob \
+          --test mount_e2e -- --nocapture --test-threads=1

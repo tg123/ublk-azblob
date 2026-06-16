@@ -43,11 +43,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-
       - name: Load ublk_drv kernel module
         run: |
           sudo apt-get update
@@ -56,22 +51,17 @@ jobs:
           sudo modprobe ublk_drv
           ls -l /dev/ublk-control
 
-      - name: Install e2fsprogs (mkfs.ext4)
-        run: sudo apt-get install -y e2fsprogs
-
-      - name: Start Azurite (docker compose)
+      - name: Run mount e2e (build + test in docker compose runner)
+        # The `runner` service builds with --features ublk and runs the Rust
+        # mount/remount/checksum test; Azurite is brought up as its dependency.
         run: |
-          docker compose -f tests/e2e/docker-compose.yml up -d --wait
+          docker compose -f tests/e2e/docker-compose.yml up \
+            --build --abort-on-container-exit --exit-code-from runner
 
-      - name: Build ublk-azblob (--features ublk)
-        run: cargo build --release --features ublk -p ublk-azblob
-
-      - name: Run mount e2e (mount → write → flush → unmount → remount → verify)
-        run: |
-          sudo -E env "PATH=$PATH" \
-            AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
-            cargo test --release --features ublk -p ublk-azblob --test mount_e2e -- --nocapture --test-threads=1
-
-      - name: Azurite logs on failure
+      - name: Compose logs on failure
         if: failure()
         run: docker compose -f tests/e2e/docker-compose.yml logs || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/e2e/docker-compose.yml down -v || true

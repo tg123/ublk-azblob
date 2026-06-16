@@ -132,24 +132,21 @@ backed by an Azure Page Blob (Azurite), with an ext4 filesystem mounted on top.
 It writes random files, forces a flush (`SIGUSR1`), unmounts, tears the device
 down, remounts over the same blob, and verifies every file's SHA-256 checksum.
 
-It requires a Linux ≥6.0 host with `ublk_drv` loaded, root / `CAP_SYS_ADMIN`,
-`mkfs.ext4` (e2fsprogs), and a running Azurite:
+It requires a Linux ≥6.0 host with `ublk_drv` loaded and Docker.  Everything
+else — the Rust build, `mkfs.ext4`, and Azurite — runs inside docker compose:
 
 ```bash
-# 1. Start Azurite (the only external dependency) via docker compose
-docker compose -f tests/e2e/docker-compose.yml up -d --wait
-
-# 2. Load the kernel module and build with the ublk feature
+# 1. Load the kernel module on the host (a container can't do this for you)
 sudo modprobe ublk_drv
-cargo build --release --features ublk -p ublk-azblob
 
-# 3. Run the mount → write → flush → unmount → remount → verify cycle
-sudo -E env "PATH=$PATH" \
-  AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
-  cargo test --release --features ublk -p ublk-azblob --test mount_e2e -- --nocapture --test-threads=1
+# 2. Build + run the mount → write → flush → unmount → remount → verify cycle.
+#    The `runner` service builds with --features ublk and runs the Rust test;
+#    Azurite is started automatically as its dependency.
+docker compose -f tests/e2e/docker-compose.yml up \
+  --build --abort-on-container-exit --exit-code-from runner
 
-# 4. Tear Azurite down when done
-docker compose -f tests/e2e/docker-compose.yml down
+# 3. Tear everything down when done
+docker compose -f tests/e2e/docker-compose.yml down -v
 ```
 
 The e2e test lives in [ublk-azblob/tests/mount_e2e.rs](ublk-azblob/tests/mount_e2e.rs);
@@ -204,6 +201,7 @@ ublk-azblob/
 │       └── mount_e2e.rs        # full mount → write → flush → remount → verify
 ├── tests/
 │   └── e2e/
-│       └── docker-compose.yml  # Azurite service for the e2e test
+│       ├── docker-compose.yml  # Azurite + test runner for the e2e test
+│       └── Dockerfile          # build + test runner image (rust + e2fsprogs)
 └── LICENSE.md                  # MIT license
 ```
