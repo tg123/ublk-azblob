@@ -111,7 +111,7 @@ impl Access {
 /// Benchmark parameters.
 #[derive(Clone, Debug)]
 pub struct BenchConfig {
-    /// Size of the backing blob in bytes (must be ≥ `block_size`).
+    /// Size of the backing blob in bytes (a multiple of 512, and ≥ `block_size`).
     pub size: u64,
     /// I/O size per operation in bytes (multiple of 512).
     pub block_size: u64,
