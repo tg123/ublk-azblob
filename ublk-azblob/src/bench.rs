@@ -215,14 +215,8 @@ pub async fn run_bench(
         backend.create(cfg.size).await.context("create blob")?;
     }
 
+    // `validate` guarantees size >= block_size (both non-zero), so nblocks >= 1.
     let nblocks = cfg.size / cfg.block_size;
-    if nblocks == 0 {
-        bail!(
-            "size ({}) must be at least block_size ({})",
-            cfg.size,
-            cfg.block_size
-        );
-    }
 
     info!(
         size = cfg.size,
@@ -249,7 +243,9 @@ async fn run_phase(
     phase: Phase,
     nblocks: u64,
 ) -> anyhow::Result<PhaseResult> {
-    // Shared write payload reused across operations (writes only).
+    // Shared write payload reused across operations (writes only). 0xA5 is an
+    // arbitrary non-zero fill pattern (alternating bits) so writes don't look
+    // like a zero/clear request.
     let payload = Bytes::from(vec![0xA5u8; cfg.block_size as usize]);
     let next = Arc::new(AtomicU64::new(0));
 
@@ -341,7 +337,8 @@ fn validate(cfg: &BenchConfig) -> anyhow::Result<()> {
 }
 
 /// Deterministic, fast pseudo-random number (SplitMix64) — avoids pulling in a
-/// `rand` dependency just to spread out block offsets.
+/// `rand` dependency just to spread out block offsets.  Constants are from the
+/// reference SplitMix64 implementation (https://prng.di.unimi.it/splitmix64.c).
 fn next_rand(seed: u64) -> u64 {
     let mut z = seed
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
