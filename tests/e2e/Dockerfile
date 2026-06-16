@@ -12,12 +12,14 @@ FROM rust:1.88-slim
 # - e2fsprogs : mkfs.ext4
 # - util-linux: mount / umount
 # - kmod      : modprobe / lsmod (the module is loaded on the host)
+# - libclang-dev: required by bindgen (used by libublk-rs-sys build script)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         e2fsprogs \
         util-linux \
         kmod \
         ca-certificates \
+        libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
