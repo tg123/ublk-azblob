@@ -166,20 +166,15 @@ impl SharedKeyPolicy {
 
     /// Build the canonicalized resource string.
     ///
-    /// Format: `/{account}/{path}\n{sorted query params}`
+    /// Format: `/{account}{path}\n{sorted query params}`
+    ///
+    /// Note: for Azurite the account name appears as the first path segment, so
+    /// the canonicalized resource intentionally contains it twice (e.g.
+    /// `/devstoreaccount1/devstoreaccount1/container/blob`). Azurite's own
+    /// SharedKey signing computes the resource the same way, so this matches.
     fn canonicalized_resource(account: &str, url: &azure_core::http::Url) -> String {
         let path = url.path();
-        let account_prefix = format!("/{account}");
-        let normalized_path = path
-            .strip_prefix(&account_prefix)
-            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
-            .unwrap_or(path);
-        let normalized_path = if normalized_path.is_empty() {
-            "/"
-        } else {
-            normalized_path
-        };
-        let mut result = format!("/{account}{normalized_path}");
+        let mut result = format!("/{account}{path}");
 
         // Collect and sort query parameters
         let mut params: Vec<(String, String)> = url
@@ -299,7 +294,10 @@ mod tests {
     use super::SharedKeyPolicy;
 
     #[test]
-    fn canonicalized_resource_strips_azurite_account_prefix() {
+    fn canonicalized_resource_azurite_includes_account_in_path() {
+        // Azurite URLs carry the account as the first path segment, so the
+        // canonicalized resource contains it twice — this is what Azurite's own
+        // SharedKey signing expects.
         let url = azure_core::http::Url::parse(
             "http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob",
         )
@@ -307,7 +305,10 @@ mod tests {
 
         let resource = SharedKeyPolicy::canonicalized_resource("devstoreaccount1", &url);
 
-        assert_eq!(resource, "/devstoreaccount1/mycontainer/myblob");
+        assert_eq!(
+            resource,
+            "/devstoreaccount1/devstoreaccount1/mycontainer/myblob"
+        );
     }
 
     #[test]
