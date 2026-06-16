@@ -12,11 +12,13 @@
 FROM rust:1.96-slim AS builder
 
 # - protobuf-compiler : `protoc`, required by the CSI build script (build.rs)
+# - libprotobuf-dev   : well-known types (google/protobuf/*.proto) imported by csi.proto
 # - libclang-dev      : bindgen, used by the libublk-rs-sys build script
 # - pkg-config        : transitive build dependency probing
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         protobuf-compiler \
+        libprotobuf-dev \
         libclang-dev \
         pkg-config \
         ca-certificates \

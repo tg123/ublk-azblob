@@ -28,7 +28,9 @@ jobs:
       - name: Install protoc + grpcurl
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          # libprotobuf-dev ships the well-known types (google/protobuf/*.proto)
+          # that csi.proto imports; protobuf-compiler alone no longer includes them.
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
           GRPCURL_VERSION=1.9.1
           curl -fsSL -o /tmp/grpcurl.tar.gz \
             "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
@@ -72,7 +74,9 @@ jobs:
       - name: Install protoc
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          # libprotobuf-dev ships the well-known types (google/protobuf/*.proto)
+          # that csi.proto imports; protobuf-compiler alone no longer includes them.
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - name: Run k8s PVC e2e
         run: sudo -E env "PATH=$PATH" cargo test --release --features csi --test k8s_pvc_e2e -- --nocapture

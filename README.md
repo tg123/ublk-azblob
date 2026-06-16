@@ -35,7 +35,9 @@ cargo build --release -p ublk-azblob
 # Build with real ublk device support (requires Linux ≥6.0 + ublk_drv)
 cargo build --release -p ublk-azblob --features ublk
 
-# Build with the Kubernetes CSI driver (needs `protoc`; combine with `ublk`)
+# Build with the Kubernetes CSI driver
+# (needs `protoc` plus the protobuf well-known types, e.g. apt
+#  `protobuf-compiler libprotobuf-dev`; combine with `ublk`)
 cargo build --release -p ublk-azblob --features "ublk csi"
 ```
 

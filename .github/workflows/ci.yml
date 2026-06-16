@@ -33,7 +33,9 @@ jobs:
       - name: Install protoc (CSI codegen)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          # libprotobuf-dev ships the well-known types (google/protobuf/*.proto)
+          # that csi.proto imports; protobuf-compiler alone no longer includes them.
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - name: cargo clippy (csi feature)
         run: cargo clippy --features csi -- -D warnings
