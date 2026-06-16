@@ -1,0 +1,18 @@
+# kind cluster for the ublk-azblob PVC e2e.
+#
+# A single control-plane node is enough.  The node container bind-mounts the
+# host /dev (so the CSI node plugin can create and see /dev/ublkbN) and
+# /lib/modules (so userspace tooling can find the already-loaded ublk_drv).
+#
+# The ublk_drv kernel module must be loaded on the *host* before `kind create`
+# (`sudo modprobe ublk_drv`); a container cannot load it into the host kernel.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: /dev
+        containerPath: /dev
+      - hostPath: /lib/modules
+        containerPath: /lib/modules
+        readOnly: true

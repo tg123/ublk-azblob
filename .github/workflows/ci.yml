@@ -30,5 +30,19 @@ jobs:
       - name: cargo clippy (ublk feature — kernel target compiles)
         run: cargo clippy --features ublk -- -D warnings
 
+      - name: Install protoc (CSI codegen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: cargo clippy (csi feature)
+        run: cargo clippy --features csi -- -D warnings
+
+      - name: cargo clippy (ublk + csi features)
+        run: cargo clippy --features "ublk csi" -- -D warnings
+
       - name: cargo test (unit tests, MemBackend — no kernel required)
         run: cargo test
+
+      - name: cargo test (csi feature unit tests)
+        run: cargo test --features csi

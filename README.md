@@ -34,6 +34,9 @@ cargo build --release -p ublk-azblob
 
 # Build with real ublk device support (requires Linux ≥6.0 + ublk_drv)
 cargo build --release -p ublk-azblob --features ublk
+
+# Build with the Kubernetes CSI driver (needs `protoc`; combine with `ublk`)
+cargo build --release -p ublk-azblob --features "ublk csi"
 ```
 
 ---
@@ -154,6 +157,82 @@ it is gated behind the `ublk` feature and skips itself when not run as root with
 
 ---
 
+## Kubernetes (CSI driver)
+
+`ublk-azblob` ships an in-tree **Container Storage Interface (CSI)** driver so
+each `PersistentVolumeClaim` is provisioned as one Azure Page Blob and exposed
+to pods as an ext4 filesystem on a ublk block device. The driver is the same
+binary, built with `--features "ublk csi"` and run via the `csi` subcommand:
+
+```bash
+# controller (provisions/deletes page blobs) — runs in a Deployment
+ublk-azblob csi --role controller --csi-endpoint unix:///csi/csi.sock
+
+# node (attaches the ublk device + mounts the filesystem) — runs in a DaemonSet
+ublk-azblob csi --role node --csi-endpoint unix:///csi/csi.sock
+```
+
+Driver name: `azblob.ublk.csi.tg123.github.io`. Volume IDs encode the blob
+location as `<container>/<blob>`; the storage account and endpoint come from the
+driver's environment (`AZURE_STORAGE_*`), while the container can be overridden
+per `StorageClass` via the `container` parameter.
+
+### Deploy
+
+The `ublk_drv` kernel module must be loaded on every node
+(`sudo modprobe ublk_drv`); a container cannot load it.
+
+```bash
+# 1. Build + publish the driver image (or load it into your cluster)
+docker build -f deploy/Dockerfile -t ghcr.io/tg123/ublk-azblob:latest .
+
+# 2. Provide storage credentials + endpoint to the driver
+kubectl -n kube-system create secret generic csi-azblob-secret \
+  --from-literal=account=<storage-account> \
+  --from-literal=accountKey=<storage-key>           # omit when using Managed Identity
+kubectl -n kube-system create configmap csi-azblob-config \
+  --from-literal=endpoint=https://<account>.blob.core.windows.net \
+  --from-literal=container=pvc
+
+# 3. Deploy the driver (CSIDriver, RBAC, controller, node, StorageClass)
+kubectl apply -f deploy/kubernetes/
+
+# 4. Create a PVC + pod
+kubectl apply -f deploy/example/pvc.yaml
+kubectl apply -f deploy/example/pod.yaml
+```
+
+On an Azure VM/AKS node with Managed Identity, drop `accountKey` from the secret
+and add `AZURE_USE_MSI=true` (optionally `AZURE_MSI_CLIENT_ID`) to the driver
+containers instead.
+
+### Kubernetes e2e
+
+Two e2e tests cover the CSI driver:
+
+* **Controller** ([tests/e2e/csi/controller_test.sh](tests/e2e/csi/controller_test.sh)) —
+  drives the controller gRPC service (`CreateVolume`/`DeleteVolume`) against
+  Azurite with `grpcurl`. Needs no kernel, so it runs anywhere:
+
+  ```bash
+  docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
+    azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+  bash tests/e2e/csi/controller_test.sh
+  ```
+
+* **PVC lifecycle** ([tests/e2e/k8s/run.sh](tests/e2e/k8s/run.sh)) — spins up a
+  `kind` cluster, deploys the driver + Azurite, then provisions a PVC, writes
+  random data, tears the pod down, and remounts the same PVC on a fresh ublk
+  device to verify the data survived the round-trip through the page blob. It
+  requires root + `ublk_drv` + Docker + `kind`, and skips gracefully otherwise:
+
+  ```bash
+  sudo modprobe ublk_drv
+  sudo -E bash tests/e2e/k8s/run.sh
+  ```
+
+---
+
 ## Running unit tests
 
 ```bash
@@ -168,9 +247,10 @@ Unit tests run against `MemBackend` — no network, no kernel required.
 
 GitHub Actions runs on every push to `main` and every pull request:
 - `cargo fmt --check`
-- `cargo clippy -- -D warnings` (with and without `--features ublk`)
-- `cargo test` (unit tests, `MemBackend`)
+- `cargo clippy -- -D warnings` (default, `--features ublk`, `--features csi`, and `--features "ublk csi"`)
+- `cargo test` (unit tests, `MemBackend`, with and without `--features csi`)
 - the full mount-based e2e (`/dev/ublkbN` + ext4 ↔ Azurite)
+- the CSI controller e2e (gRPC ↔ Azurite) and the kind-based PVC e2e (`k8s-e2e` workflow)
 
 The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
 `linux-modules-extra`, and runs the mount/remount/checksum cycle as root.
@@ -192,15 +272,28 @@ ublk-azblob/
 │   │   ├── main.rs             # CLI entry point (clap)
 │   │   ├── auth.rs             # MSI + SharedKey credential factory
 │   │   ├── ublk_target.rs      # ublk device I/O loop (gated on --features ublk)
+│   │   ├── csi/                # Kubernetes CSI driver (gated on --features csi)
+│   │   │   ├── mod.rs          # gRPC server, role/config, volume-id encoding
+│   │   │   ├── identity.rs     # CSI Identity service
+│   │   │   ├── controller.rs   # CSI Controller service (Create/DeleteVolume)
+│   │   │   ├── node.rs         # CSI Node service (attach ublk device + mount)
+│   │   │   └── mount.rs        # mkfs/mount/umount + ublk device discovery
 │   │   └── backend/
 │   │       ├── mod.rs          # BlobBackend trait (SDK isolation boundary)
 │   │       ├── azure.rs        # AzurePageBlobBackend (real SDK impl)
 │   │       └── mem.rs          # MemBackend (in-memory, for unit tests)
+│   ├── proto/csi/csi.proto     # vendored CSI spec (codegen via build.rs)
 │   └── tests/
 │       └── mount_e2e.rs        # full mount → write → flush → remount → verify
+├── deploy/
+│   ├── Dockerfile              # CSI driver image (--features "ublk csi")
+│   ├── kubernetes/             # CSIDriver, RBAC, controller, node, StorageClass
+│   └── example/                # sample PVC + pod
 ├── tests/
 │   └── e2e/
-│       ├── docker-compose.yml  # Azurite + test runner for the e2e test
-│       └── Dockerfile          # build + test runner image (rust + e2fsprogs)
+│       ├── docker-compose.yml  # Azurite + test runner for the mount e2e
+│       ├── Dockerfile          # build + test runner image (rust + e2fsprogs)
+│       ├── csi/                # controller gRPC e2e (grpcurl ↔ Azurite)
+│       └── k8s/                # kind-based PVC e2e (provision → write → remount)
 └── LICENSE.md                  # MIT license
 ```
