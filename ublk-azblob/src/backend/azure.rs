@@ -194,11 +194,13 @@ impl BlobBackend for AzurePageBlobBackend {
 /// Holds its own `BlobContainerClient` (with the auth pipeline wired in) and the
 /// target blob name.  Kept next to [`AzurePageBlobBackend`] so all Azure SDK
 /// types stay inside this module.
+#[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 pub struct AzureBlobLock {
     container: BlobContainerClient,
     blob_name: String,
 }
 
+#[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 impl AzureBlobLock {
     /// Construct a blob lock for `blob_name` from an already-configured
     /// `BlobContainerClient`.

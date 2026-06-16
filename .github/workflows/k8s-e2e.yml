@@ -39,9 +39,8 @@ jobs:
 
       - name: Run CSI controller e2e
         env:
-          BIN: ${{ github.workspace }}/target/release/ublk-azblob
           AZURE_STORAGE_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
-        run: bash tests/e2e/csi/controller_test.sh
+        run: cargo test --release --features csi --test csi_controller_e2e -- --nocapture
 
   k8s-pvc:
     name: k8s PVC e2e (kind + ublk + Azurite)
@@ -65,8 +64,18 @@ jobs:
         with:
           install_only: true
 
+      - name: Install Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
       - name: Run k8s PVC e2e
-        run: sudo -E bash tests/e2e/k8s/run.sh
+        run: sudo -E env "PATH=$PATH" cargo test --release --features csi --test k8s_pvc_e2e -- --nocapture
 
       - name: Cluster diagnostics on failure
         if: failure()

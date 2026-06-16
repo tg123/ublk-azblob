@@ -14,6 +14,7 @@
 
 mod auth;
 mod backend;
+#[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 mod coordination;
 #[cfg(feature = "csi")]
 mod csi;
