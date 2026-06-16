@@ -111,8 +111,8 @@ Cargo feature flag) and maps each NBD command to the same trait the ublk loop
 uses (`READ`/`WRITE`/`FLUSH`/`TRIM`/`WRITE_ZEROES` → `read`/`write`/`flush`/
 `clear`).  It is selected with `run --nbd <host:port>` and exists so the blob
 can be exposed on kernels/platforms where `ublk_drv` is unavailable.  It
-advertises a 512-byte minimum/preferred block size so clients align I/O to the
-page-blob granularity.
+advertises a 512-byte minimum / 4 KiB preferred block size so clients align I/O
+to the page-blob granularity.
 
 ### 2. 512-byte alignment
 

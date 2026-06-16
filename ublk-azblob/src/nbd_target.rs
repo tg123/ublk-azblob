@@ -21,8 +21,9 @@
 //! - `NBD_CMD_DISC`         → flush and close the connection
 //!
 //! Only *simple* replies are emitted (no structured replies), which every NBD
-//! client understands.  The server advertises a 512-byte minimum/preferred
-//! block size so clients align their I/O to the Azure Page Blob granularity.
+//! client understands.  The server advertises a 512-byte minimum / 4 KiB
+//! preferred block size so clients align their I/O to the Azure Page Blob
+//! granularity.
 
 use crate::backend::BlobBackend;
 use anyhow::Context as _;
@@ -304,6 +305,7 @@ async fn transmission(
             NBD_CMD_READ => {
                 if let Some(err) = bounds_error(offset, length, dev_size) {
                     simple_reply(stream, err, handle, &[]).await?;
+                    stream.flush().await?;
                     continue;
                 }
                 match backend.read(offset, length).await {
@@ -328,6 +330,7 @@ async fn transmission(
                     .context("read write payload")?;
                 if let Some(err) = bounds_error(offset, length, dev_size) {
                     simple_reply(stream, err, handle, &[]).await?;
+                    stream.flush().await?;
                     continue;
                 }
                 match backend.write(offset, bytes::Bytes::from(buf)).await {
@@ -348,6 +351,7 @@ async fn transmission(
             NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES => {
                 if let Some(err) = bounds_error(offset, length, dev_size) {
                     simple_reply(stream, err, handle, &[]).await?;
+                    stream.flush().await?;
                     continue;
                 }
                 match backend.clear(offset, length).await {
