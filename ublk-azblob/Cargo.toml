@@ -58,6 +58,10 @@ libc = { version = "0.2.186", optional = true }
 # Enable the real ublk target (requires Linux ≥6.0 + ublk_drv loaded).
 ublk = ["dep:libublk", "dep:libc"]
 
+# Enable the `bench` subcommand (backend throughput/IOPS/latency benchmark).
+# Off by default so the benchmark code is not shipped in the release binary.
+bench = []
+
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full", "test-util"] }
 

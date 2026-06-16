@@ -2,10 +2,11 @@ name: bench
 
 # I/O benchmark: ublk-azblob block device vs. a raw local disk.
 #
-# Run manually from the Actions tab (workflow_dispatch).  It is intentionally
-# *not* run on every push/PR — fio benchmarks take minutes and the numbers are
-# only meaningful as an on-demand comparison.
+# Runs on pull requests (to catch I/O regressions) and on demand from the
+# Actions tab (workflow_dispatch, with tunable inputs).  fio benchmarks take a
+# few minutes; on pull requests the default tunables below are used.
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       dev_size_mib:

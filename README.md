@@ -61,7 +61,7 @@ cargo run -p ublk-azblob -- \
 
 ```bash
 # Provision a 64 MiB blob and run all four phases (seq write/read, rand write/read)
-cargo run --release -p ublk-azblob -- \
+cargo run --release --features bench -p ublk-azblob -- \
   --endpoint http://127.0.0.1:10000/devstoreaccount1 \
   --account devstoreaccount1 \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
@@ -70,11 +70,12 @@ cargo run --release -p ublk-azblob -- \
   bench --create
 ```
 
-The `bench` subcommand issues a fixed number of fixed-size operations against
-the `BlobBackend` using a configurable number of concurrent workers (mirroring a
-ublk queue depth) and reports throughput (MiB/s), IOPS, and latency percentiles
-(min / avg / p50 / p95 / p99 / max) per phase. It runs against Azurite, real
-Azure, or the in-memory backend used in tests.
+The `bench` subcommand (gated behind the off-by-default `bench` feature so it is
+not shipped in the release binary) issues a fixed number of fixed-size
+operations against the `BlobBackend` using a configurable number of concurrent
+workers (mirroring a ublk queue depth) and reports throughput (MiB/s), IOPS, and
+latency percentiles (min / avg / p50 / p95 / p99 / max) per phase. It runs
+against Azurite, real Azure, or the in-memory backend used in tests.
 
 | Flag | Default | Notes |
 |------|---------|-------|
@@ -221,10 +222,10 @@ FIO_BS=64k FIO_IODEPTH=32 FIO_RUNTIME=30 \
     --build --abort-on-container-exit --exit-code-from runner
 ```
 
-In CI the benchmark runs on demand via the **`bench`** workflow
-(`workflow_dispatch` in the Actions tab); it is not run on every push/PR because
-fio benchmarks take minutes.  Results are attached as a `bench-results` artifact
-and rendered into the run's job summary.
+In CI the benchmark runs on every pull request and on demand via the **`bench`**
+workflow (`workflow_dispatch` in the Actions tab, with tunable inputs).  Results
+are attached as a `bench-results` artifact and rendered into the run's job
+summary.
 
 ---
 
@@ -251,9 +252,9 @@ The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
 (`ubuntu-24.04` is avoided because its azure kernel currently Oopses in
 `ublk_drv` — see [actions/runner-images#14175](https://github.com/actions/runner-images/issues/14175).)
 
-A separate **`bench`** workflow (manual `workflow_dispatch`) runs the fio
-benchmark comparing the ublk-azblob device against a raw local disk, on the same
-`ubuntu-22.04` runner.
+A separate **`bench`** workflow (on pull requests and manual `workflow_dispatch`)
+runs the fio benchmark comparing the ublk-azblob device against a raw local disk,
+on the same `ubuntu-22.04` runner.
 
 ---
 

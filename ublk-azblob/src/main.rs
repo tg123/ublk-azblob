@@ -14,6 +14,7 @@
 
 mod auth;
 mod backend;
+#[cfg(feature = "bench")]
 mod bench;
 mod ublk_target;
 
@@ -131,6 +132,7 @@ enum Command {
     },
 
     /// Benchmark the BlobBackend (throughput, IOPS, latency).
+    #[cfg(feature = "bench")]
     Bench {
         /// Size of the benchmark blob in bytes (multiple of 512).
         #[arg(long, default_value = "67108864")]
@@ -235,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
             run_smoke_test(backend, size).await?;
         }
 
+        #[cfg(feature = "bench")]
         Command::Bench {
             size,
             block_size,
