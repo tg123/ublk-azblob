@@ -127,12 +127,28 @@ All CLI flags have environment-variable equivalents:
 
 ## Running the e2e test locally
 
-The docker-compose pipeline spins up Azurite and a test-runner that builds and
-exercises the binary end-to-end (no live Azure account needed):
+The e2e test exercises the **full stack**: a real `/dev/ublkbN` block device
+backed by an Azure Page Blob (Azurite), with an ext4 filesystem mounted on top.
+It writes random files, forces a flush (`SIGUSR1`), unmounts, tears the device
+down, remounts over the same blob, and verifies every file's SHA-256 checksum.
+
+It requires a Linux ≥6.0 host with `ublk_drv` loaded, root / `CAP_SYS_ADMIN`,
+`mkfs.ext4` (e2fsprogs), and a running Azurite:
 
 ```bash
-docker compose -f tests/e2e/docker-compose.yml \
-  up --build --abort-on-container-exit --exit-code-from test-runner
+# 1. Start Azurite
+docker run -d --name azurite -p 10000:10000 \
+  mcr.microsoft.com/azure-storage/azurite:3.34.0 \
+  azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+
+# 2. Load the kernel module and build with the ublk feature
+sudo modprobe ublk_drv
+cargo build --release --features ublk -p ublk-azblob
+
+# 3. Run the mount → write → flush → unmount → remount → verify cycle
+sudo env BIN="$PWD/target/release/ublk-azblob" \
+  AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
+  bash tests/e2e/mount_test.sh
 ```
 
 See [tests/e2e/](tests/e2e/) for the full setup.
@@ -151,15 +167,16 @@ Unit tests run against `MemBackend` — no network, no kernel required.
 
 ## CI
 
-GitHub Actions runs on every push and pull request:
+GitHub Actions runs on every push to `main` and every pull request:
 - `cargo fmt --check`
-- `cargo clippy -- -D warnings`
+- `cargo clippy -- -D warnings` (with and without `--features ublk`)
 - `cargo test` (unit tests, `MemBackend`)
-- docker-compose e2e pipeline (Rust binary ↔ Azurite)
+- the full mount-based e2e (`/dev/ublkbN` + ext4 ↔ Azurite)
 
-The full `/dev/ublkbN` mount path is **skipped on GitHub-hosted runners**
-(no `ublk_drv`, insufficient privileges) and is documented as opt-in for
-self-hosted runners with a ≥6.0 kernel.
+The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
+`linux-modules-extra`, and runs the mount/remount/checksum cycle as root.
+(`ubuntu-24.04` is avoided because its azure kernel currently Oopses in
+`ublk_drv` — see [actions/runner-images#14175](https://github.com/actions/runner-images/issues/14175).)
 
 ---
 
@@ -182,7 +199,5 @@ ublk-azblob/
 │           └── mem.rs          # MemBackend (in-memory, for unit tests)
 └── tests/
     └── e2e/
-        ├── docker-compose.yml  # Azurite + test-runner
-        ├── Dockerfile          # builds & runs the Rust binary
-        └── run_e2e.sh          # convenience wrapper
+        └── mount_test.sh       # full mount → write → flush → remount → verify
 ```

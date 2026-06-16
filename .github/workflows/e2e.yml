@@ -27,33 +27,63 @@ jobs:
       - name: cargo clippy
         run: cargo clippy -- -D warnings
 
+      - name: cargo clippy (ublk feature — kernel target compiles)
+        run: cargo clippy --features ublk -- -D warnings
+
       - name: cargo test (unit tests, MemBackend — no kernel required)
         run: cargo test
 
   e2e:
-    name: e2e (BlobBackend ↔ Azurite)
-    runs-on: ubuntu-latest
+    name: e2e (mount ext4 on /dev/ublkb backed by Azurite)
+    # The ublk_drv kernel module Oopses on the ubuntu-24.04 azure kernel
+    # (actions/runner-images#14175); 22.04 ships a stable 6.x kernel.
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
 
-      - name: Run docker-compose e2e pipeline
+      - name: Load ublk_drv kernel module
         run: |
-          docker compose -f tests/e2e/docker-compose.yml \
-            up --build --abort-on-container-exit --exit-code-from test-runner
-        # NOTE: The full kernel ublk device path (/dev/ublkbN) is SKIPPED here.
-        # GitHub-hosted runners do not provide ublk_drv or CAP_SYS_ADMIN.
-        # This job tests the AzurePageBlobBackend ↔ Azurite REST path only.
-        # To run the full kernel path, use a self-hosted runner with:
-        #   - Linux kernel ≥ 6.0
-        #   - `modprobe ublk_drv`
-        #   - root / CAP_SYS_ADMIN
-        #   - `cargo build --features ublk && sudo ./target/release/ublk-azblob run ...`
+          sudo apt-get update
+          # The generic GitHub runner kernel ships ublk_drv in linux-modules-extra.
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe ublk_drv
+          ls -l /dev/ublk-control
 
-      - name: Print docker-compose logs on failure
+      - name: Install e2fsprogs (mkfs.ext4)
+        run: sudo apt-get install -y e2fsprogs
+
+      - name: Start Azurite
+        run: |
+          docker run -d --name azurite -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:3.34.0 \
+            azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+          # Wait for the blob endpoint to start responding (any HTTP status
+          # means Azurite is up; the account root returns 400 without auth).
+          for _ in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/devstoreaccount1 || true)"
+            if [ "${code}" != "000" ]; then
+              echo "Azurite responding (HTTP ${code})"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Build ublk-azblob (--features ublk)
+        run: cargo build --release --features ublk -p ublk-azblob
+
+      - name: Run mount e2e (mount → write → flush → unmount → remount → verify)
+        run: |
+          sudo env BIN="$PWD/target/release/ublk-azblob" \
+            AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
+            bash tests/e2e/mount_test.sh
+
+      - name: Azurite logs on failure
         if: failure()
-        run: docker compose -f tests/e2e/docker-compose.yml logs
+        run: docker logs azurite || true

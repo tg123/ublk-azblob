@@ -157,8 +157,8 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 - ✅ `BlobBackend` trait + `AzurePageBlobBackend` + `MemBackend`
 - ✅ SharedKey auth (Azurite) + MSI auth wiring
 - ✅ ublk target (real impl gated behind `--features ublk`; stub otherwise)
-- ✅ docker-compose e2e test against Azurite
-- ✅ CI: fmt + clippy + unit tests + e2e pipeline
+- ✅ Full mount-based e2e test against Azurite (ext4 on `/dev/ublkbN`)
+- ✅ CI: fmt + clippy + unit tests + mount e2e pipeline
 
 ### Phase 2 — Performance
 - Read cache (LRU, configurable size)
@@ -177,19 +177,22 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 
 ---
 
-## CI Limitation: ublk Kernel Path
+## CI: ublk Kernel Path
 
-GitHub-hosted runners run on Ubuntu-latest kernels that **may not have
-`ublk_drv` loaded** and do not grant the `CAP_SYS_ADMIN` required to create
-ublk devices.  The CI workflow therefore:
+GitHub-hosted runners do **not** load `ublk_drv` by default, but the module
+ships in `linux-modules-extra-$(uname -r)` and can be loaded with `modprobe`.
+The CI workflow therefore:
 
-1. **Always runs** `cargo fmt --check`, `cargo clippy`, `cargo test` (unit
-   tests against `MemBackend`).
-2. **Always runs** the docker-compose e2e pipeline which tests
-   `AzurePageBlobBackend` ↔ Azurite (real Page Blob REST API over the network).
-3. **Skips** (with an explicit note, not a silent pass) the full
-   `/dev/ublkbN` mount test.  This path can be exercised on a self-hosted
-   runner with a 6.0+ kernel and `ublk_drv`.
+1. **Always runs** `cargo fmt --check`, `cargo clippy` (with and without
+   `--features ublk`), and `cargo test` (unit tests against `MemBackend`).
+2. **Runs the full mount e2e** on `ubuntu-22.04`: it loads `ublk_drv`, starts
+   Azurite, builds with `--features ublk`, then mounts an ext4 filesystem on
+   `/dev/ublkbN`, writes random files, forces a flush via `SIGUSR1`, unmounts,
+   tears the device down, remounts over the same page blob, and verifies every
+   file's SHA-256 checksum.
+
+`ubuntu-24.04` is intentionally avoided: its azure kernel currently Oopses in
+`ublk_drv` ([actions/runner-images#14175](https://github.com/actions/runner-images/issues/14175)).
 
 ---
 
@@ -198,7 +201,7 @@ ublk devices.  The CI workflow therefore:
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
 | Azure SDK 0.x breaking change | High | Thin `BlobBackend` trait; pin exact versions |
-| ublk kernel requirement (≥6.0) | Medium | Clear docs; e2e test works without kernel |
+| ublk kernel requirement (≥6.0) | Medium | Clear docs; CI loads `ublk_drv` and runs the mount e2e |
 | Page blob cost / latency vs block blob | Medium | Phase 3: optional block-blob backend |
 | Azurite Page Blob parity gaps | Low | CI catches regressions; use real Azure for perf tests |
 | SharedKey auth complexity | Low | Implemented and tested in e2e; MSI for production |
