@@ -28,6 +28,7 @@ CLUSTER="${KIND_CLUSTER:-azblob-e2e}"
 IMAGE="${E2E_IMAGE:-ublk-azblob:e2e}"
 NS=kube-system
 # Azurite well-known development account + key (public, not a real secret).
+# NEVER use these credentials against real Azure Storage / in production.
 ACCOUNT=devstoreaccount1
 KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 ENDPOINT="http://azurite.${NS}.svc.cluster.local:10000/devstoreaccount1"

@@ -11,8 +11,9 @@ metadata:
   name: azblob-ublk
 provisioner: azblob.ublk.csi.tg123.github.io
 parameters:
-  # Blob container that holds the page blobs (must already exist or be
-  # creatable by the configured credentials).
+  # Blob container that holds the page blobs. The driver creates it on first
+  # provision if it does not yet exist (the configured credentials must allow
+  # container creation).
   container: pvc
   # Filesystem created on first mount.
   fsType: ext4

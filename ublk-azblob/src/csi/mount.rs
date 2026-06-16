@@ -143,12 +143,13 @@ pub fn umount(target: &str) -> anyhow::Result<()> {
     bail!("umount {target} failed: {}", stderr.trim());
 }
 
-/// Send `sig` to process `pid`.
+/// Send `sig` to process `pid`, logging (but not failing) if delivery fails.
 pub fn signal_pid(pid: u32, sig: i32) {
-    // SAFETY: `kill` is safe to call with any pid / signal; an invalid pid just
-    // returns an error which we ignore here.
-    unsafe {
-        libc::kill(pid as libc::pid_t, sig);
+    // SAFETY: `kill` is safe to call with any pid / signal number.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!("kill(pid={pid}, sig={sig}) failed: {err}");
     }
 }
 
