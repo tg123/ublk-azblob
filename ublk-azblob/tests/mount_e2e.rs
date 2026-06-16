@@ -324,6 +324,12 @@ fn run_mount_roundtrip(spec: DeviceSpec) {
     stop_device(&dev, child);
 
     // ── Phase 3: remount over the same blob and verify checksums ──────────────
+    // Use a *fresh* cache directory for the remount so the verification reads
+    // must come from the page blob (via the cache's read-through), not from
+    // stale local cache data left over from phase 1.
+    if let Some(dir) = &spec.cache_dir {
+        fs::remove_dir_all(dir).unwrap_or_else(|e| panic!("clear cache dir {dir:?}: {e}"));
+    }
     let child = start_device(&spec, false);
 
     log(&format!("remounting {dev} at {}", mnt.display()));

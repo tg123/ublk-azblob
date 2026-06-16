@@ -284,6 +284,7 @@ fn cache_file_name(container: &str, blob: &str) -> String {
     }
     name
 }
+
 fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
     if let Some(key) = &cli.account_key {
         return Ok(AuthConfig::SharedKey {
