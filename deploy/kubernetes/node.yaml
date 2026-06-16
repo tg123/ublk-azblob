@@ -39,7 +39,7 @@ spec:
               mountPath: /registration
 
         - name: azblob
-          image: ghcr.io/tg123/ublk-azblob:latest
+          image: docker.io/farmer1992/ublk-azblob:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true

@@ -354,7 +354,7 @@ fn stage_manifests(repo: &Path, img: &str) -> PathBuf {
         let content = std::fs::read_to_string(&path).expect("read manifest");
         let content = content
             .replace(
-                "image: ghcr.io/tg123/ublk-azblob:latest",
+                "image: docker.io/farmer1992/ublk-azblob:latest",
                 &format!("image: {img}"),
             )
             .replace("imagePullPolicy: IfNotPresent", "imagePullPolicy: Never");

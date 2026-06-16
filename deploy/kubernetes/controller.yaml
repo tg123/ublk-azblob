@@ -33,7 +33,7 @@ spec:
               mountPath: /csi
 
         - name: azblob
-          image: ghcr.io/tg123/ublk-azblob:latest
+          image: docker.io/farmer1992/ublk-azblob:latest
           imagePullPolicy: IfNotPresent
           args:
             - "csi"
