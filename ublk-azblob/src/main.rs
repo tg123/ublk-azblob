@@ -66,11 +66,11 @@ struct Cli {
     msi: bool,
 
     /// User-assigned Managed Identity — client ID.
-    #[arg(long, env = "AZURE_MSI_CLIENT_ID")]
+    #[arg(long, env = "AZURE_MSI_CLIENT_ID", conflicts_with_all = ["msi_object_id", "msi_resource_id"])]
     msi_client_id: Option<String>,
 
     /// User-assigned Managed Identity — object ID.
-    #[arg(long, env = "AZURE_MSI_OBJECT_ID")]
+    #[arg(long, env = "AZURE_MSI_OBJECT_ID", conflicts_with_all = ["msi_resource_id"])]
     msi_object_id: Option<String>,
 
     /// User-assigned Managed Identity — resource ID.
@@ -176,13 +176,16 @@ async fn main() -> anyhow::Result<()> {
             // Wrap with write-back buffer if page_size > 0.
             let backend: Arc<dyn BlobBackend> = if page_size > 0 {
                 info!(page_size, max_dirty_pages, "write-back buffer enabled");
-                Arc::new(BufferedBackend::new(
-                    backend,
-                    BufferedConfig {
-                        page_size,
-                        max_dirty_pages,
-                    },
-                ))
+                Arc::new(
+                    BufferedBackend::new(
+                        backend,
+                        BufferedConfig {
+                            page_size,
+                            max_dirty_pages,
+                        },
+                    )
+                    .context("configure write-back buffer")?,
+                )
             } else {
                 info!("write-through mode (no buffering)");
                 backend

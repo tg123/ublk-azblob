@@ -124,6 +124,10 @@ mod signals {
     }
 
     pub fn install() {
+        // Reset state so a stop/flush from a previous run in the same process
+        // does not leak into this one.
+        STOP.store(false, Ordering::SeqCst);
+        FLUSH.store(false, Ordering::SeqCst);
         for (sig, name, handler) in [
             (
                 libc::SIGINT,
@@ -174,9 +178,9 @@ fn run_ublk_target_blocking(
 
     let dev_size = cfg.dev_size;
     let block_size = cfg.block_size;
-    if !block_size.is_power_of_two() {
+    if block_size < 512 || !block_size.is_multiple_of(512) || !block_size.is_power_of_two() {
         anyhow::bail!(
-            "block_size ({block_size}) must be a power of two for logical_bs_shift to be valid"
+            "block_size ({block_size}) must be a power of two that is >= 512 and a multiple of 512"
         );
     }
     let block_size_u64 = u64::from(block_size);

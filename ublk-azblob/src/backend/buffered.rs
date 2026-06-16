@@ -68,9 +68,17 @@ struct BufferState {
 }
 
 impl BufferedBackend {
-    pub fn new(inner: Arc<dyn BlobBackend>, config: BufferedConfig) -> Self {
-        assert!(config.page_size >= 512 && config.page_size.is_multiple_of(512));
-        Self {
+    pub fn new(inner: Arc<dyn BlobBackend>, config: BufferedConfig) -> anyhow::Result<Self> {
+        if config.page_size < 512 || !config.page_size.is_multiple_of(512) {
+            bail!(
+                "page_size ({}) must be a non-zero multiple of 512",
+                config.page_size
+            );
+        }
+        if config.max_dirty_pages == 0 {
+            bail!("max_dirty_pages must be greater than 0");
+        }
+        Ok(Self {
             inner,
             config,
             state: Mutex::new(BufferState {
@@ -78,7 +86,7 @@ impl BufferedBackend {
                 seq_counter: 0,
                 dev_size: 0,
             }),
-        }
+        })
     }
 
     /// Flush the N oldest dirty pages to make room.
@@ -242,8 +250,13 @@ impl BlobBackend for BufferedBackend {
                     .read(abs_offset, chunk_len as u64)
                     .await
                     .with_context(|| format!("read offset={abs_offset} len={chunk_len}"))?;
-                let copy_len = data.len().min(chunk_len);
-                result[pos as usize..pos as usize + copy_len].copy_from_slice(&data[..copy_len]);
+                if data.len() != chunk_len {
+                    bail!(
+                        "backend returned {} bytes for read offset={abs_offset} len={chunk_len}",
+                        data.len()
+                    );
+                }
+                result[pos as usize..pos as usize + chunk_len].copy_from_slice(&data);
             }
 
             pos += chunk_len as u64;
@@ -402,6 +415,7 @@ mod tests {
                 max_dirty_pages: max_dirty,
             },
         )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -432,7 +446,8 @@ mod tests {
                 page_size: 1024,
                 max_dirty_pages: 4,
             },
-        );
+        )
+        .unwrap();
         let data = Bytes::from(vec![0xEF; 512]);
         b.write(0, data.clone()).await.unwrap();
 
@@ -456,7 +471,8 @@ mod tests {
                 page_size: 1024,
                 max_dirty_pages: 2,
             },
-        );
+        )
+        .unwrap();
 
         // Write to 3 different pages — should trigger auto-flush of the oldest.
         b.write(0, Bytes::from(vec![0x11; 512])).await.unwrap();

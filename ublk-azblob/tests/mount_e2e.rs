@@ -160,7 +160,11 @@ fn signal(child: &Child, sig: i32) {
 fn stop_device(dev: &str, mut child: Child) {
     log(&format!("stopping ublk device {dev} (pid {})", child.id()));
     signal(&child, libc::SIGINT);
-    let _ = child.wait();
+    let status = child.wait().expect("wait for ublk-azblob to exit");
+    assert!(
+        status.success(),
+        "ublk-azblob exited with non-zero status while stopping: {status}"
+    );
     // Give the kernel a moment to remove the device node.
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && Path::new(dev).exists() {
