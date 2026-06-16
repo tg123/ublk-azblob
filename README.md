@@ -48,43 +48,42 @@ docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
   azurite-blob --blobHost 0.0.0.0
 
 # Run the built-in smoke test (create → write → read-back → clear → zero-verify)
-cargo run -p ublk-azblob -- test \
-  --storage-endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --storage-account devstoreaccount1 \
-  --storage-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
+cargo run -p ublk-azblob -- \
+  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
+  --account devstoreaccount1 \
+  --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
   --container mycontainer \
   --blob myblob \
-  --size 4096
+  test --size 4096
 ```
 
 ### Run as a block device (requires root + ublk_drv + `--features ublk`)
 
 ```bash
 # System-assigned Managed Identity (recommended on Azure VMs / AKS)
-sudo ./target/release/ublk-azblob run \
-  --storage-account mystorageaccount \
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount \
   --container mydisks \
   --blob myvm.vhd \
-  --size 10737418240 \
-  --msi
+  --msi \
+  run --size 10737418240
 
 # User-assigned Managed Identity by client ID
-sudo ./target/release/ublk-azblob run \
-  --storage-account mystorageaccount \
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount \
   --container mydisks \
   --blob myvm.vhd \
-  --size 10737418240 \
-  --msi \
-  --msi-client-id 00000000-0000-0000-0000-000000000000
+  --msi-client-id 00000000-0000-0000-0000-000000000000 \
+  run --size 10737418240
 
 # Account key (local dev / Azurite)
-sudo ./target/release/ublk-azblob run \
-  --storage-endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --storage-account devstoreaccount1 \
-  --storage-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
+sudo ./target/release/ublk-azblob \
+  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
+  --account devstoreaccount1 \
+  --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
   --container mycontainer \
   --blob myblob.vhd \
-  --size 4194304
+  run --size 4194304
 ```
 
 After launch, a `/dev/ublkbN` device appears and can be used like any block device:
@@ -102,9 +101,9 @@ All CLI flags have environment-variable equivalents:
 
 | Flag | Env var |
 |------|---------|
-| `--storage-account` | `AZURE_STORAGE_ACCOUNT` |
-| `--storage-endpoint` | `AZURE_STORAGE_ENDPOINT` |
-| `--storage-key` | `AZURE_STORAGE_KEY` |
+| `--account` | `AZURE_STORAGE_ACCOUNT` |
+| `--endpoint` | `AZURE_STORAGE_ENDPOINT` |
+| `--account-key` | `AZURE_STORAGE_KEY` |
 | `--container` | `AZURE_STORAGE_CONTAINER` |
 | `--blob` | `AZURE_STORAGE_BLOB` |
 
@@ -116,7 +115,7 @@ All CLI flags have environment-variable equivalents:
 |------|------|-------|
 | Managed Identity (system) | `--msi` | Recommended on Azure VMs; no secrets on disk |
 | Managed Identity (user) | `--msi --msi-client-id <id>` | Multiple identities per host |
-| Shared Key | `--storage-key <key>` | Local dev, CI, Azurite |
+| Shared Key | `--account-key <key>` | Local dev, CI, Azurite |
 
 > **Note:** The Azure Rust SDK (`azure_identity`, `azure_storage_blob`) is
 > **0.x / preview** — API changes between minor releases are expected. Exact

@@ -75,7 +75,8 @@ pub async fn run_ublk_target(backend: Arc<dyn BlobBackend>, cfg: UblkConfig) -> 
         anyhow::bail!(
             "ublk kernel target is not compiled in.\n\
              Rebuild with `--features ublk` on a Linux host with ublk_drv loaded.\n\
-             For testing the BlobBackend without a kernel, use the e2e integration tests."
+             To exercise the BlobBackend without a kernel, use the `test` \
+             subcommand (write → read → clear → verify smoke test)."
         );
     }
 }
@@ -101,22 +102,30 @@ mod signals {
     ///
     /// Uses `sigaction` rather than the deprecated `signal()` so behaviour is
     /// well-defined in the presence of the threads spawned by Tokio and
-    /// `libublk`.
-    pub fn install() {
+    /// `libublk`.  Returns an error if any handler fails to install so the
+    /// caller can avoid running a device that can't respond to signals.
+    fn set_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) -> std::io::Result<()> {
+        // SAFETY: `sa` is fully initialised before use and the handler is
+        // async-signal-safe (it only stores into an atomic).
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_stop as *const () as libc::sighandler_t;
-            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_sigaction = handler as libc::sighandler_t;
+            if libc::sigemptyset(&mut sa.sa_mask) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             sa.sa_flags = libc::SA_RESTART;
-            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-            libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-
-            let mut sa_flush: libc::sigaction = std::mem::zeroed();
-            sa_flush.sa_sigaction = on_flush as *const () as libc::sighandler_t;
-            libc::sigemptyset(&mut sa_flush.sa_mask);
-            sa_flush.sa_flags = libc::SA_RESTART;
-            libc::sigaction(libc::SIGUSR1, &sa_flush, std::ptr::null_mut());
+            if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
+        Ok(())
+    }
+
+    pub fn install() -> std::io::Result<()> {
+        set_handler(libc::SIGINT, on_stop)?;
+        set_handler(libc::SIGTERM, on_stop)?;
+        set_handler(libc::SIGUSR1, on_flush)?;
+        Ok(())
     }
 }
 
@@ -153,10 +162,12 @@ fn run_ublk_target_blocking(
         .context("build UblkCtrl (is ublk_drv loaded? do you have root?)")?;
 
     let dev_size = cfg.dev_size;
+    let block_size = cfg.block_size;
     let tgt_init = move |dev: &mut UblkDev| {
-        // 512-byte logical blocks, advertise a volatile write cache so the
-        // kernel issues FLUSH on sync/umount.
+        // Advertise a volatile write cache so the kernel issues FLUSH on
+        // sync/umount, then honour the configured logical block size.
         dev.set_default_params(dev_size);
+        dev.tgt.params.basic.logical_bs_shift = block_size.trailing_zeros() as u8;
         Ok(())
     };
 
@@ -181,14 +192,25 @@ fn run_ublk_target_blocking(
                 let res: i32 = match op {
                     sys::UBLK_IO_OP_READ => match rt.block_on(backend.read(off, len as u64)) {
                         Ok(data) => {
-                            let dst =
-                                unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), len) };
-                            let n = data.len().min(len);
-                            dst[..n].copy_from_slice(&data[..n]);
-                            if n < len {
-                                dst[n..].fill(0);
+                            if data.len() != len {
+                                // A short/over-long backend response would mask
+                                // out-of-bounds reads or backend corruption;
+                                // surface it as an I/O error instead.
+                                error!(
+                                    tag,
+                                    off,
+                                    len,
+                                    got = data.len(),
+                                    "read returned wrong length"
+                                );
+                                -libc::EIO
+                            } else {
+                                let dst = unsafe {
+                                    std::slice::from_raw_parts_mut(buf.as_mut_ptr(), len)
+                                };
+                                dst.copy_from_slice(&data);
+                                len as i32
                             }
-                            len as i32
                         }
                         Err(e) => {
                             error!(tag, off, len, err = %e, "read failed");
@@ -253,7 +275,10 @@ fn run_ublk_target_blocking(
         let backend = backend.clone();
         let rt = rt.clone();
         move |ctrl: &UblkCtrl| {
-            signals::install();
+            if let Err(e) = signals::install() {
+                error!(err = %e, "failed to install signal handlers — shutting down");
+                signals::STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             info!(dev_id = ctrl.dev_info().dev_id, "ublk device ready");
             while !signals::STOP.load(std::sync::atomic::Ordering::SeqCst) {
                 if signals::FLUSH.swap(false, std::sync::atomic::Ordering::SeqCst) {
