@@ -14,6 +14,7 @@
 
 mod auth;
 mod backend;
+mod bench;
 mod ublk_target;
 
 use anyhow::Context as _;
@@ -128,6 +129,33 @@ enum Command {
         #[arg(long, default_value = "4096")]
         size: u64,
     },
+
+    /// Benchmark the BlobBackend (throughput, IOPS, latency).
+    Bench {
+        /// Size of the benchmark blob in bytes (multiple of 512).
+        #[arg(long, default_value = "67108864")]
+        size: u64,
+
+        /// I/O size per operation in bytes (multiple of 512).
+        #[arg(long, default_value = "4096")]
+        block_size: u64,
+
+        /// Number of operations to issue per phase.
+        #[arg(long, default_value = "1024")]
+        count: u64,
+
+        /// Number of concurrent in-flight operations (queue depth).
+        #[arg(long, default_value = "16")]
+        concurrency: u64,
+
+        /// Which workload(s) to run.
+        #[arg(long, value_enum, default_value_t = bench::Workload::All)]
+        workload: bench::Workload,
+
+        /// Provision (create/overwrite) the blob before benchmarking.
+        #[arg(long)]
+        create: bool,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -205,6 +233,29 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Test { size } => {
             run_smoke_test(backend, size).await?;
+        }
+
+        Command::Bench {
+            size,
+            block_size,
+            count,
+            concurrency,
+            workload,
+            create,
+        } => {
+            bench::run_bench(
+                backend,
+                bench::BenchConfig {
+                    size,
+                    block_size,
+                    count,
+                    concurrency,
+                    workload,
+                    create,
+                },
+            )
+            .await
+            .context("benchmark")?;
         }
     }
 

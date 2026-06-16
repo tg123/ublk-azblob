@@ -57,6 +57,34 @@ cargo run -p ublk-azblob -- \
   test --size 4096
 ```
 
+### Benchmark the backend (throughput / IOPS / latency)
+
+```bash
+# Provision a 64 MiB blob and run all four phases (seq write/read, rand write/read)
+cargo run --release -p ublk-azblob -- \
+  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
+  --account devstoreaccount1 \
+  --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
+  --container mycontainer \
+  --blob mybench \
+  bench --create
+```
+
+The `bench` subcommand issues a fixed number of fixed-size operations against
+the `BlobBackend` using a configurable number of concurrent workers (mirroring a
+ublk queue depth) and reports throughput (MiB/s), IOPS, and latency percentiles
+(min / avg / p50 / p95 / p99 / max) per phase. It runs against Azurite, real
+Azure, or the in-memory backend used in tests.
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--size` | `67108864` (64 MiB) | Benchmark blob size (multiple of 512) |
+| `--block-size` | `4096` | I/O size per operation (multiple of 512) |
+| `--count` | `1024` | Operations issued per phase |
+| `--concurrency` | `16` | Concurrent in-flight operations (queue depth) |
+| `--workload` | `all` | `seq`, `rand`, or `all` |
+| `--create` | _off_ | Provision/overwrite the blob before benchmarking |
+
 ### Run as a block device (requires root + ublk_drv + `--features ublk`)
 
 ```bash
@@ -191,6 +219,7 @@ ublk-azblob/
 │   ├── src/
 │   │   ├── main.rs             # CLI entry point (clap)
 │   │   ├── auth.rs             # MSI + SharedKey credential factory
+│   │   ├── bench.rs            # backend throughput / IOPS / latency benchmark
 │   │   ├── ublk_target.rs      # ublk device I/O loop (gated on --features ublk)
 │   │   └── backend/
 │   │       ├── mod.rs          # BlobBackend trait (SDK isolation boundary)
