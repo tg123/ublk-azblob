@@ -185,7 +185,10 @@ The `ublk_drv` kernel module must be loaded on every node
 (`sudo modprobe ublk_drv`); a container cannot load it.
 
 ```bash
-# 1. Build + publish the driver image (or load it into your cluster)
+# 1. Build + publish the driver image (or load it into your cluster).
+#    CI publishes ghcr.io/tg123/ublk-azblob (and Docker Hub) on push to
+#    main and on version tags via .github/workflows/docker.yml; to build
+#    locally instead:
 docker build -f deploy/Dockerfile -t ghcr.io/tg123/ublk-azblob:latest .
 
 # 2. Provide storage credentials + endpoint to the driver

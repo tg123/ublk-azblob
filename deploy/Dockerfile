@@ -9,7 +9,10 @@
 #   docker build -f deploy/Dockerfile -t ghcr.io/tg123/ublk-azblob:latest .
 
 # ── Builder ───────────────────────────────────────────────────────────────────
-FROM rust:1.96-slim AS builder
+# Pinned to bookworm so the produced binary links against the same glibc as the
+# debian:bookworm-slim runtime below (plain rust:1.96-slim tracks a newer Debian
+# and yields `GLIBC_2.x not found` at runtime).
+FROM rust:1.96-slim-bookworm AS builder
 
 # - protobuf-compiler : `protoc`, required by the CSI build script (build.rs)
 # - libprotobuf-dev   : well-known types (google/protobuf/*.proto) imported by csi.proto
