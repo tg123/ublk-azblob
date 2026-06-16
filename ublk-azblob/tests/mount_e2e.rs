@@ -148,7 +148,12 @@ fn start_device(dev: &str, create: bool) -> Child {
 fn signal(child: &Child, sig: i32) {
     // SAFETY: `kill` is safe to call with a valid pid and signal number.
     let rc = unsafe { libc::kill(child.id() as libc::pid_t, sig) };
-    assert_eq!(rc, 0, "kill({sig}) failed");
+    assert_eq!(
+        rc,
+        0,
+        "kill({sig}) failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// Stop the running device cleanly via `SIGINT` and wait for it to exit.

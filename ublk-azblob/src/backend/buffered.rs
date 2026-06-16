@@ -183,6 +183,17 @@ impl BufferedBackend {
     }
 }
 
+/// Reject requests whose `[offset, offset+len)` range falls outside the device.
+fn check_in_bounds(op: &str, offset: u64, len: u64, dev_size: u64) -> anyhow::Result<()> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("{op}: offset ({offset}) + len ({len}) overflows u64"))?;
+    if end > dev_size {
+        bail!("{op} out of bounds: offset={offset} len={len} dev_size={dev_size}");
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl BlobBackend for BufferedBackend {
     async fn create(&self, size: u64) -> anyhow::Result<()> {
@@ -206,6 +217,7 @@ impl BlobBackend for BufferedBackend {
         if state.dev_size == 0 {
             state.dev_size = self.inner.size().await?;
         }
+        check_in_bounds("read", offset, len, state.dev_size)?;
 
         let page_size = self.config.page_size;
         let mut result = BytesMut::zeroed(len as usize);
@@ -259,6 +271,7 @@ impl BlobBackend for BufferedBackend {
         let page_size = self.config.page_size;
         let mut pos: u64 = 0;
         let len = data.len() as u64;
+        check_in_bounds("write", offset, len, state.dev_size)?;
 
         while pos < len {
             let abs_offset = offset + pos;
@@ -305,6 +318,7 @@ impl BlobBackend for BufferedBackend {
         if state.dev_size == 0 {
             state.dev_size = self.inner.size().await?;
         }
+        check_in_bounds("clear", offset, len, state.dev_size)?;
 
         let page_size = self.config.page_size;
         let mut pos: u64 = 0;
@@ -462,5 +476,18 @@ mod tests {
         b.clear(0, 512).await.unwrap();
         let read = b.read(0, 512).await.unwrap();
         assert!(read.iter().all(|&x| x == 0));
+    }
+
+    #[tokio::test]
+    async fn out_of_bounds_is_rejected() {
+        let b = make_backend(2048, 1024, 4);
+        // Reads, writes and clears past dev_size must fail rather than silently
+        // succeed or drop data.
+        assert!(b.read(1536, 1024).await.is_err(), "read past end");
+        assert!(
+            b.write(1536, Bytes::from(vec![0u8; 1024])).await.is_err(),
+            "write past end"
+        );
+        assert!(b.clear(1536, 1024).await.is_err(), "clear past end");
     }
 }

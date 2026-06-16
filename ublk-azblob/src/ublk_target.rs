@@ -174,11 +174,18 @@ fn run_ublk_target_blocking(
 
     let dev_size = cfg.dev_size;
     let block_size = cfg.block_size;
+    if !block_size.is_power_of_two() {
+        anyhow::bail!(
+            "block_size ({block_size}) must be a power of two for logical_bs_shift to be valid"
+        );
+    }
     let block_size_u64 = u64::from(block_size);
     let block_size_usize = usize::try_from(block_size).expect("block size fits in usize");
     let tgt_init = move |dev: &mut UblkDev| {
         // Advertise a volatile write cache so the kernel issues FLUSH on
-        // sync/umount, then honour the configured logical block size.
+        // sync/umount, then honour the configured logical block size.  The
+        // power-of-two check above guarantees `trailing_zeros` is the correct
+        // shift for `block_size`.
         dev.set_default_params(dev_size);
         dev.tgt.params.basic.logical_bs_shift = block_size.trailing_zeros() as u8;
         Ok(())
