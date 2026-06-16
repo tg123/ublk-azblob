@@ -199,8 +199,7 @@ fn run_ublk_target_blocking(
                 let iod = q.get_iod(tag);
                 let op = iod.op_flags & 0xff;
                 let off = iod.start_sector * block_size_u64;
-                let len = usize::try_from(iod.nr_sectors)
-                    .expect("nr_sectors fits in usize")
+                let len = usize::try_from(iod.nr_sectors).expect("nr_sectors fits in usize")
                     * block_size_usize;
                 let buf = &bufs_io[tag as usize];
 

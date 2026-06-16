@@ -33,7 +33,7 @@ impl Default for BufferedConfig {
     fn default() -> Self {
         Self {
             page_size: 4 * 1024 * 1024, // 4 MiB
-            max_dirty_pages: 64,         // 256 MiB total
+            max_dirty_pages: 64,        // 256 MiB total
         }
     }
 }
@@ -69,7 +69,7 @@ struct BufferState {
 
 impl BufferedBackend {
     pub fn new(inner: Arc<dyn BlobBackend>, config: BufferedConfig) -> Self {
-        assert!(config.page_size >= 512 && config.page_size % 512 == 0);
+        assert!(config.page_size >= 512 && config.page_size.is_multiple_of(512));
         Self {
             inner,
             config,
@@ -119,7 +119,12 @@ impl BufferedBackend {
         };
 
         if write_len > 0 {
-            trace!(page_idx, offset, len = write_len, "flushing page to backend");
+            trace!(
+                page_idx,
+                offset,
+                len = write_len,
+                "flushing page to backend"
+            );
             self.inner
                 .write(offset, data.slice(..write_len as usize))
                 .await
@@ -193,7 +198,7 @@ impl BlobBackend for BufferedBackend {
         if len == 0 {
             return Ok(Bytes::new());
         }
-        if offset % 512 != 0 || len % 512 != 0 {
+        if !offset.is_multiple_of(512) || !len.is_multiple_of(512) {
             bail!("read: offset ({offset}) and len ({len}) must be 512-byte aligned");
         }
 
@@ -210,13 +215,14 @@ impl BlobBackend for BufferedBackend {
             let abs_offset = offset + pos;
             let page_idx = abs_offset / page_size;
             let page_offset = abs_offset % page_size;
-            let chunk_len = ((page_size - page_offset) as u64).min(len - pos) as usize;
+            let chunk_len = (page_size - page_offset).min(len - pos) as usize;
 
             if state.pages.contains_key(&page_idx) {
                 // Serve from buffer.
                 let page = state.pages.get(&page_idx).unwrap();
-                result[pos as usize..pos as usize + chunk_len]
-                    .copy_from_slice(&page.data[page_offset as usize..page_offset as usize + chunk_len]);
+                result[pos as usize..pos as usize + chunk_len].copy_from_slice(
+                    &page.data[page_offset as usize..page_offset as usize + chunk_len],
+                );
             } else {
                 // Read directly from inner (don't pollute cache for pure reads).
                 let data = self
@@ -238,7 +244,7 @@ impl BlobBackend for BufferedBackend {
         if data.is_empty() {
             return Ok(());
         }
-        if offset % 512 != 0 || data.len() as u64 % 512 != 0 {
+        if !offset.is_multiple_of(512) || !(data.len() as u64).is_multiple_of(512) {
             bail!(
                 "write: offset ({offset}) and data.len() ({}) must be 512-byte aligned",
                 data.len()
@@ -258,7 +264,7 @@ impl BlobBackend for BufferedBackend {
             let abs_offset = offset + pos;
             let page_idx = abs_offset / page_size;
             let page_offset = (abs_offset % page_size) as usize;
-            let chunk_len = ((page_size as u64 - page_offset as u64).min(len - pos)) as usize;
+            let chunk_len = (page_size - page_offset as u64).min(len - pos) as usize;
 
             // Auto-flush if we're about to exceed the dirty page limit and this
             // page isn't already in the buffer.
@@ -291,7 +297,7 @@ impl BlobBackend for BufferedBackend {
         if len == 0 {
             return Ok(());
         }
-        if offset % 512 != 0 || len % 512 != 0 {
+        if !offset.is_multiple_of(512) || !len.is_multiple_of(512) {
             bail!("clear: offset ({offset}) and len ({len}) must be 512-byte aligned");
         }
 
@@ -307,7 +313,7 @@ impl BlobBackend for BufferedBackend {
             let abs_offset = offset + pos;
             let page_idx = abs_offset / page_size;
             let page_offset = (abs_offset % page_size) as usize;
-            let chunk_len = ((page_size as u64 - page_offset as u64).min(len - pos)) as usize;
+            let chunk_len = (page_size - page_offset as u64).min(len - pos) as usize;
 
             if !state.pages.contains_key(&page_idx) {
                 let dirty = Self::dirty_count(&state);
@@ -345,7 +351,10 @@ impl BlobBackend for BufferedBackend {
             return Ok(());
         }
 
-        info!(dirty_pages = dirty_indices.len(), "flushing all dirty pages");
+        info!(
+            dirty_pages = dirty_indices.len(),
+            "flushing all dirty pages"
+        );
         for page_idx in dirty_indices {
             self.flush_page(&mut state, page_idx).await?;
         }
