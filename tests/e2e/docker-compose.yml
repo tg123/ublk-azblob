@@ -11,11 +11,11 @@
 services:
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:3.34.0
-    command: azurite-blob --blobHost 0.0.0.0 --loose
+    command: azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
     ports:
       - "10000:10000"
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "10000"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "10000"]
       interval: 5s
       timeout: 5s
       retries: 10

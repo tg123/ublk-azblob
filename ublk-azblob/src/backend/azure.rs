@@ -48,6 +48,13 @@ impl BlobBackend for AzurePageBlobBackend {
         if size == 0 || !size.is_multiple_of(512) {
             bail!("size must be a non-zero multiple of 512 bytes, got {size}");
         }
+        // Ensure the target container exists before provisioning the blob.
+        // A 409 Conflict means it already exists, which is fine.
+        if let Err(err) = self.container.create(None).await {
+            if err.http_status() != Some(azure_core::http::StatusCode::Conflict) {
+                return Err(err).context("create container");
+            }
+        }
         let blob_client = self.container.blob_client(&self.blob_name);
         let page_client = blob_client.page_blob_client();
         trace!(size, "creating page blob");
