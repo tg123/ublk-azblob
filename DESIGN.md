@@ -95,6 +95,25 @@ blob.
 
 A future SDK upgrade only requires modifying `src/backend/azure.rs`.
 
+### 1b. Pluggable front-ends: ublk and NBD
+
+The same `BlobBackend` boundary lets the device be driven by more than one
+kernel/userspace front-end.  Two targets are provided:
+
+```
+ublk_target.rs  ←  Linux ublk (io_uring) → /dev/ublkbN   (needs ublk_drv, root, kernel ≥6.0)
+nbd_target.rs   ←  NBD server (TCP)       → /dev/nbdX     (compatibility; any kernel with nbd client)
+```
+
+`nbd_target.rs` implements the server side of the NBD *fixed newstyle*
+handshake and transmission phase in pure `tokio` (no extra dependencies, no
+Cargo feature flag) and maps each NBD command to the same trait the ublk loop
+uses (`READ`/`WRITE`/`FLUSH`/`TRIM`/`WRITE_ZEROES` → `read`/`write`/`flush`/
+`clear`).  It is selected with `run --nbd <host:port>` and exists so the blob
+can be exposed on kernels/platforms where `ublk_drv` is unavailable.  It
+advertises a 512-byte minimum/preferred block size so clients align I/O to the
+page-blob granularity.
+
 ### 2. 512-byte alignment
 
 All offsets and lengths are validated to be multiples of 512 bytes.  Azure Page
