@@ -16,8 +16,73 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Build the image and run a health check *against the image itself* before
+  # publishing: the static binary must run and the userspace tools the node
+  # plugin shells out to (mkfs.ext4 / mount / umount / blkid) must be present.
+  # The amd64 layers are cached (type=gha) and reused by the publish job below.
+  verify:
+    name: verify image is healthy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (amd64, load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ublk-azblob:verify
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run image health check
+        run: |
+          set -euo pipefail
+          img=ublk-azblob:verify
+
+          echo "::group::binary runs (--help)"
+          docker run --rm "$img" --help
+          echo "::endgroup::"
+
+          echo "::group::bundled userspace tools present"
+          docker run --rm --entrypoint sh "$img" -ec '
+            for tool in mkfs.ext4 mount umount blkid; do
+              if command -v "$tool" >/dev/null 2>&1; then
+                echo "ok: $tool -> $(command -v "$tool")"
+              else
+                echo "MISSING: $tool" >&2
+                exit 1
+              fi
+            done
+          '
+          echo "::endgroup::"
+
+          echo "::group::binary is statically linked (no dynamic loader)"
+          # musl's ldd is quirky on static-PIE binaries (may exit non-zero and
+          # print "Not a valid dynamic program"); treat any of the known
+          # "no shared libs" markers as static, and only fail if we actually see
+          # shared-library resolution lines (" => /path/lib.so").
+          docker run --rm --entrypoint sh "$img" -ec '
+            out=$(ldd /usr/local/bin/ublk-azblob 2>&1 || true)
+            echo "$out"
+            if printf "%s" "$out" | grep -q " => /"; then
+              echo "ERROR: binary is dynamically linked" >&2
+              exit 1
+            fi
+            echo "ok: no shared library dependencies"
+          '
+          echo "::endgroup::"
+
   publish:
     name: build + publish image (GHCR + Docker Hub)
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
