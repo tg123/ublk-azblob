@@ -89,105 +89,167 @@ impl BufferedBackend {
         })
     }
 
-    /// Flush the N oldest dirty pages to make room.
-    async fn evict_oldest(&self, state: &mut BufferState, count: usize) -> anyhow::Result<()> {
-        // Collect dirty page indices sorted by sequence number (oldest first).
-        let mut dirty: Vec<(u64, u64)> = state
-            .pages
-            .iter()
-            .filter(|(_, p)| p.dirty)
-            .map(|(&idx, p)| (p.seq, idx))
-            .collect();
-        dirty.sort_unstable();
-
-        let to_flush: Vec<u64> = dirty.iter().take(count).map(|&(_, idx)| idx).collect();
-
-        for &page_idx in &to_flush {
-            self.flush_page(state, page_idx).await?;
+    /// Return the device size, lazily initialising it from the inner backend.
+    ///
+    /// The state lock is never held across the inner `.await`.
+    async fn dev_size(&self) -> anyhow::Result<u64> {
+        {
+            let state = self.state.lock().await;
+            if state.dev_size != 0 {
+                return Ok(state.dev_size);
+            }
         }
-        Ok(())
+        let sz = self.inner.size().await?;
+        let mut state = self.state.lock().await;
+        if state.dev_size == 0 {
+            state.dev_size = sz;
+        }
+        Ok(state.dev_size)
     }
 
-    /// Flush a single page to the inner backend.
-    async fn flush_page(&self, state: &mut BufferState, page_idx: u64) -> anyhow::Result<()> {
-        let page = match state.pages.get_mut(&page_idx) {
-            Some(p) if p.dirty => p,
-            _ => return Ok(()),
-        };
-
-        let offset = page_idx * self.config.page_size;
-        let data = Bytes::copy_from_slice(&page.data[..]);
-
-        // Determine actual write length (don't write past dev_size).
-        let write_len = if state.dev_size > 0 {
-            let remaining = state.dev_size.saturating_sub(offset);
-            (data.len() as u64).min(remaining)
-        } else {
-            data.len() as u64
-        };
-
-        if write_len > 0 {
-            trace!(
-                page_idx,
-                offset,
-                len = write_len,
-                "flushing page to backend"
-            );
-            self.inner
-                .write(offset, data.slice(..write_len as usize))
-                .await
-                .with_context(|| format!("flush page {page_idx} at offset {offset}"))?;
+    /// Ensure `page_idx` is resident, loading it from the inner backend if
+    /// necessary.  The inner read happens **without** the state lock held; the
+    /// lock is only taken briefly to check residency and to insert the page.
+    ///
+    /// Pages are never removed once resident, so after this returns the page is
+    /// guaranteed to stay present for subsequent `get_mut` access.
+    async fn ensure_resident(&self, page_idx: u64, dev_size: u64) -> anyhow::Result<()> {
+        {
+            let state = self.state.lock().await;
+            if state.pages.contains_key(&page_idx) {
+                return Ok(());
+            }
         }
 
-        // Mark clean after successful write.
-        let page = state.pages.get_mut(&page_idx).unwrap();
-        page.dirty = false;
-        Ok(())
-    }
-
-    /// Ensure a page exists in the buffer, loading from inner if needed.
-    async fn ensure_page(&self, state: &mut BufferState, page_idx: u64) -> anyhow::Result<()> {
-        if state.pages.contains_key(&page_idx) {
-            return Ok(());
-        }
-
-        let offset = page_idx * self.config.page_size;
-        let read_len = if state.dev_size > 0 {
-            let remaining = state.dev_size.saturating_sub(offset);
-            remaining.min(self.config.page_size)
+        let page_size = self.config.page_size;
+        let offset = page_idx * page_size;
+        let read_len = if dev_size > 0 {
+            dev_size.saturating_sub(offset).min(page_size)
         } else {
-            self.config.page_size
+            0
         };
 
-        let data = if read_len > 0 && state.dev_size > 0 {
-            // Read existing content from inner backend.
-            self.inner
+        let mut buf = BytesMut::zeroed(page_size as usize);
+        if read_len > 0 {
+            let data = self
+                .inner
                 .read(offset, read_len)
                 .await
-                .with_context(|| format!("load page {page_idx} from backend"))?
-        } else {
-            Bytes::from(vec![0u8; self.config.page_size as usize])
-        };
+                .with_context(|| format!("load page {page_idx} from backend"))?;
+            if data.len() as u64 != read_len {
+                bail!(
+                    "backend returned {} bytes loading page {page_idx} (expected {read_len})",
+                    data.len()
+                );
+            }
+            buf[..data.len()].copy_from_slice(&data);
+        }
 
-        let mut buf = BytesMut::zeroed(self.config.page_size as usize);
-        let copy_len = data.len().min(buf.len());
-        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-
-        state.seq_counter += 1;
-        state.pages.insert(
-            page_idx,
-            Page {
-                data: buf,
-                dirty: false,
-                seq: state.seq_counter,
-            },
-        );
+        let mut state = self.state.lock().await;
+        // Another task may have loaded the page while we were reading; if so,
+        // keep theirs (never clobber a resident page) and drop our load.
+        if !state.pages.contains_key(&page_idx) {
+            state.seq_counter += 1;
+            let seq = state.seq_counter;
+            state.pages.insert(
+                page_idx,
+                Page {
+                    data: buf,
+                    dirty: false,
+                    seq,
+                },
+            );
+        }
         Ok(())
     }
 
-    /// Count dirty pages.
-    fn dirty_count(state: &BufferState) -> usize {
-        state.pages.values().filter(|p| p.dirty).count()
+    /// Flush the given pages to the inner backend.
+    ///
+    /// Each page's bytes are snapshotted under a brief lock, written to the
+    /// inner backend with the lock released, then marked clean under the lock —
+    /// but only if the page was not modified again during the write (detected
+    /// via its sequence number).  This guarantees no dirty data is lost.
+    async fn flush_indices(&self, indices: &[u64]) -> anyhow::Result<()> {
+        let page_size = self.config.page_size;
+        for &page_idx in indices {
+            // Snapshot the dirty page under a brief lock (no await held).
+            let snapshot = {
+                let state = self.state.lock().await;
+                match state.pages.get(&page_idx) {
+                    Some(p) if p.dirty => {
+                        let offset = page_idx * page_size;
+                        let write_len = if state.dev_size > 0 {
+                            (p.data.len() as u64).min(state.dev_size.saturating_sub(offset))
+                        } else {
+                            p.data.len() as u64
+                        };
+                        Some((
+                            p.seq,
+                            offset,
+                            write_len,
+                            Bytes::copy_from_slice(&p.data[..]),
+                        ))
+                    }
+                    _ => None,
+                }
+            };
+
+            let Some((seq, offset, write_len, data)) = snapshot else {
+                continue;
+            };
+
+            if write_len > 0 {
+                trace!(
+                    page_idx,
+                    offset,
+                    len = write_len,
+                    "flushing page to backend"
+                );
+                self.inner
+                    .write(offset, data.slice(..write_len as usize))
+                    .await
+                    .with_context(|| format!("flush page {page_idx} at offset {offset}"))?;
+            }
+
+            // Mark clean only if the page wasn't re-dirtied during the flush.
+            let mut state = self.state.lock().await;
+            if let Some(p) = state.pages.get_mut(&page_idx) {
+                if p.seq == seq {
+                    p.dirty = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// If the number of dirty pages exceeds `max_dirty_pages`, flush the oldest
+    /// dirty pages until the limit is satisfied.
+    async fn enforce_dirty_limit(&self) -> anyhow::Result<()> {
+        let victims: Vec<u64> = {
+            let state = self.state.lock().await;
+            let dirty = state.pages.values().filter(|p| p.dirty).count();
+            if dirty <= self.config.max_dirty_pages {
+                return Ok(());
+            }
+            let over = dirty - self.config.max_dirty_pages;
+            let mut by_age: Vec<(u64, u64)> = state
+                .pages
+                .iter()
+                .filter(|(_, p)| p.dirty)
+                .map(|(&idx, p)| (p.seq, idx))
+                .collect();
+            by_age.sort_unstable();
+            by_age.iter().take(over).map(|&(_, idx)| idx).collect()
+        };
+
+        if !victims.is_empty() {
+            info!(
+                evicting = victims.len(),
+                "auto-flushing dirty pages over limit"
+            );
+            self.flush_indices(&victims).await?;
+        }
+        Ok(())
     }
 }
 
@@ -221,11 +283,8 @@ impl BlobBackend for BufferedBackend {
             bail!("read: offset ({offset}) and len ({len}) must be 512-byte aligned");
         }
 
-        let mut state = self.state.lock().await;
-        if state.dev_size == 0 {
-            state.dev_size = self.inner.size().await?;
-        }
-        check_in_bounds("read", offset, len, state.dev_size)?;
+        let dev_size = self.dev_size().await?;
+        check_in_bounds("read", offset, len, dev_size)?;
 
         let page_size = self.config.page_size;
         let mut result = BytesMut::zeroed(len as usize);
@@ -237,14 +296,22 @@ impl BlobBackend for BufferedBackend {
             let page_offset = abs_offset % page_size;
             let chunk_len = (page_size - page_offset).min(len - pos) as usize;
 
-            if state.pages.contains_key(&page_idx) {
-                // Serve from buffer.
-                let page = state.pages.get(&page_idx).unwrap();
-                result[pos as usize..pos as usize + chunk_len].copy_from_slice(
-                    &page.data[page_offset as usize..page_offset as usize + chunk_len],
-                );
-            } else {
-                // Read directly from inner (don't pollute cache for pure reads).
+            // Try to serve from the buffer under a brief lock (no await held).
+            let served = {
+                let state = self.state.lock().await;
+                if let Some(page) = state.pages.get(&page_idx) {
+                    result[pos as usize..pos as usize + chunk_len].copy_from_slice(
+                        &page.data[page_offset as usize..page_offset as usize + chunk_len],
+                    );
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if !served {
+                // Read directly from inner with no lock held; don't pollute the
+                // cache for pure reads.
                 let data = self
                     .inner
                     .read(abs_offset, chunk_len as u64)
@@ -276,15 +343,12 @@ impl BlobBackend for BufferedBackend {
             );
         }
 
-        let mut state = self.state.lock().await;
-        if state.dev_size == 0 {
-            state.dev_size = self.inner.size().await?;
-        }
+        let dev_size = self.dev_size().await?;
+        let len = data.len() as u64;
+        check_in_bounds("write", offset, len, dev_size)?;
 
         let page_size = self.config.page_size;
         let mut pos: u64 = 0;
-        let len = data.len() as u64;
-        check_in_bounds("write", offset, len, state.dev_size)?;
 
         while pos < len {
             let abs_offset = offset + pos;
@@ -292,26 +356,27 @@ impl BlobBackend for BufferedBackend {
             let page_offset = (abs_offset % page_size) as usize;
             let chunk_len = (page_size - page_offset as u64).min(len - pos) as usize;
 
-            // Auto-flush if we're about to exceed the dirty page limit and this
-            // page isn't already in the buffer.
-            if !state.pages.contains_key(&page_idx) {
-                let dirty = Self::dirty_count(&state);
-                if dirty >= self.config.max_dirty_pages {
-                    let to_evict = dirty - self.config.max_dirty_pages + 1;
-                    info!(dirty, evicting = to_evict, "auto-flushing dirty pages");
-                    self.evict_oldest(&mut state, to_evict).await?;
-                }
+            // Load the page (inner I/O happens without the state lock held).
+            self.ensure_resident(page_idx, dev_size).await?;
+
+            // Apply the modification under a brief lock (no await held).
+            {
+                let mut state = self.state.lock().await;
+                state.seq_counter += 1;
+                let seq = state.seq_counter;
+                let page = state
+                    .pages
+                    .get_mut(&page_idx)
+                    .expect("page resident after ensure_resident");
+                page.data[page_offset..page_offset + chunk_len]
+                    .copy_from_slice(&data[pos as usize..pos as usize + chunk_len]);
+                page.dirty = true;
+                page.seq = seq;
             }
 
-            self.ensure_page(&mut state, page_idx).await?;
-
-            state.seq_counter += 1;
-            let seq = state.seq_counter;
-            let page = state.pages.get_mut(&page_idx).unwrap();
-            page.data[page_offset..page_offset + chunk_len]
-                .copy_from_slice(&data[pos as usize..pos as usize + chunk_len]);
-            page.dirty = true;
-            page.seq = seq;
+            // Keep the dirty-page count bounded (flushes oldest, lock released
+            // across the inner writes).
+            self.enforce_dirty_limit().await?;
 
             pos += chunk_len as u64;
         }
@@ -327,11 +392,8 @@ impl BlobBackend for BufferedBackend {
             bail!("clear: offset ({offset}) and len ({len}) must be 512-byte aligned");
         }
 
-        let mut state = self.state.lock().await;
-        if state.dev_size == 0 {
-            state.dev_size = self.inner.size().await?;
-        }
-        check_in_bounds("clear", offset, len, state.dev_size)?;
+        let dev_size = self.dev_size().await?;
+        check_in_bounds("clear", offset, len, dev_size)?;
 
         let page_size = self.config.page_size;
         let mut pos: u64 = 0;
@@ -342,22 +404,22 @@ impl BlobBackend for BufferedBackend {
             let page_offset = (abs_offset % page_size) as usize;
             let chunk_len = (page_size - page_offset as u64).min(len - pos) as usize;
 
-            if !state.pages.contains_key(&page_idx) {
-                let dirty = Self::dirty_count(&state);
-                if dirty >= self.config.max_dirty_pages {
-                    let to_evict = dirty - self.config.max_dirty_pages + 1;
-                    self.evict_oldest(&mut state, to_evict).await?;
-                }
+            self.ensure_resident(page_idx, dev_size).await?;
+
+            {
+                let mut state = self.state.lock().await;
+                state.seq_counter += 1;
+                let seq = state.seq_counter;
+                let page = state
+                    .pages
+                    .get_mut(&page_idx)
+                    .expect("page resident after ensure_resident");
+                page.data[page_offset..page_offset + chunk_len].fill(0);
+                page.dirty = true;
+                page.seq = seq;
             }
 
-            self.ensure_page(&mut state, page_idx).await?;
-
-            state.seq_counter += 1;
-            let seq = state.seq_counter;
-            let page = state.pages.get_mut(&page_idx).unwrap();
-            page.data[page_offset..page_offset + chunk_len].fill(0);
-            page.dirty = true;
-            page.seq = seq;
+            self.enforce_dirty_limit().await?;
 
             pos += chunk_len as u64;
         }
@@ -366,38 +428,30 @@ impl BlobBackend for BufferedBackend {
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        let dirty_indices: Vec<u64> = state
-            .pages
-            .iter()
-            .filter(|(_, p)| p.dirty)
-            .map(|(&idx, _)| idx)
-            .collect();
+        let dirty_indices: Vec<u64> = {
+            let state = self.state.lock().await;
+            state
+                .pages
+                .iter()
+                .filter(|(_, p)| p.dirty)
+                .map(|(&idx, _)| idx)
+                .collect()
+        };
 
-        if dirty_indices.is_empty() {
-            return Ok(());
+        if !dirty_indices.is_empty() {
+            info!(
+                dirty_pages = dirty_indices.len(),
+                "flushing all dirty pages"
+            );
+            self.flush_indices(&dirty_indices).await?;
         }
 
-        info!(
-            dirty_pages = dirty_indices.len(),
-            "flushing all dirty pages"
-        );
-        for page_idx in dirty_indices {
-            self.flush_page(&mut state, page_idx).await?;
-        }
-
-        // Also call inner flush in case it has its own buffering.
-        // Release lock first to avoid holding it across the inner flush.
-        drop(state);
+        // Also flush the inner backend in case it has its own buffering.
         self.inner.flush().await
     }
 
     async fn size(&self) -> anyhow::Result<u64> {
-        let mut state = self.state.lock().await;
-        if state.dev_size == 0 {
-            state.dev_size = self.inner.size().await?;
-        }
-        Ok(state.dev_size)
+        self.dev_size().await
     }
 }
 
@@ -505,5 +559,58 @@ mod tests {
             "write past end"
         );
         assert!(b.clear(1536, 1024).await.is_err(), "clear past end");
+    }
+
+    // Concurrent writes to distinct pages, interleaved with a flush, must not
+    // deadlock and every write must survive — exercising the path where the
+    // state lock is released across inner I/O.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_are_consistent() {
+        const PAGES: u64 = 32;
+        let page_size = 1024u64;
+        let dev_size = PAGES * page_size;
+        let inner = Arc::new(MemBackend::new(dev_size).unwrap());
+        let b = Arc::new(
+            BufferedBackend::new(
+                inner.clone(),
+                BufferedConfig {
+                    page_size,
+                    max_dirty_pages: 4,
+                },
+            )
+            .unwrap(),
+        );
+
+        let mut handles = Vec::new();
+        for p in 0..PAGES {
+            let b = b.clone();
+            handles.push(tokio::spawn(async move {
+                let byte = (p & 0xFF) as u8;
+                b.write(p * page_size, Bytes::from(vec![byte; 512]))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        b.flush().await.unwrap();
+
+        // Every page's write must be readable both through the buffer and from
+        // the inner backend after flush.
+        for p in 0..PAGES {
+            let byte = (p & 0xFF) as u8;
+            let via_buffer = b.read(p * page_size, 512).await.unwrap();
+            assert!(
+                via_buffer.iter().all(|&x| x == byte),
+                "page {p} wrong via buffer"
+            );
+            let via_inner = inner.read(p * page_size, 512).await.unwrap();
+            assert!(
+                via_inner.iter().all(|&x| x == byte),
+                "page {p} not persisted to inner"
+            );
+        }
     }
 }
