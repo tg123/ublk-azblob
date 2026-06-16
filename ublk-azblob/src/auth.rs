@@ -31,9 +31,10 @@ use azure_core::http::{
     policies::{Policy, PolicyResult},
     Context, Request,
 };
+use azure_core::credentials::Secret;
 use azure_identity::{
-    ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId,
-    WorkloadIdentityCredential, WorkloadIdentityCredentialOptions,
+    ClientSecretCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
+    UserAssignedId, WorkloadIdentityCredential, WorkloadIdentityCredentialOptions,
 };
 use azure_storage_blob::{BlobContainerClient, BlobContainerClientOptions, BlobServiceClient};
 use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine as _};
@@ -68,6 +69,16 @@ pub enum AuthConfig {
         client_id: Option<String>,
         tenant_id: Option<String>,
         token_file: Option<String>,
+    },
+
+    /// Service principal (Entra ID application) with a client secret.
+    ///
+    /// Suitable when the workload authenticates as an app registration rather
+    /// than a managed identity (e.g. an AKS pod handed an SP client id/secret).
+    ServicePrincipal {
+        tenant_id: String,
+        client_id: String,
+        client_secret: String,
     },
 
     /// Storage account shared key (HMAC-SHA256).
@@ -136,6 +147,24 @@ pub fn build_container_client(
                 .context("create WorkloadIdentityCredential")?;
             let svc = BlobServiceClient::new(url, Some(cred), None)
                 .context("create BlobServiceClient (Workload Identity)")?;
+            Ok(svc.blob_container_client(container_name))
+        }
+
+        AuthConfig::ServicePrincipal {
+            tenant_id,
+            client_id,
+            client_secret,
+        } => {
+            debug!(client_id = %client_id, "using ServicePrincipal (client secret) credential");
+            let cred = ClientSecretCredential::new(
+                tenant_id,
+                client_id.clone(),
+                Secret::from(client_secret.clone()),
+                None,
+            )
+            .context("create ClientSecretCredential")?;
+            let svc = BlobServiceClient::new(url, Some(cred), None)
+                .context("create BlobServiceClient (ServicePrincipal)")?;
             Ok(svc.blob_container_client(container_name))
         }
 

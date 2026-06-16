@@ -98,11 +98,11 @@ struct Cli {
     #[arg(long, env = "AZURE_USE_WORKLOAD_IDENTITY", conflicts_with_all = ["account_key", "msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
     workload_identity: bool,
 
-    /// Workload Identity client ID (overrides `AZURE_CLIENT_ID`).
+    /// Workload Identity / service principal client ID (overrides `AZURE_CLIENT_ID`).
     #[arg(long, env = "AZURE_CLIENT_ID")]
     azure_client_id: Option<String>,
 
-    /// Workload Identity tenant ID (overrides `AZURE_TENANT_ID`).
+    /// Workload Identity / service principal tenant ID (overrides `AZURE_TENANT_ID`).
     #[arg(long, env = "AZURE_TENANT_ID")]
     azure_tenant_id: Option<String>,
 
@@ -110,6 +110,15 @@ struct Cli {
     /// `AZURE_FEDERATED_TOKEN_FILE`).
     #[arg(long, env = "AZURE_FEDERATED_TOKEN_FILE")]
     azure_federated_token_file: Option<String>,
+
+    /// Service principal client secret.
+    ///
+    /// When set (together with `AZURE_CLIENT_ID` / `AZURE_TENANT_ID`), the
+    /// driver authenticates as an Entra ID application (client-secret flow)
+    /// rather than a managed/workload identity. Mutually exclusive with
+    /// --account-key and the --msi* flags.
+    #[arg(long, env = "AZURE_CLIENT_SECRET", conflicts_with_all = ["account_key", "msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
+    azure_client_secret: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -395,6 +404,9 @@ async fn main() -> anyhow::Result<()> {
                 workload_identity_client_id: cli.azure_client_id.clone(),
                 workload_identity_tenant_id: cli.azure_tenant_id.clone(),
                 workload_identity_token_file: cli.azure_federated_token_file.clone(),
+                sp_tenant_id: cli.azure_tenant_id.clone(),
+                sp_client_id: cli.azure_client_id.clone(),
+                sp_client_secret: cli.azure_client_secret.clone(),
             };
             let node_id = if node_id.is_empty() {
                 hostname()
@@ -579,10 +591,23 @@ fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
         return Ok(AuthConfig::Msi(user_assigned));
     }
 
+    if let (Some(tenant_id), Some(client_id), Some(client_secret)) = (
+        cli.azure_tenant_id.as_ref(),
+        cli.azure_client_id.as_ref(),
+        cli.azure_client_secret.as_ref(),
+    ) {
+        return Ok(AuthConfig::ServicePrincipal {
+            tenant_id: tenant_id.clone(),
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+        });
+    }
+
     anyhow::bail!(
         "No auth method specified. Use --account-key for Azurite/dev, \
          --workload-identity for AKS (federated token), \
-         or --msi / --msi-client-id for production (Managed Identity)."
+         --msi / --msi-client-id for Managed Identity, \
+         or AZURE_CLIENT_ID + AZURE_TENANT_ID + AZURE_CLIENT_SECRET for a service principal."
     );
 }
 

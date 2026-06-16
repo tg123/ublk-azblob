@@ -112,6 +112,12 @@ pub struct DriverConfig {
     pub workload_identity_tenant_id: Option<String>,
     /// Optional federated token file path (defaults to `AZURE_FEDERATED_TOKEN_FILE`).
     pub workload_identity_token_file: Option<String>,
+    /// Service principal Entra ID tenant id (client-secret auth).
+    pub sp_tenant_id: Option<String>,
+    /// Service principal application (client) id (client-secret auth).
+    pub sp_client_id: Option<String>,
+    /// Service principal client secret (client-secret auth).
+    pub sp_client_secret: Option<String>,
 }
 
 /// Run the CSI gRPC server, listening on `endpoint` until the process is
@@ -229,11 +235,22 @@ pub fn build_backend(
                 .clone()
                 .map(UserAssignedIdentity::ClientId),
         )
+    } else if let (Some(tenant_id), Some(client_id), Some(client_secret)) = (
+        config.sp_tenant_id.clone(),
+        config.sp_client_id.clone(),
+        config.sp_client_secret.clone(),
+    ) {
+        AuthConfig::ServicePrincipal {
+            tenant_id,
+            client_id,
+            client_secret,
+        }
     } else {
         anyhow::bail!(
             "no auth configured: provide an account key (secret 'accountKey' or \
-             --account-key), enable Workload Identity (--workload-identity), or \
-             enable Managed Identity (--msi / --msi-client-id)"
+             --account-key), enable Workload Identity (--workload-identity), \
+             enable Managed Identity (--msi / --msi-client-id), \
+             or a service principal (AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET)"
         );
     };
 
