@@ -14,7 +14,7 @@ mod ublk_target;
 
 use anyhow::Context as _;
 use auth::{AuthConfig, UserAssignedIdentity};
-use backend::{azure::AzurePageBlobBackend, BlobBackend};
+use backend::{azure::AzurePageBlobBackend, buffered::{BufferedBackend, BufferedConfig}, BlobBackend};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -97,6 +97,21 @@ enum Command {
         /// next free `/dev/ublkbN`).
         #[arg(long, default_value = "-1")]
         id: i32,
+
+        /// Write-back buffer page size in bytes.
+        ///
+        /// Writes are buffered in pages of this size and flushed to Azure in
+        /// batches.  Must be a multiple of 512.  Set to 0 to disable buffering
+        /// (write-through mode).
+        #[arg(long, default_value = "4194304", env = "UBLK_PAGE_SIZE")]
+        page_size: u64,
+
+        /// Maximum number of dirty pages held in memory before auto-flush.
+        ///
+        /// When the dirty page count exceeds this limit the oldest pages are
+        /// flushed to Azure automatically.  Total memory cap ≈ page_size × max_dirty_pages.
+        #[arg(long, default_value = "64", env = "UBLK_MAX_DIRTY_PAGES")]
+        max_dirty_pages: usize,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -139,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
             nr_queues,
             queue_depth,
             id,
+            page_size,
+            max_dirty_pages,
         } => {
             if create {
                 info!(size, blob = %cli.blob, "creating page blob");
@@ -147,6 +164,21 @@ async fn main() -> anyhow::Result<()> {
 
             let actual_size = backend.size().await.context("get blob size")?;
             info!(size = actual_size, blob = %cli.blob, "blob ready");
+
+            // Wrap with write-back buffer if page_size > 0.
+            let backend: Arc<dyn BlobBackend> = if page_size > 0 {
+                info!(page_size, max_dirty_pages, "write-back buffer enabled");
+                Arc::new(BufferedBackend::new(
+                    backend,
+                    BufferedConfig {
+                        page_size,
+                        max_dirty_pages,
+                    },
+                ))
+            } else {
+                info!("write-through mode (no buffering)");
+                backend
+            };
 
             let cfg = ublk_target::UblkConfig {
                 block_size: 512,

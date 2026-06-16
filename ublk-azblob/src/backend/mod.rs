@@ -4,6 +4,7 @@
 //! No Azure SDK types cross this boundary, so SDK upgrades are isolated here.
 
 pub mod azure;
+pub mod buffered;
 pub mod mem;
 
 use async_trait::async_trait;
