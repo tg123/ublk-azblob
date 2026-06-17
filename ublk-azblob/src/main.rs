@@ -44,11 +44,13 @@ use tracing::{error, info};
 )]
 struct Cli {
     /// Azure Storage account name (e.g. `mystorageaccount`).
-    #[arg(long, env = "AZURE_STORAGE_ACCOUNT")]
+    /// Not used in CSI mode (values come from StorageClass parameters).
+    #[arg(long, env = "AZURE_STORAGE_ACCOUNT", default_value = "")]
     account: String,
 
     /// Blob container name.
-    #[arg(long, env = "AZURE_STORAGE_CONTAINER")]
+    /// Not used in CSI mode (values come from StorageClass parameters).
+    #[arg(long, env = "AZURE_STORAGE_CONTAINER", default_value = "")]
     container: String,
 
     /// Page blob name (path within the container).
@@ -268,7 +270,14 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = cli
         .endpoint
         .clone()
-        .unwrap_or_else(|| format!("https://{}.blob.core.windows.net/", cli.account));
+        .unwrap_or_else(|| {
+            // For CSI mode with empty account, use generic endpoint (will be replaced with actual account)
+            if cli.account.is_empty() {
+                "https://blob.core.windows.net/".to_string()
+            } else {
+                format!("https://{}.blob.core.windows.net/", cli.account)
+            }
+        });
 
     match cli.command {
         Command::Run {

@@ -25,14 +25,11 @@ metadata:
   {{- end }}
 provisioner: {{ .Values.driver.name }}
 parameters:
-  # Secret references (CSI provisioner loads these)
-  csi.storage.k8s.io/provisioner-secret-name: {{ include "ublk-azblob-csi.secretName" . }}
-  csi.storage.k8s.io/provisioner-secret-namespace: {{ include "ublk-azblob-csi.secretNamespace" . }}
-  csi.storage.k8s.io/node-publish-secret-name: {{ include "ublk-azblob-csi.secretName" . }}
-  csi.storage.k8s.io/node-publish-secret-namespace: {{ include "ublk-azblob-csi.secretNamespace" . }}
-  
+  csi.storage.k8s.io/provisioner-secret-name: {{ include "ublk-azblob-csi.secretName" . | quote }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ include "ublk-azblob-csi.secretNamespace" . | quote }}
+  csi.storage.k8s.io/node-publish-secret-name: {{ include "ublk-azblob-csi.secretName" . | quote }}
+  csi.storage.k8s.io/node-publish-secret-namespace: {{ include "ublk-azblob-csi.secretNamespace" . | quote }}
   {{- with .Values.storageClass.parameters }}
-  # Storage configuration (all support variable expansion)
   {{- if .storageAccount }}
   storageAccount: {{ .storageAccount | quote }}
   {{- end }}

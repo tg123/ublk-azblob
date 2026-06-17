@@ -9,48 +9,47 @@
 #   docker build -f deploy/Dockerfile -t ghcr.io/tg123/ublk-azblob:latest .
 
 # ── Builder ───────────────────────────────────────────────────────────────────
-# Alpine's Rust toolchain targets x86_64-unknown-linux-musl (and aarch64 on
-# arm64) by default, so a plain `cargo build` already produces a fully static,
-# self-contained binary — no glibc, so it runs on busybox/Alpine/scratch with no
-# `GLIBC_2.x not found` surprises.
-FROM rust:1.96-alpine AS builder
+# Use Debian-based Rust image for better bindgen compatibility and faster builds with cache
+FROM rust:1.96-bookworm AS builder
 
-# - musl-dev          : C runtime/headers for the `ring` (crypto) C build
-# - protoc, protobuf-dev : `protoc` and the well-known types
-#                       (google/protobuf/*.proto) imported by csi.proto (CSI build.rs)
-# - clang, clang-dev, llvm-libunwind : libclang for bindgen build script
-# - linux-headers     : asm/ioctl.h, linux/blkzoned.h etc. that bindgen parses
-# - pkgconfig         : transitive build dependency probing
-RUN apk add --no-cache \
-        musl-dev \
-        protoc \
-        protobuf-dev \
-        clang \
-        clang-dev \
-        llvm-libunwind \
-        linux-headers \
-        pkgconfig
-
-# Set libclang path for bindgen
-ENV LIBCLANG_PATH=/usr/lib
+# Install build dependencies
+# - protobuf-compiler, libprotobuf-dev: protoc and well-known types for CSI gRPC
+# - libclang-dev: libclang for bindgen (used by libublk-rs-sys)
+# - pkg-config: build dependency probing
+RUN apt-get update && apt-get install -y \
+        protobuf-compiler \
+        libprotobuf-dev \
+        libclang-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY . .
 
-RUN cargo build --release --features "ublk csi" -p ublk-azblob
+# Use BuildKit cache mounts for faster builds:
+# - Cache cargo registry (crates.io index and downloads)
+# - Cache cargo build artifacts in /build/target
+# - Mount source code instead of copying (avoids layer invalidation)
+RUN --mount=type=bind,source=.,target=/src,readonly \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cd /src && \
+    CARGO_TARGET_DIR=/build/target cargo build --release --features "ublk csi" -p ublk-azblob && \
+    cp /build/target/release/ublk-azblob /ublk-azblob
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
-FROM alpine:3.21
+# Use Debian slim runtime to match builder's glibc
+FROM debian:bookworm-slim
 
 # - e2fsprogs       : mkfs.ext4 + blkid
 # - util-linux      : mount / umount
 # - ca-certificates : TLS roots for talking to Azure Storage / the Kubernetes API
 # (the ublk_drv module is loaded on the host, so no kmod/modprobe is needed here)
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y \
         e2fsprogs \
         util-linux \
-        ca-certificates
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/target/release/ublk-azblob /usr/local/bin/ublk-azblob
+COPY --from=builder /ublk-azblob /usr/local/bin/ublk-azblob
 
 ENTRYPOINT ["/usr/local/bin/ublk-azblob"]

@@ -103,9 +103,9 @@ impl NodeService {
                 env.push(("AZURE_MSI_CLIENT_ID".to_string(), id.clone()));
             }
         } else if let (Some(tenant), Some(client), Some(secret)) = (
-            &self.config.sp_tenant_id,
-            &self.config.sp_client_id,
-            &self.config.sp_client_secret,
+            secrets.get("AZURE_TENANT_ID").or(self.config.sp_tenant_id.as_ref()),
+            secrets.get("AZURE_CLIENT_ID").or(self.config.sp_client_id.as_ref()),
+            secrets.get("AZURE_CLIENT_SECRET").or(self.config.sp_client_secret.as_ref()),
         ) {
             env.push(("AZURE_TENANT_ID".to_string(), tenant.clone()));
             env.push(("AZURE_CLIENT_ID".to_string(), client.clone()));

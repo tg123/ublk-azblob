@@ -101,9 +101,9 @@ Secret name based on deployment mode
 Secret namespace based on deployment mode
 */}}
 {{- define "ublk-azblob-csi.secretNamespace" -}}
-{{- if eq .Values.deploymentMode "global" }}
-{{- .Values.namespace }}
-{{- else }}
+{{- if eq .Values.deploymentMode "global" -}}
+{{- .Values.namespace -}}
+{{- else -}}
 ${pvc.namespace}
-{{- end }}
-{{- end }}
+{{- end -}}
+{{- end -}}

@@ -178,9 +178,9 @@ impl Controller for ControllerService {
             pv_name,
         ));
 
-        info!(name = %req.name, container = %container, size, "CreateVolume");
+        info!(name = %req.name, account = %account, container = %container, size, "CreateVolume");
 
-        let backend = build_backend(&self.config, &container, &blob, &req.secrets)
+        let backend = build_backend(&self.config, &account, &container, &blob, &req.secrets)
             .map_err(|e| Status::internal(format!("build backend: {e:#}")))?;
         backend.create(size).await.map_err(|e| {
             error!(error = %format!("{e:#}"), "create page blob failed");
@@ -192,7 +192,16 @@ impl Controller for ControllerService {
         volume_context.insert("container".to_string(), container.clone());
         volume_context.insert("blob".to_string(), blob.clone());
         volume_context.insert("account".to_string(), account.clone());
-        volume_context.insert("endpoint".to_string(), self.config.endpoint.clone());
+        
+        // Build account-specific endpoint for the node
+        // Standard Azure: construct from account; Custom (Azurite): use config if has account
+        let endpoint = if self.config.endpoint.contains(&account) {
+            self.config.endpoint.clone()
+        } else {
+            format!("https://{account}.blob.core.windows.net/")
+        };
+        
+        volume_context.insert("endpoint".to_string(), endpoint);
         volume_context.insert("size".to_string(), size.to_string());
         if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
             volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
@@ -223,7 +232,14 @@ impl Controller for ControllerService {
 
         info!(volume_id = %req.volume_id, "DeleteVolume");
 
-        let backend = build_backend(&self.config, &container, &blob, &req.secrets)
+        // For delete, try to get account from secrets or fall back to config
+        let account = req
+            .secrets
+            .get(PARAM_STORAGE_ACCOUNT)
+            .map(|s| s.as_str())
+            .unwrap_or(&self.config.account);
+
+        let backend = build_backend(&self.config, account, &container, &blob, &req.secrets)
             .map_err(|e| Status::internal(format!("build backend: {e:#}")))?;
         backend.delete().await.map_err(|e| {
             error!(error = %format!("{e:#}"), "delete page blob failed");

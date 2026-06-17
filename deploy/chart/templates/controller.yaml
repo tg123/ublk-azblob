@@ -57,7 +57,6 @@ spec:
             - "csi"
             - "--role=controller"
             - "--csi-endpoint=unix:///csi/csi.sock"
-          # No hardcoded credentials - come from per-namespace or global secrets
           volumeMounts:
             - name: socket-dir
               mountPath: /csi

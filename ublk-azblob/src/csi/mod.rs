@@ -208,6 +208,7 @@ pub fn parse_volume_id(volume_id: &str) -> anyhow::Result<(String, String)> {
 /// `accountKey`) to override the account key.
 pub fn build_backend(
     config: &DriverConfig,
+    account: &str,
     container: &str,
     blob: &str,
     secrets: &HashMap<String, String>,
@@ -219,7 +220,7 @@ pub fn build_backend(
 
     let auth = if let Some(key) = account_key {
         AuthConfig::SharedKey {
-            account_name: config.account.clone(),
+            account_name: account.to_string(),
             account_key: key,
         }
     } else if config.use_workload_identity {
@@ -236,14 +237,14 @@ pub fn build_backend(
                 .map(UserAssignedIdentity::ClientId),
         )
     } else if let (Some(tenant_id), Some(client_id), Some(client_secret)) = (
-        config.sp_tenant_id.clone(),
-        config.sp_client_id.clone(),
-        config.sp_client_secret.clone(),
+        secrets.get("AZURE_TENANT_ID").or(config.sp_tenant_id.as_ref()),
+        secrets.get("AZURE_CLIENT_ID").or(config.sp_client_id.as_ref()),
+        secrets.get("AZURE_CLIENT_SECRET").or(config.sp_client_secret.as_ref()),
     ) {
         AuthConfig::ServicePrincipal {
-            tenant_id,
-            client_id,
-            client_secret,
+            tenant_id: tenant_id.clone(),
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
         }
     } else {
         anyhow::bail!(
@@ -254,7 +255,18 @@ pub fn build_backend(
         );
     };
 
-    let container_client = auth::build_container_client(&config.endpoint, container, &auth)
+    // Build the account-specific endpoint URL
+    // For standard Azure, construct from account: https://{account}.blob.core.windows.net/
+    // For custom endpoints (Azurite, sovereign clouds), use config endpoint if it contains the account
+    let endpoint = if config.endpoint.contains(&account) {
+        // Custom endpoint already has account name (e.g., Azurite: http://127.0.0.1:10000/devstoreaccount1)
+        config.endpoint.clone()
+    } else {
+        // Standard Azure or generic endpoint - construct account-specific URL
+        format!("https://{account}.blob.core.windows.net/")
+    };
+
+    let container_client = auth::build_container_client(&endpoint, container, &auth)
         .context("build container client")?;
     Ok(Arc::new(AzurePageBlobBackend::new(
         container_client,
