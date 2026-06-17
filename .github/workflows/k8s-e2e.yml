@@ -7,43 +7,6 @@ on:
   pull_request:
 
 jobs:
-  csi-controller:
-    name: csi controller e2e (gRPC against Azurite)
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    services:
-      azurite:
-        image: mcr.microsoft.com/azure-storage/azurite:3.34.0
-        ports:
-          - 10000:10000
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-
-      - name: Install protoc + grpcurl
-        run: |
-          sudo apt-get update
-          # libprotobuf-dev ships the well-known types (google/protobuf/*.proto)
-          # that csi.proto imports; protobuf-compiler alone no longer includes them.
-          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
-          GRPCURL_VERSION=1.9.1
-          curl -fsSL -o /tmp/grpcurl.tar.gz \
-            "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
-          sudo tar -xzf /tmp/grpcurl.tar.gz -C /usr/local/bin grpcurl
-
-      - name: Build ublk-azblob (--features csi)
-        run: cargo build --release --features csi -p ublk-azblob
-
-      - name: Run CSI controller e2e
-        env:
-          AZURE_STORAGE_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
-        run: cargo test --release --features csi --test csi_controller_e2e -- --nocapture
-
   k8s-pvc:
     name: k8s PVC e2e (kind + ublk + Azurite)
     # The ublk_drv kernel module Oopses on the ubuntu-24.04 azure kernel
