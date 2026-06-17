@@ -18,7 +18,7 @@ FROM rust:1.96-alpine AS builder
 # - musl-dev          : C runtime/headers for the `ring` (crypto) C build
 # - protoc, protobuf-dev : `protoc` and the well-known types
 #                       (google/protobuf/*.proto) imported by csi.proto (CSI build.rs)
-# - clang, clang-dev  : libclang, used by the libublk-rs-sys bindgen build script
+# - clang, clang-dev, llvm-libunwind : libclang for bindgen build script
 # - linux-headers     : asm/ioctl.h, linux/blkzoned.h etc. that bindgen parses
 # - pkgconfig         : transitive build dependency probing
 RUN apk add --no-cache \
@@ -27,8 +27,12 @@ RUN apk add --no-cache \
         protobuf-dev \
         clang \
         clang-dev \
+        llvm-libunwind \
         linux-headers \
         pkgconfig
+
+# Set libclang path for bindgen
+ENV LIBCLANG_PATH=/usr/lib
 
 WORKDIR /src
 COPY . .
