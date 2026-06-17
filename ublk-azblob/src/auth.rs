@@ -1,6 +1,6 @@
 //! Authentication helpers for Azure Storage.
 //!
-//! Supports three auth modes:
+//! Supports four auth modes:
 //!
 //! 1. **Managed Identity (MSI)** — uses [`azure_identity::ManagedIdentityCredential`].
 //!    Suitable for production workloads running on Azure VMs / AKS / App Service.
@@ -20,6 +20,10 @@
 //!    Used for Azurite (the local emulator) and any environment where you have
 //!    the raw storage account key.  Azurite does **not** support Entra ID / MSI,
 //!    so this path is the only option for local dev and the docker-compose e2e test.
+//!
+//! 4. **Service Principal** — uses [`azure_identity::ClientSecretCredential`],
+//!    authenticating with a Microsoft Entra application client id, tenant id and
+//!    client secret.
 //!
 //! ## Note on SDK preview status
 //! `azure_identity` and `azure_storage_blob` are 0.x / preview crates.  All

@@ -282,17 +282,17 @@ containers instead.
 
 Two e2e tests cover the CSI driver:
 
-* **Controller** ([tests/e2e/csi/controller_test.sh](tests/e2e/csi/controller_test.sh)) —
+* **Controller** ([tests/csi_controller_e2e.rs](ublk-azblob/tests/csi_controller_e2e.rs)) —
   drives the controller gRPC service (`CreateVolume`/`DeleteVolume`) against
-  Azurite with `grpcurl`. Needs no kernel, so it runs anywhere:
+  Azurite. Needs no kernel, so it runs anywhere:
 
   ```bash
   docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
     azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
-  bash tests/e2e/csi/controller_test.sh
+  cargo test --features csi --test csi_controller_e2e -- --nocapture
   ```
 
-* **PVC lifecycle** ([tests/e2e/k8s/run.sh](tests/e2e/k8s/run.sh)) — spins up a
+* **PVC lifecycle** ([tests/k8s_pvc_e2e.rs](ublk-azblob/tests/k8s_pvc_e2e.rs)) — spins up a
   `kind` cluster, deploys the driver + Azurite, then provisions a PVC, writes
   random data, tears the pod down, and remounts the same PVC on a fresh ublk
   device to verify the data survived the round-trip through the page blob. It
@@ -300,7 +300,7 @@ Two e2e tests cover the CSI driver:
 
   ```bash
   sudo modprobe ublk_drv
-  sudo -E bash tests/e2e/k8s/run.sh
+  sudo -E env "PATH=$PATH" cargo test --features csi --test k8s_pvc_e2e -- --nocapture
   ```
 
 ---

@@ -1,110 +1,99 @@
-{{- if .Values.storageClass.create -}}
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ include "ublk-azblob-csi.fullname" . }}-notes
-  namespace: {{ .Values.namespace }}
-  labels:
-    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
-data:
-  NOTES.txt: |
-    ublk-azblob CSI Driver has been installed!
-    
-    Deployment Mode: {{ .Values.deploymentMode }}
-    Driver Name: {{ .Values.driver.name }}
-    StorageClass: {{ .Values.storageClass.name }}
-    {{- if .Values.node.useNbd }}
-    Block Device Mode: NBD (Network Block Device)
-    {{- else }}
-    Block Device Mode: ublk (requires kernel >= 6.0 with ublk_drv)
-    {{- end }}
-    
-    {{- if eq .Values.deploymentMode "per-namespace" }}
-    
-    === Per-Namespace Mode ===
-    
-    Each namespace needs to create a secret named "{{ .Values.perNamespaceSecret.name }}".
-    
-    Example (Service Principal):
-    
-      kubectl create secret generic {{ .Values.perNamespaceSecret.name }} \
-        --namespace=<your-namespace> \
-        --from-literal=AZURE_CLIENT_ID=<client-id> \
-        --from-literal=AZURE_TENANT_ID=<tenant-id> \
-        --from-literal=AZURE_CLIENT_SECRET=<client-secret>
-    
-    {{- else }}
-    
-    === Global Secret Mode ===
-    
-    {{- if .Values.globalSecret.create }}
-    A global secret has been created in {{ .Values.namespace }}.
-    {{- else }}
-    You need to create a global secret "{{ .Values.globalSecret.name }}" in {{ .Values.namespace }}.
-    
-    Example:
-    
-      kubectl create secret generic {{ .Values.globalSecret.name }} \
-        --namespace={{ .Values.namespace }} \
-        --from-literal=AZURE_CLIENT_ID=<client-id> \
-        --from-literal=AZURE_TENANT_ID=<tenant-id> \
-        --from-literal=AZURE_CLIENT_SECRET=<client-secret> \
-        --from-literal=AZURE_STORAGE_ACCOUNT=<account> \
-        --from-literal=AZURE_STORAGE_CONTAINER=<container>
-    {{- end }}
-    
-    {{- end }}
-    
-    === Create a PVC ===
-    
-      kubectl apply -f - <<EOF
-      apiVersion: v1
-      kind: PersistentVolumeClaim
-      metadata:
-        name: my-data
-        namespace: <your-namespace>
-      spec:
-        storageClassName: {{ .Values.storageClass.name }}
-        accessModes: [ReadWriteOnce]
-        resources:
-          requests:
-            storage: 10Gi
-      EOF
-    
-    === Use in a Pod ===
-    
-      kubectl apply -f - <<EOF
-      apiVersion: v1
-      kind: Pod
-      metadata:
-        name: my-app
-        namespace: <your-namespace>
-      spec:
-        containers:
-          - name: app
-            image: ubuntu:22.04
-            command: ["sleep", "infinity"]
-            volumeMounts:
-              - name: data
-                mountPath: /data
-        volumes:
-          - name: data
-            persistentVolumeClaim:
-              claimName: my-data
-      EOF
-    
-    === Requirements ===
-    
-    {{- if .Values.node.useNbd }}
-    - NBD (Network Block Device) kernel module: modprobe nbd
-    - No special kernel version requirements
-    - Standard nbd-client tool (usually pre-installed)
-    {{- else }}
-    - Linux kernel >= 6.0 with CONFIG_BLK_DEV_UBLK=y or =m
-    - Ubuntu 24.04 (kernel 6.8+) recommended
-    - ublk_drv kernel module loaded: sudo modprobe ublk_drv
-    {{- end }}
-    
-    For more information, visit:
-    https://github.com/tg123/ublk-azblob
+ublk-azblob CSI Driver has been installed!
+
+Deployment Mode: {{ .Values.deploymentMode }}
+Driver Name: {{ .Values.driver.name }}
+StorageClass: {{ .Values.storageClass.name }}
+{{- if .Values.node.useNbd }}
+Block Device Mode: NBD (Network Block Device)
+{{- else }}
+Block Device Mode: ublk (requires kernel >= 6.0 with ublk_drv)
 {{- end }}
+
+{{- if eq .Values.deploymentMode "per-namespace" }}
+
+=== Per-Namespace Mode ===
+
+Each namespace needs to create a secret named "{{ .Values.perNamespaceSecret.name }}".
+
+Example (Service Principal):
+
+  kubectl create secret generic {{ .Values.perNamespaceSecret.name }} \
+    --namespace=<your-namespace> \
+    --from-literal=AZURE_CLIENT_ID=<client-id> \
+    --from-literal=AZURE_TENANT_ID=<tenant-id> \
+    --from-literal=AZURE_CLIENT_SECRET=<client-secret>
+
+{{- else }}
+
+=== Global Secret Mode ===
+
+{{- if .Values.globalSecret.create }}
+A global secret has been created in {{ .Values.namespace }}.
+{{- else }}
+You need to create a global secret "{{ .Values.globalSecret.name }}" in {{ .Values.namespace }}.
+
+Example:
+
+  kubectl create secret generic {{ .Values.globalSecret.name }} \
+    --namespace={{ .Values.namespace }} \
+    --from-literal=AZURE_CLIENT_ID=<client-id> \
+    --from-literal=AZURE_TENANT_ID=<tenant-id> \
+    --from-literal=AZURE_CLIENT_SECRET=<client-secret> \
+    --from-literal=AZURE_STORAGE_ACCOUNT=<account> \
+    --from-literal=AZURE_STORAGE_CONTAINER=<container>
+{{- end }}
+
+{{- end }}
+
+=== Create a PVC ===
+
+  kubectl apply -f - <<EOF
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: my-data
+    namespace: <your-namespace>
+  spec:
+    storageClassName: {{ .Values.storageClass.name }}
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 10Gi
+  EOF
+
+=== Use in a Pod ===
+
+  kubectl apply -f - <<EOF
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: my-app
+    namespace: <your-namespace>
+  spec:
+    containers:
+      - name: app
+        image: ubuntu:22.04
+        command: ["sleep", "infinity"]
+        volumeMounts:
+          - name: data
+            mountPath: /data
+    volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: my-data
+  EOF
+
+=== Requirements ===
+
+{{- if .Values.node.useNbd }}
+- NBD (Network Block Device) kernel module: modprobe nbd
+- No special kernel version requirements
+- Standard nbd-client tool (usually pre-installed)
+{{- else }}
+- Linux kernel >= 6.0 with CONFIG_BLK_DEV_UBLK=y or =m
+- Ubuntu 24.04 (kernel 6.8+) recommended
+- ublk_drv kernel module loaded: sudo modprobe ublk_drv
+{{- end }}
+
+For more information, visit:
+https://github.com/tg123/ublk-azblob
