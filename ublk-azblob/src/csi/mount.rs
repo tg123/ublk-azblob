@@ -88,8 +88,10 @@ pub fn mkfs(dev: &str, fs_type: &str) -> anyhow::Result<()> {
     info!(dev, fs_type, "creating filesystem");
     // `-F` forces creation without interactive confirmation; `-E nodiscard`
     // avoids a full TRIM pass (faster, and discard maps onto Clear Pages).
+    // For ext4, use lazy_itable_init and lazy_journal_init to speed up mkfs
+    // on large devices (avoids writing zeros to entire inode tables and journal).
     let args: Vec<&str> = if fs_type == "ext4" || fs_type == "ext3" || fs_type == "ext2" {
-        vec!["-F", "-E", "nodiscard", dev]
+        vec!["-F", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1", dev]
     } else {
         vec![dev]
     };
