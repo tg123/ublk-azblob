@@ -29,7 +29,11 @@ RUN ARCH=$(dpkg --print-architecture) \
     esac \
  && curl -fsSL \
       "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_VERSION}.tgz" \
-    | tar -xzC /usr/local/bin --strip-components=1 docker/docker
+    | tar -xzC /usr/local/bin --strip-components=1 docker/docker \
+ && mkdir -p /usr/local/lib/docker/cli-plugins \
+ && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx \
+      "https://github.com/docker/buildx/releases/download/v0.20.1/buildx-v0.20.1.linux-${ARCH}" \
+ && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
 
 # kind — single static binary, arch-aware
 RUN ARCH=$(dpkg --print-architecture) \
