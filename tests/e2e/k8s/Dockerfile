@@ -1,11 +1,12 @@
 # Test runner image for the ublk-azblob Kubernetes PVC e2e.
 #
-# Provides: Rust toolchain, protoc/libprotobuf-dev, kind, kubectl, and helm.
-# The source tree is bind-mounted at /workspace at runtime; nothing is compiled
-# here — only the environment is prepared.
+# Provides: Rust toolchain, protoc/libprotobuf-dev, the docker CLI, kind,
+# kubectl, and helm.  The source tree is bind-mounted at /workspace at runtime;
+# nothing is compiled here — only the environment is prepared.
 #
 FROM rust:1.96-slim
 
+ARG DOCKER_VERSION=27.5.1
 ARG KIND_VERSION=v0.26.0
 ARG KUBECTL_VERSION=v1.32.3
 ARG HELM_VERSION=v3.17.3
@@ -17,6 +18,18 @@ RUN apt-get update \
         curl \
         ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
+# docker CLI (client only) — talks to the host daemon via the mounted socket.
+# The static archive uses x86_64/aarch64 naming; map from dpkg arch.
+RUN ARCH=$(dpkg --print-architecture) \
+ && case "$ARCH" in \
+        amd64) DOCKER_ARCH=x86_64 ;; \
+        arm64) DOCKER_ARCH=aarch64 ;; \
+        *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL \
+      "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_VERSION}.tgz" \
+    | tar -xzC /usr/local/bin --strip-components=1 docker/docker
 
 # kind — single static binary, arch-aware
 RUN ARCH=$(dpkg --print-architecture) \
