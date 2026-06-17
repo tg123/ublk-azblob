@@ -114,27 +114,24 @@ fn try_run(cmd: &str, args: &[&str]) -> bool {
 /// Apply a manifest via `kubectl apply -f <path>`, with retry for API server readiness.
 fn kubectl_apply(path: &Path) {
     let args = ["apply", "-f", path.to_str().unwrap(), "--validate=false"];
-    
+
     // Retry up to 10 times with exponential backoff (1s, 2s, 4s, 8s, 16s, 32s...)
     for attempt in 1..=10 {
-        log(&format!(
-            "$ kubectl {} (attempt {attempt})",
-            args.join(" ")
-        ));
-        
+        log(&format!("$ kubectl {} (attempt {attempt})", args.join(" ")));
+
         if try_run("kubectl", &args) {
             return;
         }
-        
+
         if attempt < 10 {
-            let delay = 2u64.pow(attempt - 1).min(32);  // Cap at 32s
+            let delay = 2u64.pow(attempt - 1).min(32); // Cap at 32s
             log(&format!(
                 "kubectl apply failed (attempt {attempt}), retrying in {delay}s..."
             ));
             std::thread::sleep(std::time::Duration::from_secs(delay));
         }
     }
-    
+
     // All attempts failed, use run() for proper panic message
     run("kubectl", &args);
 }
