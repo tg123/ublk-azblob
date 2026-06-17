@@ -114,7 +114,10 @@ fn try_run(cmd: &str, args: &[&str]) -> bool {
 /// Apply a manifest via `kubectl apply -f <path>`, with retry for API server readiness.
 fn kubectl_apply(path: &Path) {
     // Skip validation to avoid API server connection issues during startup
-    run("kubectl", &["apply", "-f", path.to_str().unwrap(), "--validate=false"]);
+    run(
+        "kubectl",
+        &["apply", "-f", path.to_str().unwrap(), "--validate=false"],
+    );
 }
 
 /// Pipe `yaml` into `kubectl apply -f -`.
