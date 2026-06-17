@@ -40,6 +40,8 @@ services:
     working_dir: /workspace
     environment:
       CARGO_TERM_COLOR: "always"
+      # Enable Docker BuildKit for --mount support in Dockerfile
+      DOCKER_BUILDKIT: "1"
       # This runner image is purpose-built with docker/kind/kubectl and runs
       # privileged with the host /dev + ublk_drv, so the e2e must *run*, not
       # skip.  K8S_E2E_REQUIRE turns an unmet precondition into a hard failure
