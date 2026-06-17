@@ -7,7 +7,9 @@
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
-  name: azblob.ublk.csi.tg123.github.io
+  name: {{ .Values.driver.name }}
+  labels:
+    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
 spec:
   attachRequired: false
   podInfoOnMount: false

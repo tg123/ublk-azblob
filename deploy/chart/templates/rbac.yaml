@@ -1,28 +1,47 @@
+{{- if .Values.rbac.create -}}
 # RBAC for the ublk-azblob CSI driver.
 #
 # Two service accounts:
-#   * csi-ublk-azblob-controller — used by the controller Deployment and its
+#   * controller — used by the controller Deployment and its
 #     external-provisioner sidecar (needs to watch PVCs and create/delete PVs).
-#   * csi-ublk-azblob-node       — used by the node DaemonSet and its
+#   * node       — used by the node DaemonSet and its
 #     node-driver-registrar sidecar (minimal permissions).
 ---
+{{- if .Values.serviceAccount.controller.create }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: csi-ublk-azblob-controller
-  namespace: kube-system
+  name: {{ include "ublk-azblob-csi.controller.serviceAccountName" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "ublk-azblob-csi.controller.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.controller.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
 ---
+{{- if .Values.serviceAccount.node.create }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: csi-ublk-azblob-node
-  namespace: kube-system
+  name: {{ include "ublk-azblob-csi.node.serviceAccountName" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "ublk-azblob-csi.node.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.node.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
 ---
 # Permissions required by the external-provisioner sidecar.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: csi-ublk-azblob-provisioner-role
+  name: {{ include "ublk-azblob-csi.fullname" . }}-provisioner-role
+  labels:
+    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
@@ -52,12 +71,15 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: csi-ublk-azblob-provisioner-binding
+  name: {{ include "ublk-azblob-csi.fullname" . }}-provisioner-binding
+  labels:
+    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
-    name: csi-ublk-azblob-controller
-    namespace: kube-system
+    name: {{ include "ublk-azblob-csi.controller.serviceAccountName" . }}
+    namespace: {{ .Values.namespace }}
 roleRef:
   kind: ClusterRole
-  name: csi-ublk-azblob-provisioner-role
+  name: {{ include "ublk-azblob-csi.fullname" . }}-provisioner-role
   apiGroup: rbac.authorization.k8s.io
+{{- end }}

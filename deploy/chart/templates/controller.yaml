@@ -1,0 +1,70 @@
+# Controller plug-in: provisions / deletes the Azure Page Blob behind each PVC.
+#
+# Runs the ublk-azblob CSI controller service alongside the upstream
+# external-provisioner sidecar.  They communicate over a shared unix socket in
+# an emptyDir.  A single replica is sufficient (provisioning is idempotent).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ublk-azblob-csi.fullname" . }}-controller
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "ublk-azblob-csi.controller.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "ublk-azblob-csi.fullname" . }}-controller
+  template:
+    metadata:
+      labels:
+        app: {{ include "ublk-azblob-csi.fullname" . }}-controller
+        {{- include "ublk-azblob-csi.controller.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "ublk-azblob-csi.controller.serviceAccountName" . }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: csi-provisioner
+          image: {{ .Values.sidecars.provisioner.image.repository }}:{{ .Values.sidecars.provisioner.image.tag }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--extra-create-metadata"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          {{- with .Values.sidecars.provisioner.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+        - name: azblob
+          image: {{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          args:
+            - "csi"
+            - "--role=controller"
+            - "--csi-endpoint=unix:///csi/csi.sock"
+          # No hardcoded credentials - come from per-namespace or global secrets
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          {{- with .Values.controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

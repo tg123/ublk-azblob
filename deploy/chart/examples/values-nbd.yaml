@@ -1,0 +1,40 @@
+# Example: NBD mode for older kernels without ublk_drv
+#
+# Use this configuration when your Kubernetes nodes run kernels older than 6.0
+# or don't have CONFIG_BLK_DEV_UBLK enabled.
+#
+# NBD (Network Block Device) mode:
+# - Works on any modern Linux kernel
+# - Only requires 'nbd' kernel module (usually available by default)
+# - Slightly lower performance than ublk mode
+# - Uses TCP sockets instead of ublk character devices
+
+deploymentMode: per-namespace
+
+# Enable NBD mode
+node:
+  useNbd: true
+  nbd:
+    # Port range start (each volume gets portStart + N)
+    portStart: 10809
+  
+  # NBD doesn't need as much CPU as ublk
+  resources:
+    limits:
+      cpu: 300m
+      memory: 384Mi
+    requests:
+      cpu: 50m
+      memory: 96Mi
+
+storageClass:
+  name: azblob-nbd
+  parameters:
+    container: "nbd-volumes"
+    blobPathTemplate: '${pvc.namespace}/volumes/${pv.name}'
+    fsType: ext4
+
+# Per-namespace secrets
+# Each namespace needs to create azblob-csi-secret
+perNamespaceSecret:
+  name: azblob-csi-secret

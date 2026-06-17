@@ -11,36 +11,54 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: csi-ublk-azblob-node
-  namespace: kube-system
+  name: {{ include "ublk-azblob-csi.fullname" . }}-node
+  namespace: {{ .Values.namespace }}
   labels:
-    app: csi-ublk-azblob-node
+    {{- include "ublk-azblob-csi.node.labels" . | nindent 4 }}
 spec:
   selector:
     matchLabels:
-      app: csi-ublk-azblob-node
+      app: {{ include "ublk-azblob-csi.fullname" . }}-node
   template:
     metadata:
       labels:
-        app: csi-ublk-azblob-node
+        app: {{ include "ublk-azblob-csi.fullname" . }}-node
+        {{- include "ublk-azblob-csi.node.labels" . | nindent 8 }}
     spec:
-      serviceAccountName: csi-ublk-azblob-node
+      serviceAccountName: {{ include "ublk-azblob-csi.node.serviceAccountName" . }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: node-driver-registrar
-          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          image: {{ .Values.sidecars.registrar.image.repository }}:{{ .Values.sidecars.registrar.image.tag }}
+          imagePullPolicy: IfNotPresent
           args:
             - "--csi-address=/csi/csi.sock"
-            - "--kubelet-registration-path=/var/lib/kubelet/plugins/azblob.ublk.csi.tg123.github.io/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/{{ .Values.driver.name }}/csi.sock"
             - "--v=2"
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
             - name: registration-dir
               mountPath: /registration
+          {{- with .Values.sidecars.registrar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
 
         - name: azblob
-          image: docker.io/farmer1992/ublk-azblob:latest
-          imagePullPolicy: IfNotPresent
+          image: {{ .Values.node.image.repository }}:{{ .Values.node.image.tag }}
+          imagePullPolicy: {{ .Values.node.image.pullPolicy }}
           securityContext:
             privileged: true
           args:
@@ -52,28 +70,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: AZURE_STORAGE_ACCOUNT
-              valueFrom:
-                secretKeyRef:
-                  name: csi-ublk-azblob-secret
-                  key: account
-            - name: AZURE_STORAGE_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: csi-ublk-azblob-secret
-                  key: accountKey
-                  optional: true
-            - name: AZURE_STORAGE_ENDPOINT
-              valueFrom:
-                configMapKeyRef:
-                  name: csi-ublk-azblob-config
-                  key: endpoint
-                  optional: true
-            - name: AZURE_STORAGE_CONTAINER
-              valueFrom:
-                configMapKeyRef:
-                  name: csi-ublk-azblob-config
-                  key: container
+            {{- if .Values.node.useNbd }}
+            # NBD mode configuration
+            - name: USE_NBD
+              value: "true"
+            - name: NBD_PORT_START
+              value: {{ .Values.node.nbd.portStart | quote }}
+            {{- end }}
+          # No hardcoded credentials - come from per-namespace or global secrets at mount time
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
@@ -85,10 +89,14 @@ spec:
             - name: modules-dir
               mountPath: /lib/modules
               readOnly: true
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       volumes:
         - name: socket-dir
           hostPath:
-            path: /var/lib/kubelet/plugins/azblob.ublk.csi.tg123.github.io
+            path: /var/lib/kubelet/plugins/{{ .Values.driver.name }}
             type: DirectoryOrCreate
         - name: registration-dir
           hostPath:

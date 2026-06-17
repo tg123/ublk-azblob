@@ -27,14 +27,45 @@ use super::proto::{
 };
 use super::{build_backend, make_volume_id, parse_volume_id, round_up_512, DriverConfig};
 
+/// Parameter key (StorageClass `parameters`) for storage account.
+const PARAM_STORAGE_ACCOUNT: &str = "storageAccount";
 /// Parameter key (StorageClass `parameters`) selecting the blob container.
 const PARAM_CONTAINER: &str = "container";
+/// Parameter key for blob path template.
+const PARAM_BLOB_PATH_TEMPLATE: &str = "blobPathTemplate";
 /// Parameter key selecting the on-disk filesystem the node should create.
 const PARAM_FS_TYPE: &str = "fsType";
+
+/// Default blob path template
+const DEFAULT_BLOB_PATH_TEMPLATE: &str = "ublk-azblob-disk/${pv.name}";
 
 /// Controller service implementation.
 pub struct ControllerService {
     config: DriverConfig,
+}
+
+/// Expand variables in a template string
+fn expand_template(
+    template: &str,
+    pvc_name: &str,
+    pvc_namespace: &str,
+    pv_name: &str,
+) -> String {
+    template
+        .replace("${pvc.name}", pvc_name)
+        .replace("${pvc.namespace}", pvc_namespace)
+        .replace("${pv.name}", pv_name)
+}
+
+/// Sanitize path by removing leading/trailing slashes and collapsing doubles
+fn sanitize_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 impl ControllerService {
@@ -43,11 +74,52 @@ impl ControllerService {
         Self { config }
     }
 
-    fn container_for(&self, parameters: &HashMap<String, String>) -> String {
-        parameters
-            .get(PARAM_CONTAINER)
-            .cloned()
-            .unwrap_or_else(|| self.config.default_container.clone())
+    /// Get storage account with variable expansion and secret fallback
+    fn storage_account_for(
+        &self,
+        parameters: &HashMap<String, String>,
+        secrets: &HashMap<String, Vec<u8>>,
+        pvc_name: &str,
+        pvc_namespace: &str,
+        pv_name: &str,
+    ) -> Result<String, Status> {
+        // 1. Try StorageClass parameter (with expansion)
+        if let Some(template) = parameters.get(PARAM_STORAGE_ACCOUNT) {
+            return Ok(expand_template(template, pvc_name, pvc_namespace, pv_name));
+        }
+        
+        // 2. Try secret's AZURE_STORAGE_ACCOUNT
+        if let Some(account_bytes) = secrets.get("AZURE_STORAGE_ACCOUNT") {
+            return String::from_utf8(account_bytes.clone())
+                .map_err(|e| Status::invalid_argument(format!("invalid storage account in secret: {}", e)));
+        }
+        
+        // 3. Fall back to config default
+        Ok(self.config.account.clone())
+    }
+
+    /// Get container with variable expansion and secret fallback
+    fn container_for(
+        &self,
+        parameters: &HashMap<String, String>,
+        secrets: &HashMap<String, Vec<u8>>,
+        pvc_name: &str,
+        pvc_namespace: &str,
+        pv_name: &str,
+    ) -> Result<String, Status> {
+        // 1. Try StorageClass parameter (with expansion)
+        if let Some(template) = parameters.get(PARAM_CONTAINER) {
+            return Ok(expand_template(template, pvc_name, pvc_namespace, pv_name));
+        }
+        
+        // 2. Try secret's AZURE_STORAGE_CONTAINER
+        if let Some(container_bytes) = secrets.get("AZURE_STORAGE_CONTAINER") {
+            return String::from_utf8(container_bytes.clone())
+                .map_err(|e| Status::invalid_argument(format!("invalid container in secret: {}", e)));
+        }
+        
+        // 3. Fall back to config default
+        Ok(self.config.default_container.clone())
     }
 }
 
