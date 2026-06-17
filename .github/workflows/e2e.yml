@@ -8,7 +8,7 @@ on:
 
 jobs:
   e2e:
-    name: e2e (mount ext4 on /dev/ublkb backed by Azurite)
+    name: e2e
     # The ublk_drv kernel module Oopses on the ubuntu-24.04 azure kernel
     # (actions/runner-images#14175); 22.04 ships a stable 6.x kernel.
     runs-on: ubuntu-22.04
@@ -25,9 +25,10 @@ jobs:
           sudo modprobe ublk_drv
           ls -l /dev/ublk-control
 
-      - name: Run mount e2e (build + test in docker compose runner)
-        # The `runner` service builds with --features ublk and runs the Rust
-        # mount/remount/checksum test; Azurite is brought up as its dependency.
+      - name: Run e2e (build + test in docker compose runner)
+        # The `runner` service builds with --features ublk and runs both the
+        # ublk mount/remount/checksum test and the NBD roundtrip test; Azurite
+        # is brought up as its dependency.
         run: |
           docker compose -f tests/e2e/docker-compose.yml up \
             --build --abort-on-container-exit --exit-code-from runner
