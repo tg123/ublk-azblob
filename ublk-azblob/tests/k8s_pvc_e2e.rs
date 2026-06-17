@@ -122,14 +122,19 @@ fn kubectl_apply_impl(path: &Path, max_retries: usize) {
         let result = Command::new("kubectl")
             .args(["apply", "-f", path.to_str().unwrap()])
             .status();
-        
+
         match result {
             Ok(status) if status.success() => {
-                log(&format!("$ kubectl apply -f {} (attempt {attempt})", path.display()));
+                log(&format!(
+                    "$ kubectl apply -f {} (attempt {attempt})",
+                    path.display()
+                ));
                 return;
             }
             _ if attempt < max_retries => {
-                log(&format!("kubectl apply failed (attempt {attempt}), retrying in 2s..."));
+                log(&format!(
+                    "kubectl apply failed (attempt {attempt}), retrying in 2s..."
+                ));
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
             _ => {
