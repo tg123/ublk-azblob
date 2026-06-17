@@ -36,7 +36,7 @@ spec:
       {{- end }}
       containers:
         - name: csi-provisioner
-          image: {{ .Values.sidecars.provisioner.image.repository }}:{{ .Values.sidecars.provisioner.image.tag }}
+          image: {{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}
           imagePullPolicy: IfNotPresent
           args:
             - "--csi-address=/csi/csi.sock"
@@ -51,8 +51,8 @@ spec:
           {{- end }}
 
         - name: azblob
-          image: {{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}
-          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "csi"
             - "--role=controller"

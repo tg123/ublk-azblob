@@ -60,7 +60,7 @@ spec:
       {{- end }}
       containers:
         - name: node-driver-registrar
-          image: {{ .Values.sidecars.registrar.image.repository }}:{{ .Values.sidecars.registrar.image.tag }}
+          image: {{ .Values.node.image.repository }}:{{ .Values.node.image.tag }}
           imagePullPolicy: IfNotPresent
           args:
             - "--csi-address=/csi/csi.sock"
@@ -77,8 +77,8 @@ spec:
           {{- end }}
 
         - name: azblob
-          image: {{ .Values.node.image.repository }}:{{ .Values.node.image.tag }}
-          imagePullPolicy: {{ .Values.node.image.pullPolicy }}
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             privileged: true
           args:
