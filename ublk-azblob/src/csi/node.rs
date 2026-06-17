@@ -86,14 +86,35 @@ impl NodeService {
             .or_else(|| self.config.account_key.clone());
         if let Some(key) = account_key {
             env.push(("AZURE_STORAGE_KEY".to_string(), key));
+        } else if self.config.use_workload_identity {
+            env.push(("AZURE_USE_WORKLOAD_IDENTITY".to_string(), "1".to_string()));
+            if let Some(id) = &self.config.workload_identity_client_id {
+                env.push(("AZURE_CLIENT_ID".to_string(), id.clone()));
+            }
+            if let Some(t) = &self.config.workload_identity_tenant_id {
+                env.push(("AZURE_TENANT_ID".to_string(), t.clone()));
+            }
+            if let Some(f) = &self.config.workload_identity_token_file {
+                env.push(("AZURE_FEDERATED_TOKEN_FILE".to_string(), f.clone()));
+            }
         } else if self.config.use_msi || self.config.msi_client_id.is_some() {
             env.push(("AZURE_USE_MSI".to_string(), "1".to_string()));
             if let Some(id) = &self.config.msi_client_id {
                 env.push(("AZURE_MSI_CLIENT_ID".to_string(), id.clone()));
             }
+        } else if let (Some(tenant), Some(client), Some(secret)) = (
+            &self.config.sp_tenant_id,
+            &self.config.sp_client_id,
+            &self.config.sp_client_secret,
+        ) {
+            env.push(("AZURE_TENANT_ID".to_string(), tenant.clone()));
+            env.push(("AZURE_CLIENT_ID".to_string(), client.clone()));
+            env.push(("AZURE_CLIENT_SECRET".to_string(), secret.clone()));
         } else {
             anyhow::bail!(
-                "no auth configured for node publish: provide secret 'accountKey' or enable MSI"
+                "no auth configured for node publish: provide secret 'accountKey', \
+                 enable Workload Identity, enable MSI, or a service principal \
+                 (AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET)"
             );
         }
 
