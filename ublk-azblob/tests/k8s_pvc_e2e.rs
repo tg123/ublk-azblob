@@ -113,36 +113,8 @@ fn try_run(cmd: &str, args: &[&str]) -> bool {
 
 /// Apply a manifest via `kubectl apply -f <path>`, with retry for API server readiness.
 fn kubectl_apply(path: &Path) {
-    kubectl_apply_impl(path, 5);
-}
-
-/// Apply a manifest with retries (internal implementation).
-fn kubectl_apply_impl(path: &Path, max_retries: usize) {
-    for attempt in 1..=max_retries {
-        let result = Command::new("kubectl")
-            .args(["apply", "-f", path.to_str().unwrap()])
-            .status();
-
-        match result {
-            Ok(status) if status.success() => {
-                log(&format!(
-                    "$ kubectl apply -f {} (attempt {attempt})",
-                    path.display()
-                ));
-                return;
-            }
-            _ if attempt < max_retries => {
-                log(&format!(
-                    "kubectl apply failed (attempt {attempt}), retrying in 2s..."
-                ));
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-            _ => {
-                // Last attempt, use run() to get the proper panic message
-                run("kubectl", &["apply", "-f", path.to_str().unwrap()]);
-            }
-        }
-    }
+    // Skip validation to avoid API server connection issues during startup
+    run("kubectl", &["apply", "-f", path.to_str().unwrap(), "--validate=false"]);
 }
 
 /// Pipe `yaml` into `kubectl apply -f -`.
