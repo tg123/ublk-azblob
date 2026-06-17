@@ -1,0 +1,55 @@
+# Helm values for e2e testing with k3s
+# This configures the CSI driver for testing with Azurite + NBD mode
+
+image:
+  repository: ublk-azblob
+  tag: e2e
+  pullPolicy: Never  # Use locally-loaded image
+
+controller:
+  replicas: 1
+
+node:
+  # NBD mode for better portability
+  useNbd: true
+  nbd:
+    portStart: 10809
+
+  # Storage account credentials (Azurite well-known)
+  # Note: endpoint will be patched by test code
+  env:
+    - name: AZURE_STORAGE_ACCOUNT
+      value: "devstoreaccount1"
+    - name: AZURE_STORAGE_KEY
+      value: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+    # Azurite endpoint - will be set by test
+    # - name: AZURE_STORAGE_ENDPOINT
+    #   value: "http://azurite.kube-system.svc.cluster.local:10000/devstoreaccount1"
+    
+    # Enable caching for migration testing
+    - name: CSI_MEM_BUFFER_NUM_PAGES
+      value: "256"  # 256 * 4MB = 1GB
+    - name: CSI_MEM_BUFFER_PAGE_SIZE
+      value: "4194304"  # 4MB
+    
+    # Flush timeouts
+    - name: CSI_IDLE_FLUSH_SECS
+      value: "15"
+    - name: CSI_FORCE_FLUSH_TIMEOUT_SECS
+      value: "600"
+
+  # Optional: local disk cache (commented out for basic test)
+  # volumeMounts:
+  #   - name: disk-cache
+  #     mountPath: /var/lib/ublk-cache
+  # 
+  # volumes:
+  #   - name: disk-cache
+  #     emptyDir:
+  #       sizeLimit: 1Gi
+
+storageClass:
+  name: azblob-ublk
+  parameters:
+    # Use page blob for better performance
+    skuName: Premium_LRS

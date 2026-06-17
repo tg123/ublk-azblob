@@ -20,31 +20,52 @@
 #   docker compose -f tests/e2e/k8s/docker-compose.yml down -v
 
 services:
-  # K3s server - lightweight Kubernetes cluster
-  k3s:
+  # K3s server - control plane node
+  k3s-server:
     image: rancher/k3s:v1.31.4-k3s1
     privileged: true
-    # Bind to specific port to avoid conflicts
     ports:
       - "6443:6443"
     volumes:
-      # Host kernel devices (ublk_drv must already be loaded on the host)
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
-      # K3s data directory (persists during test run)
       - k3s-data:/var/lib/rancher/k3s
-      # Kubeconfig output location (shared with runner)
       - kubeconfig:/output
     environment:
-      # Disable Traefik, metrics-server (not needed for test)
+      K3S_TOKEN: "e2e-test-token"
       K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
       K3S_KUBECONFIG_MODE: "644"
     command:
       - server
       - --disable=traefik,metrics-server
       - --kube-apiserver-arg=feature-gates=CSINodeExpandSecret=true
+      # Allow pods to schedule on server (for single-node fallback)
+      - --no-deploy=local-storage
+    networks:
+      - k3s
     healthcheck:
       test: ["CMD", "kubectl", "get", "--raw", "/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # K3s agent - worker node for pod migration testing
+  k3s-agent:
+    image: rancher/k3s:v1.31.4-k3s1
+    privileged: true
+    depends_on:
+      k3s-server:
+        condition: service_healthy
+    volumes:
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+    environment:
+      K3S_TOKEN: "e2e-test-token"
+      K3S_URL: "https://k3s-server:6443"
+    networks:
+      - k3s
+    healthcheck:
+      test: ["CMD", "test", "-f", "/var/lib/rancher/k3s/agent/kubelet.kubeconfig"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -55,27 +76,25 @@ services:
       context: ../../..
       dockerfile: tests/e2e/k8s/Dockerfile
     depends_on:
-      k3s:
+      k3s-server:
+        condition: service_healthy
+      k3s-agent:
         condition: service_healthy
     privileged: true
     volumes:
-      # Source tree — cargo builds and reads manifests from here
       - ../../..:/workspace
-      # Host kernel devices (for debugging, though CSI node runs in k3s)
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
-      # Host Docker socket — build driver image and push to k3s
       - /var/run/docker.sock:/var/run/docker.sock
-      # Kubeconfig from k3s (read-only)
       - kubeconfig:/kubeconfig:ro
     working_dir: /workspace
+    networks:
+      - k3s
     environment:
       CARGO_TERM_COLOR: "always"
       DOCKER_BUILDKIT: "1"
       K8S_E2E_REQUIRE: "1"
-      # Point kubectl at k3s service
       KUBECONFIG: /kubeconfig/kubeconfig.yaml
-      # Tell test to use existing cluster instead of creating kind
       K8S_E2E_USE_EXISTING_CLUSTER: "1"
       K8S_E2E_CLUSTER_NAME: "k3s"
     command:
@@ -95,11 +114,15 @@ services:
         done
         
         # Update kubeconfig server to point to k3s service
-        sed -i 's|https://127.0.0.1:6443|https://k3s:6443|g' /kubeconfig/kubeconfig.yaml
+        sed -i 's|https://127.0.0.1:6443|https://k3s-server:6443|g' /kubeconfig/kubeconfig.yaml
         
         # Verify cluster is accessible
         kubectl cluster-info
-        kubectl get nodes
+        kubectl get nodes -o wide
+        
+        # Wait for both nodes to be Ready
+        echo "Waiting for nodes to be Ready..."
+        kubectl wait --for=condition=Ready nodes --all --timeout=120s
         
         # Run the e2e test
         cargo test --release --features csi -p ublk-azblob \
@@ -108,3 +131,7 @@ services:
 volumes:
   k3s-data:
   kubeconfig:
+
+networks:
+  k3s:
+    driver: bridge

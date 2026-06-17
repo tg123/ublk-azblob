@@ -189,9 +189,12 @@ fn skip_or_fail(reason: &str) {
 
 #[test]
 fn pvc_write_remount_verify() {
+    test_basic_mount_and_recovery();
+}
+
+/// Test 1: Simple mount, read, write
+fn test_basic_mount_and_recovery() {
     // ── Preflight: skip gracefully when the environment can't drive ublk ──────
-    // (but hard-fail in the CI runner where everything must be present — see
-    // `skip_or_fail`).
     if !is_root() {
         skip_or_fail("must run as root");
         return;
@@ -200,11 +203,10 @@ fn pvc_write_remount_verify() {
         skip_or_fail("ublk_drv not loaded (no /dev/ublk-control)");
         return;
     }
-    // Check required tools (skip kind check if using existing cluster)
     let required_tools = if use_existing_cluster() {
-        vec!["docker", "kubectl"]
+        vec!["docker", "kubectl", "helm"]
     } else {
-        vec!["docker", "kind", "kubectl"]
+        vec!["docker", "kind", "kubectl", "helm"]
     };
     for tool in required_tools {
         if !have(tool) {
@@ -233,69 +235,9 @@ fn pvc_write_remount_verify() {
     );
 
     // ── Create cluster or use existing one ────────────────────────────────────
-    let _guard = if use_existing_cluster() {
-        log(&format!(
-            "using existing cluster {cluster} (K8S_E2E_USE_EXISTING_CLUSTER set)"
-        ));
-        // Import image to containerd in k3s (bypass kind load)
-        log(&format!("importing {img} to k3s containerd"));
-        run(
-            "docker",
-            &[
-                "exec",
-                "k8s-k3s-1", // docker-compose service name
-                "ctr",
-                "--namespace=k8s.io",
-                "images",
-                "import",
-                "-",
-            ],
-        );
-        // Save docker image as tarball and pipe to ctr import
-        let docker_save = Command::new("docker")
-            .args(["save", &img])
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("docker save");
-        let status = Command::new("docker")
-            .args([
-                "exec",
-                "-i",
-                "k8s-k3s-1",
-                "ctr",
-                "--namespace=k8s.io",
-                "images",
-                "import",
-                "-",
-            ])
-            .stdin(docker_save.stdout.unwrap())
-            .status()
-            .expect("ctr import");
-        assert!(status.success(), "failed to import image to k3s");
-        None // no cleanup guard for external cluster
-    } else {
-        log(&format!("creating kind cluster {cluster}"));
-        run(
-            "kind",
-            &[
-                "create",
-                "cluster",
-                "--name",
-                &cluster,
-                "--config",
-                here.join("kind-config.yaml").to_str().unwrap(),
-                "--wait",
-                "120s",
-            ],
-        );
-        log(&format!("loading {img} into the cluster"));
-        run("kind", &["load", "docker-image", &img, "--name", &cluster]);
-        Some(ClusterGuard {
-            name: cluster.clone(),
-        })
-    };
+    let _guard = setup_cluster(&cluster, &img, &here);
 
-    // ── Deploy Azurite + driver config ────────────────────────────────────────
+    // ── Deploy Azurite ─────────────────────────────────────────────────────────
     log("deploying Azurite");
     kubectl_apply(&here.join("azurite.yaml"));
     run(
@@ -310,47 +252,9 @@ fn pvc_write_remount_verify() {
         ],
     );
 
-    log("creating driver secret + config");
+    // ── Deploy CSI driver using Helm ──────────────────────────────────────────
     let endpoint = format!("http://azurite.{NS}.svc.cluster.local:10000/devstoreaccount1");
-    kubectl_apply_stdin(&render_secret());
-    kubectl_apply_stdin(&render_config(&endpoint));
-
-    // ── Deploy the CSI driver, pinned to the locally-built image ──────────────
-    let manifests = stage_manifests(&repo, &img);
-    log("deploying CSI driver");
-    for m in [
-        "csi-driver.yaml",
-        "rbac.yaml",
-        "storageclass.yaml",
-        "controller.yaml",
-        "node.yaml",
-    ] {
-        kubectl_apply(&manifests.join(m));
-    }
-
-    log("waiting for the driver to become ready");
-    run(
-        "kubectl",
-        &[
-            "-n",
-            NS,
-            "rollout",
-            "status",
-            "deployment/csi-ublk-azblob-controller",
-            "--timeout=180s",
-        ],
-    );
-    run(
-        "kubectl",
-        &[
-            "-n",
-            NS,
-            "rollout",
-            "status",
-            "daemonset/csi-ublk-azblob-node",
-            "--timeout=180s",
-        ],
-    );
+    deploy_csi_driver_helm(&repo, &here, &endpoint);
 
     // ── Run the PVC write/remount/verify cycle ────────────────────────────────
     log("creating PVC");
@@ -399,6 +303,9 @@ fn pvc_write_remount_verify() {
     }
     let _ = try_run("kubectl", &["logs", "-l", "app=azblob-reader", "--tail=50"]);
 
+    // ── Test 2: Pod migration between nodes ────────────────────────────────────
+    test_pod_migration(&here);
+
     log("k8s PVC e2e PASSED ✓");
 }
 
@@ -418,6 +325,301 @@ fn render_secret() -> String {
     writeln!(s, "  account: {account_b64}").unwrap();
     writeln!(s, "  accountKey: {key_b64}").unwrap();
     s
+}
+
+/// Setup cluster (create or use existing) and load image
+fn setup_cluster(cluster: &str, img: &str, here: &Path) -> Option<ClusterGuard> {
+    if use_existing_cluster() {
+        log(&format!(
+            "using existing cluster {cluster} (K8S_E2E_USE_EXISTING_CLUSTER set)"
+        ));
+        // Import image to containerd in k3s (bypass kind load)
+        log(&format!("importing {img} to k3s containerd"));
+        // Save docker image as tarball and pipe to ctr import
+        let docker_save = Command::new("docker")
+            .args(["save", img])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("docker save");
+        let status = Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                "k8s-k3s-server-1", // docker-compose service name
+                "ctr",
+                "--namespace=k8s.io",
+                "images",
+                "import",
+                "-",
+            ])
+            .stdin(docker_save.stdout.unwrap())
+            .status()
+            .expect("ctr import");
+        assert!(status.success(), "failed to import image to k3s");
+        None // no cleanup guard for external cluster
+    } else {
+        log(&format!("creating kind cluster {cluster}"));
+        run(
+            "kind",
+            &[
+                "create",
+                "cluster",
+                "--name",
+                cluster,
+                "--config",
+                here.join("kind-config.yaml").to_str().unwrap(),
+                "--wait",
+                "120s",
+            ],
+        );
+        log(&format!("loading {img} into the cluster"));
+        run("kind", &["load", "docker-image", img, "--name", cluster]);
+        Some(ClusterGuard {
+            name: cluster.to_string(),
+        })
+    }
+}
+
+/// Deploy CSI driver using Helm
+fn deploy_csi_driver_helm(repo: &Path, here: &Path, endpoint: &str) {
+    log("deploying CSI driver via Helm");
+
+    // Copy e2e.values.yaml and patch endpoint
+    let values_src = here.join("e2e.values.yaml");
+    let values_content = std::fs::read_to_string(&values_src)
+        .expect("read e2e.values.yaml");
+    
+    // Add endpoint to env section
+    let patched = values_content.replace(
+        "# Azurite endpoint - will be set by test",
+        &format!("# Azurite endpoint\n    - name: AZURE_STORAGE_ENDPOINT\n      value: \"{}\"", endpoint)
+    );
+    
+    let values_tmp = std::env::temp_dir().join("e2e-patched.values.yaml");
+    std::fs::write(&values_tmp, patched).expect("write patched values");
+
+    // helm install
+    run(
+        "helm",
+        &[
+            "install",
+            "csi-ublk-azblob",
+            repo.join("deploy/helm/csi-ublk-azblob").to_str().unwrap(),
+            "-n",
+            NS,
+            "-f",
+            values_tmp.to_str().unwrap(),
+            "--wait",
+            "--timeout=180s",
+        ],
+    );
+
+    log("waiting for the driver to become ready");
+    run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "rollout",
+            "status",
+            "deployment/csi-ublk-azblob-controller",
+            "--timeout=180s",
+        ],
+    );
+    run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "rollout",
+            "status",
+            "daemonset/csi-ublk-azblob-node",
+            "--timeout=180s",
+        ],
+    );
+}
+
+/// Test pod migration between nodes
+fn test_pod_migration(here: &Path) {
+    log("TEST 2: Pod migration between nodes");
+    
+    // Get list of nodes
+    let nodes_out = Command::new("kubectl")
+        .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+        .output()
+        .expect("get nodes");
+    let nodes_str = String::from_utf8_lossy(&nodes_out.stdout);
+    let nodes: Vec<&str> = nodes_str.split_whitespace().collect();
+    
+    if nodes.len() < 2 {
+        log("SKIP pod migration test: cluster has <2 nodes");
+        return;
+    }
+    
+    log(&format!("found {} nodes: {}", nodes.len(), nodes.join(", ")));
+
+    // Create a deployment with PVC (instead of job)
+    let deployment_yaml = format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azblob-migration-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: azblob-migration-test
+  template:
+    metadata:
+      labels:
+        app: azblob-migration-test
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: {}
+      containers:
+      - name: writer
+        image: busybox
+        command:
+          - /bin/sh
+          - -c
+          - |
+            echo "Writing test data on node $(hostname)"
+            dd if=/dev/urandom of=/data/migration-test.dat bs=1M count=10
+            sha256sum /data/migration-test.dat > /data/checksum.txt
+            echo "Data written, sleeping..."
+            sleep 3600
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: azblob-pvc
+"#,
+        nodes[0]
+    );
+
+    log(&format!("creating deployment on node {}", nodes[0]));
+    kubectl_apply_stdin(&deployment_yaml);
+    
+    // Wait for pod to be ready
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=Ready",
+            "pod",
+            "-l",
+            "app=azblob-migration-test",
+            "--timeout=180s",
+        ],
+    ) {
+        panic!("migration test pod did not become ready");
+    }
+
+    // Read checksum
+    let checksum1_out = Command::new("kubectl")
+        .args([
+            "exec",
+            "deployment/azblob-migration-test",
+            "--",
+            "cat",
+            "/data/checksum.txt",
+        ])
+        .output()
+        .expect("read checksum");
+    let checksum1 = String::from_utf8_lossy(&checksum1_out.stdout);
+    log(&format!("checksum on node {}: {}", nodes[0], checksum1.trim()));
+
+    // Delete pod to trigger NodeUnpublishVolume
+    log(&format!("deleting pod (will trigger graceful shutdown and flush)"));
+    run("kubectl", &["delete", "deployment", "azblob-migration-test", "--wait=true"]);
+
+    // Recreate deployment on different node
+    let deployment_yaml2 = format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azblob-migration-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: azblob-migration-test
+  template:
+    metadata:
+      labels:
+        app: azblob-migration-test
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: {}
+      containers:
+      - name: reader
+        image: busybox
+        command:
+          - /bin/sh
+          - -c
+          - |
+            echo "Reading test data on node $(hostname)"
+            if [ -f /data/migration-test.dat ]; then
+              sha256sum -c /data/checksum.txt
+              if [ $? -eq 0 ]; then
+                echo "MIGRATION SUCCESS: Data verified on new node!"
+              else
+                echo "MIGRATION FAILED: Checksum mismatch!"
+                exit 1
+              fi
+            else
+              echo "MIGRATION FAILED: Data file not found!"
+              exit 1
+            fi
+            sleep 3600
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: azblob-pvc
+"#,
+        nodes[1]
+    );
+
+    log(&format!("recreating deployment on node {}", nodes[1]));
+    kubectl_apply_stdin(&deployment_yaml2);
+    
+    // Wait for pod to be ready
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=Ready",
+            "pod",
+            "-l",
+            "app=azblob-migration-test",
+            "--timeout=180s",
+        ],
+    ) {
+        dump_diagnostics("azblob-migration-test");
+        panic!("migration test pod did not become ready on new node");
+    }
+
+    // Check logs for success message
+    let logs_out = Command::new("kubectl")
+        .args(["logs", "deployment/azblob-migration-test"])
+        .output()
+        .expect("get logs");
+    let logs = String::from_utf8_lossy(&logs_out.stdout);
+    log(&format!("migration test logs:\n{}", logs));
+
+    if !logs.contains("MIGRATION SUCCESS") {
+        panic!("pod migration failed: data did not survive node migration");
+    }
+
+    log("✓ Pod migration test PASSED: data survived node migration");
+
+    // Cleanup
+    run("kubectl", &["delete", "deployment", "azblob-migration-test", "--wait=true"]);
 }
 
 /// Render the driver config map (endpoint + container).
