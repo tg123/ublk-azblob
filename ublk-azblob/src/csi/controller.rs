@@ -195,7 +195,7 @@ impl Controller for ControllerService {
 
         // Build account-specific endpoint for the node
         // Standard Azure: construct from account; Custom (Azurite): use config if has account
-        let endpoint = if self.config.endpoint.contains(&account) {
+        let endpoint = if self.config.endpoint.contains(account.as_str()) {
             self.config.endpoint.clone()
         } else {
             format!("https://{account}.blob.core.windows.net/")

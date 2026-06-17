@@ -270,7 +270,7 @@ pub fn build_backend(
     // Build the account-specific endpoint URL
     // For standard Azure, construct from account: https://{account}.blob.core.windows.net/
     // For custom endpoints (Azurite, sovereign clouds), use config endpoint if it contains the account
-    let endpoint = if config.endpoint.contains(&account) {
+    let endpoint = if config.endpoint.contains(account) {
         // Custom endpoint already has account name (e.g., Azurite: http://127.0.0.1:10000/devstoreaccount1)
         config.endpoint.clone()
     } else {
