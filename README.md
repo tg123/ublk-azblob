@@ -100,6 +100,39 @@ sudo mount /dev/ublkb0 /mnt/azblob
 
 ---
 
+## NBD compatibility mode (no `ublk_drv` required)
+
+For kernels or platforms **without** `ublk_drv` (older kernels, containers that
+can't load the module, etc.), `ublk-azblob` can instead expose the blob over the
+**NBD** (Network Block Device) protocol with the `--nbd <host:port>` option.
+This mode needs no special kernel module — only a TCP socket and the standard
+NBD client — and does **not** require the `ublk` Cargo feature.
+
+```bash
+# Start the NBD server (works on any kernel; no --features ublk needed)
+./target/release/ublk-azblob \
+  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
+  --account devstoreaccount1 \
+  --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
+  --container mycontainer \
+  --blob myblob.vhd \
+  run --size 4194304 --nbd 0.0.0.0:10809
+
+# In another shell, attach it as /dev/nbd0
+sudo modprobe nbd
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0
+sudo mkfs.ext4 /dev/nbd0
+sudo mount /dev/nbd0 /mnt/azblob
+
+# Detach when done
+sudo nbd-client -d /dev/nbd0
+```
+
+The ublk-specific options (`--nr-queues`, `--queue-depth`, `--id`) are ignored
+in NBD mode. The local-disk / write-back cache options behave identically.
+
+---
+
 ## Environment variables
 
 All CLI flags have environment-variable equivalents:
@@ -113,6 +146,7 @@ All CLI flags have environment-variable equivalents:
 | `--blob` | `AZURE_STORAGE_BLOB` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
+| `--nbd` | `NBD_LISTEN` |
 
 ---
 

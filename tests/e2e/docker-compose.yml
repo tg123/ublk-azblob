@@ -5,7 +5,8 @@
 #   * `azurite`  — a local Azure Storage emulator (the one external service the
 #     test talks to).
 #   * `runner`   — builds `ublk-azblob` (`--features ublk`) and runs the Rust
-#     mount e2e (`tests/mount_e2e.rs`) against Azurite.
+#     mount e2e (`tests/mount_e2e.rs`) and NBD e2e (`tests/nbd_e2e.rs`) against
+#     Azurite.
 #
 # The `runner` shares the host kernel: it is `privileged` and bind-mounts
 # `/dev` and `/lib/modules`, so the ublk device it creates (plus `mkfs.ext4` and
@@ -66,3 +67,7 @@ services:
         cargo build --release --features ublk -p ublk-azblob
         cargo test --release --features ublk -p ublk-azblob \
           --test mount_e2e -- --nocapture --test-threads=1
+        # NBD compatibility e2e: pure TCP, no kernel module or ublk feature
+        # required, but reuse the same Azurite-backed runner.
+        cargo test --release --features ublk -p ublk-azblob \
+          --test nbd_e2e -- --nocapture --test-threads=1

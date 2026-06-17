@@ -18,6 +18,7 @@ mod backend;
 mod coordination;
 #[cfg(feature = "csi")]
 mod csi;
+mod nbd_target;
 mod ublk_target;
 
 use anyhow::Context as _;
@@ -211,6 +212,17 @@ enum Command {
         /// Only used when `--cache-dir` is set.
         #[arg(long, default_value = "1048576", env = "UBLK_CACHE_PAGE_SIZE")]
         cache_page_size: u64,
+
+        /// Serve over the NBD protocol instead of ublk (compatibility mode).
+        ///
+        /// When set, the device is exposed as an NBD server bound to this
+        /// `host:port` (e.g. `0.0.0.0:10809`) rather than a `/dev/ublkbN`
+        /// device.  Use this on kernels/platforms without `ublk_drv`: connect
+        /// with the standard NBD client, e.g.
+        /// `nbd-client <host> <port> /dev/nbd0`.  The ublk-specific options
+        /// (`--nr-queues`, `--queue-depth`, `--id`) are ignored in this mode.
+        #[arg(long, env = "NBD_LISTEN")]
+        nbd: Option<String>,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -275,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
             ref lease_holder,
             ref cache_dir,
             cache_page_size,
+            ref nbd,
         } => {
             let backend = build_azure_backend(&cli, &endpoint)?;
             if create {
@@ -368,9 +381,16 @@ async fn main() -> anyhow::Result<()> {
                 queue_depth,
                 id,
             };
-            let result = ublk_target::run_ublk_target(backend, cfg)
-                .await
-                .context("ublk target");
+            let result = if let Some(addr) = nbd {
+                info!(addr = %addr, "starting NBD compatibility server");
+                nbd_target::run_nbd_target(backend, addr, actual_size)
+                    .await
+                    .context("nbd target")
+            } else {
+                ublk_target::run_ublk_target(backend, cfg)
+                    .await
+                    .context("ublk target")
+            };
 
             // Release the leases so another node can take over immediately.
             if let Some(guard) = guard {
