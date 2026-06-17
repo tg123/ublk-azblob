@@ -1,14 +1,13 @@
 # docker-compose for the ublk-azblob Kubernetes PVC e2e.
 #
-# Spins up a privileged `runner` container that has access to the host Docker
-# daemon (via socket mount) and the host kernel devices (/dev, /lib/modules),
-# then runs the Rust `k8s_pvc_e2e` integration test, which:
+# Architecture:
+#   1. k3s service: Runs k3s server (Kubernetes cluster) in Docker
+#   2. runner service: Builds CSI driver image, deploys to k3s, runs e2e test
 #
-#   1. Builds the CSI driver image from deploy/Dockerfile.
-#   2. Creates a single-node kind cluster (cluster nodes bind-mount /dev and
-#      /lib/modules from the host so the CSI node plugin can reach ublk_drv).
-#   3. Deploys an in-cluster Azurite + the CSI driver + StorageClass.
-#   4. Exercises the full PVC write → unmount → remount → checksum-verify cycle.
+# K3s is used instead of kind because:
+#   - Designed to run in containers (single process, no Docker-in-Docker needed)
+#   - More stable in CI environments
+#   - Better handling of host device mounts (/dev/ublk-control)
 #
 # Requirements on the **host** (not inside this compose stack):
 #   - Docker daemon running at /var/run/docker.sock
@@ -21,36 +20,91 @@
 #   docker compose -f tests/e2e/k8s/docker-compose.yml down -v
 
 services:
+  # K3s server - lightweight Kubernetes cluster
+  k3s:
+    image: rancher/k3s:v1.31.4-k3s1
+    privileged: true
+    # Bind to specific port to avoid conflicts
+    ports:
+      - "6443:6443"
+    volumes:
+      # Host kernel devices (ublk_drv must already be loaded on the host)
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+      # K3s data directory (persists during test run)
+      - k3s-data:/var/lib/rancher/k3s
+      # Kubeconfig output location (shared with runner)
+      - kubeconfig:/output
+    environment:
+      # Disable Traefik, metrics-server (not needed for test)
+      K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
+      K3S_KUBECONFIG_MODE: "644"
+    command:
+      - server
+      - --disable=traefik,metrics-server
+      - --kube-apiserver-arg=feature-gates=CSINodeExpandSecret=true
+    healthcheck:
+      test: ["CMD", "kubectl", "get", "--raw", "/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Test runner - builds CSI image and runs e2e test
   runner:
     build:
       context: ../../..
       dockerfile: tests/e2e/k8s/Dockerfile
-    # The ublk block device and mkfs/mount tools need a real kernel with ublk_drv
-    # already loaded on the host; privileged mode + host /dev makes them visible.
+    depends_on:
+      k3s:
+        condition: service_healthy
     privileged: true
     volumes:
       # Source tree — cargo builds and reads manifests from here
       - ../../..:/workspace
-      # Host kernel devices (ublk_drv must already be loaded on the host)
+      # Host kernel devices (for debugging, though CSI node runs in k3s)
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
-      # Host Docker socket — kind creates cluster nodes as Docker containers on
-      # the host daemon, and the test builds the driver image via `docker build`
+      # Host Docker socket — build driver image and push to k3s
       - /var/run/docker.sock:/var/run/docker.sock
+      # Kubeconfig from k3s (read-only)
+      - kubeconfig:/kubeconfig:ro
     working_dir: /workspace
     environment:
       CARGO_TERM_COLOR: "always"
-      # Enable Docker BuildKit for --mount support in Dockerfile
       DOCKER_BUILDKIT: "1"
-      # This runner image is purpose-built with docker/kind/kubectl and runs
-      # privileged with the host /dev + ublk_drv, so the e2e must *run*, not
-      # skip.  K8S_E2E_REQUIRE turns an unmet precondition into a hard failure
-      # (instead of a misleading green skip/pass).
       K8S_E2E_REQUIRE: "1"
+      # Point kubectl at k3s service
+      KUBECONFIG: /kubeconfig/kubeconfig.yaml
+      # Tell test to use existing cluster instead of creating kind
+      K8S_E2E_USE_EXISTING_CLUSTER: "1"
+      K8S_E2E_CLUSTER_NAME: "k3s"
     command:
       - bash
       - -c
       - |
         set -euo pipefail
+        
+        # Wait for kubeconfig to be written
+        for i in {1..30}; do
+          if [ -f /kubeconfig/kubeconfig.yaml ]; then
+            echo "Kubeconfig found"
+            break
+          fi
+          echo "Waiting for kubeconfig... ($i/30)"
+          sleep 1
+        done
+        
+        # Update kubeconfig server to point to k3s service
+        sed -i 's|https://127.0.0.1:6443|https://k3s:6443|g' /kubeconfig/kubeconfig.yaml
+        
+        # Verify cluster is accessible
+        kubectl cluster-info
+        kubectl get nodes
+        
+        # Run the e2e test
         cargo test --release --features csi -p ublk-azblob \
           --test k8s_pvc_e2e -- --nocapture
+
+volumes:
+  k3s-data:
+  kubeconfig:

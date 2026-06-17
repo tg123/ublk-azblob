@@ -40,7 +40,13 @@ const NS: &str = "kube-system";
 const CONTAINER: &str = "pvc";
 
 fn cluster_name() -> String {
-    std::env::var("KIND_CLUSTER").unwrap_or_else(|_| "azblob-e2e".to_string())
+    std::env::var("K8S_E2E_CLUSTER_NAME")
+        .or_else(|_| std::env::var("KIND_CLUSTER"))
+        .unwrap_or_else(|_| "azblob-e2e".to_string())
+}
+
+fn use_existing_cluster() -> bool {
+    std::env::var("K8S_E2E_USE_EXISTING_CLUSTER").is_ok()
 }
 
 fn image() -> String {
@@ -194,7 +200,13 @@ fn pvc_write_remount_verify() {
         skip_or_fail("ublk_drv not loaded (no /dev/ublk-control)");
         return;
     }
-    for tool in ["docker", "kind", "kubectl"] {
+    // Check required tools (skip kind check if using existing cluster)
+    let required_tools = if use_existing_cluster() {
+        vec!["docker", "kubectl"]
+    } else {
+        vec!["docker", "kind", "kubectl"]
+    };
+    for tool in required_tools {
         if !have(tool) {
             skip_or_fail(&format!("{tool} not found"));
             return;
@@ -220,26 +232,68 @@ fn pvc_write_remount_verify() {
         ],
     );
 
-    log(&format!("creating kind cluster {cluster}"));
-    run(
-        "kind",
-        &[
-            "create",
-            "cluster",
-            "--name",
-            &cluster,
-            "--config",
-            here.join("kind-config.yaml").to_str().unwrap(),
-            "--wait",
-            "120s",
-        ],
-    );
-    let _guard = ClusterGuard {
-        name: cluster.clone(),
+    // ── Create cluster or use existing one ────────────────────────────────────
+    let _guard = if use_existing_cluster() {
+        log(&format!(
+            "using existing cluster {cluster} (K8S_E2E_USE_EXISTING_CLUSTER set)"
+        ));
+        // Import image to containerd in k3s (bypass kind load)
+        log(&format!("importing {img} to k3s containerd"));
+        run(
+            "docker",
+            &[
+                "exec",
+                "k8s-k3s-1", // docker-compose service name
+                "ctr",
+                "--namespace=k8s.io",
+                "images",
+                "import",
+                "-",
+            ],
+        );
+        // Save docker image as tarball and pipe to ctr import
+        let docker_save = Command::new("docker")
+            .args(["save", &img])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("docker save");
+        let status = Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                "k8s-k3s-1",
+                "ctr",
+                "--namespace=k8s.io",
+                "images",
+                "import",
+                "-",
+            ])
+            .stdin(docker_save.stdout.unwrap())
+            .status()
+            .expect("ctr import");
+        assert!(status.success(), "failed to import image to k3s");
+        None // no cleanup guard for external cluster
+    } else {
+        log(&format!("creating kind cluster {cluster}"));
+        run(
+            "kind",
+            &[
+                "create",
+                "cluster",
+                "--name",
+                &cluster,
+                "--config",
+                here.join("kind-config.yaml").to_str().unwrap(),
+                "--wait",
+                "120s",
+            ],
+        );
+        log(&format!("loading {img} into the cluster"));
+        run("kind", &["load", "docker-image", &img, "--name", &cluster]);
+        Some(ClusterGuard {
+            name: cluster.clone(),
+        })
     };
-
-    log(&format!("loading {img} into the cluster"));
-    run("kind", &["load", "docker-image", &img, "--name", &cluster]);
 
     // ── Deploy Azurite + driver config ────────────────────────────────────────
     log("deploying Azurite");

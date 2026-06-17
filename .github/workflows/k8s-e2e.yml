@@ -8,11 +8,10 @@ on:
 
 jobs:
   k8s-pvc:
-    name: k8s PVC e2e (kind + ublk + Azurite) [optional]
+    name: k8s PVC e2e (k3s + ublk + Azurite)
     # The ublk_drv kernel module Oopses on the ubuntu-24.04 azure kernel
     # (actions/runner-images#14175); 22.04 ships a stable 6.x kernel.
     runs-on: ubuntu-22.04
-    continue-on-error: true  # Don't block PR merges on k8s e2e failures
     permissions:
       contents: read
     steps:
@@ -25,15 +24,13 @@ jobs:
           sudo modprobe ublk_drv
           ls -l /dev/ublk-control
 
-      - name: Run k8s PVC e2e (docker compose)
+      - name: Run k8s PVC e2e (docker compose with k3s)
         run: |
           docker compose -f tests/e2e/k8s/docker-compose.yml up \
             --build --abort-on-container-exit --exit-code-from runner
 
-      - name: Teardown compose stack
+      - name: Delete leftover clusters (if any)
         if: always()
-        run: docker compose -f tests/e2e/k8s/docker-compose.yml down -v || true
-
-      - name: Delete leftover kind cluster (if any)
-        if: always()
-        run: kind delete cluster --name azblob-e2e || true
+        run: |
+          docker compose -f tests/e2e/k8s/docker-compose.yml down -v || true
+          kind delete cluster --name azblob-e2e || true
