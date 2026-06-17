@@ -40,6 +40,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if not .Values.node.useNbd }}
+      # Init container for ublk mode: load ublk_drv module
       initContainers:
         - name: load-ublk-module
           image: busybox:1.36
@@ -57,10 +58,30 @@ spec:
               fi
           securityContext:
             privileged: true
+      {{- else }}
+      # Init container for NBD mode: load nbd module
+      initContainers:
+        - name: load-nbd-module
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              # Try to load nbd kernel module using nsenter to access host namespace
+              nsenter --mount=/proc/1/ns/mnt -- modprobe nbd max_part=8 || true
+              # Verify module is loaded
+              if nsenter --mount=/proc/1/ns/mnt -- lsmod | grep -q '^nbd '; then
+                echo "nbd module loaded successfully"
+                nsenter --mount=/proc/1/ns/mnt -- ls -la /dev/nbd* 2>&1 | head -5
+              else
+                echo "Warning: nbd module not loaded - device may not work"
+              fi
+          securityContext:
+            privileged: true
       {{- end }}
       containers:
         - name: node-driver-registrar
-          image: {{ .Values.node.image.repository }}:{{ .Values.node.image.tag }}
+          image: {{ .Values.sidecars.registrar.image.repository }}:{{ .Values.sidecars.registrar.image.tag }}
           imagePullPolicy: IfNotPresent
           args:
             - "--csi-address=/csi/csi.sock"
@@ -92,9 +113,11 @@ spec:
                   fieldPath: spec.nodeName
             {{- if .Values.node.useNbd }}
             # NBD mode configuration
-            - name: USE_NBD
+            - name: CSI_USE_NBD
               value: "true"
-            - name: NBD_PORT_START
+            - name: CSI_NBD_HOST
+              value: "127.0.0.1"
+            - name: CSI_NBD_PORT_START
               value: {{ .Values.node.nbd.portStart | quote }}
             {{- end }}
           # No hardcoded credentials - come from per-namespace or global secrets at mount time

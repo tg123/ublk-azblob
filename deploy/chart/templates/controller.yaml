@@ -36,7 +36,7 @@ spec:
       {{- end }}
       containers:
         - name: csi-provisioner
-          image: {{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}
+          image: {{ .Values.sidecars.provisioner.image.repository }}:{{ .Values.sidecars.provisioner.image.tag }}
           imagePullPolicy: IfNotPresent
           args:
             - "--csi-address=/csi/csi.sock"

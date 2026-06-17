@@ -252,6 +252,18 @@ enum Command {
         /// Which CSI services to serve: `controller`, `node`, or `all`.
         #[arg(long, env = "CSI_ROLE", default_value = "all")]
         role: csi::Role,
+
+        /// Use NBD instead of ublk for node devices (compatibility mode).
+        #[arg(long, env = "CSI_USE_NBD")]
+        use_nbd: bool,
+
+        /// NBD listen address prefix (e.g. `127.0.0.1`). Port is auto-assigned per volume.
+        #[arg(long, env = "CSI_NBD_HOST", default_value = "127.0.0.1")]
+        nbd_host: String,
+
+        /// Starting port for NBD servers (each volume gets host:port+N).
+        #[arg(long, env = "CSI_NBD_PORT_START", default_value = "10809")]
+        nbd_port_start: u16,
     },
 }
 
@@ -418,6 +430,9 @@ async fn main() -> anyhow::Result<()> {
             csi_endpoint,
             node_id,
             role,
+            use_nbd,
+            nbd_host,
+            nbd_port_start,
         } => {
             let config = csi::DriverConfig {
                 account: cli.account.clone(),
@@ -436,6 +451,9 @@ async fn main() -> anyhow::Result<()> {
                 sp_tenant_id: cli.azure_tenant_id.clone(),
                 sp_client_id: cli.azure_client_id.clone(),
                 sp_client_secret: cli.azure_client_secret.clone(),
+                use_nbd,
+                nbd_host: nbd_host.clone(),
+                nbd_port_start,
             };
             let node_id = if node_id.is_empty() {
                 hostname()

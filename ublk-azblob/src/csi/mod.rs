@@ -118,6 +118,12 @@ pub struct DriverConfig {
     pub sp_client_id: Option<String>,
     /// Service principal client secret (client-secret auth).
     pub sp_client_secret: Option<String>,
+    /// Use NBD instead of ublk for node devices (compatibility mode).
+    pub use_nbd: bool,
+    /// NBD listen address prefix (e.g. `127.0.0.1`).
+    pub nbd_host: String,
+    /// Starting port for NBD servers (each volume gets host:port+N).
+    pub nbd_port_start: u16,
 }
 
 /// Run the CSI gRPC server, listening on `endpoint` until the process is

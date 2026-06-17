@@ -4,6 +4,7 @@
 //! `umount` and poll `/dev`); the node service runs them on a blocking thread.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -30,21 +31,55 @@ pub fn list_ublk_devices() -> HashSet<String> {
     set
 }
 
-/// Spawn `ublk-azblob run --size <size>` as a child process.
+/// Return the set of available (unused) `/dev/nbd*` device nodes for NBD mode.
+pub fn list_available_nbd_devices() -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix("nbd") {
+                if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                    let dev_path = format!("/dev/{name}");
+                    // Check if the device is not in use (no partitions exist)
+                    // An unused NBD device won't have entries like /dev/nbd0p1
+                    if !Path::new(&format!("{}p1", dev_path)).exists() {
+                        set.insert(dev_path);
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Spawn `ublk-azblob run --size <size>` (or with `--nbd` for NBD mode) as a child process.
 ///
 /// `env` carries the storage selectors and credentials (`AZURE_STORAGE_*`).
-/// The child keeps the ublk device alive until it is signalled.
-pub fn spawn_device(size: u64, env: &[(String, String)]) -> anyhow::Result<Child> {
+/// `nbd_listen` optionally enables NBD mode with the given listen address (e.g. `127.0.0.1:10809`).
+/// The child keeps the device alive until it is signalled.
+pub fn spawn_device(size: u64, env: &[(String, String)], nbd_listen: Option<String>) -> anyhow::Result<Child> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut cmd = Command::new(exe);
     cmd.arg("run")
         .arg("--size")
         .arg(size.to_string())
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    
+    if let Some(ref listen) = nbd_listen {
+        info!(listen = %listen, "spawning NBD server");
+        cmd.arg("--nbd").arg(listen);
+    } else {
+        info!("spawning ublk device");
+    }
+    
     for (k, v) in env {
         cmd.env(k, v);
     }
     let child = cmd.spawn().context("spawn ublk-azblob run")?;
+    info!(pid = child.id(), nbd_mode = nbd_listen.is_some(), "spawned device process");
     Ok(child)
 }
 
@@ -67,6 +102,111 @@ pub fn wait_for_new_device(
         std::thread::sleep(Duration::from_millis(250));
     }
     bail!("timed out waiting for a new ublk device");
+}
+
+/// For NBD mode: wait for the server to start, then connect with nbd-client.
+/// Returns the `/dev/nbdN` device path.
+pub fn wait_and_connect_nbd(
+    nbd_listen: &str,
+    child: &mut Child,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    // Parse host:port from listen address
+    let parts: Vec<&str> = nbd_listen.split(':').collect();
+    if parts.len() != 2 {
+        bail!("invalid NBD listen address: {}", nbd_listen);
+    }
+    let host = parts[0];
+    let port = parts[1];
+
+    // Wait a bit for the NBD server to start
+    let deadline = Instant::now() + timeout;
+    
+    // Poll for the child to either start listening or exit
+    for _attempt in 0..10 {
+        std::thread::sleep(Duration::from_millis(200));
+        
+        // Check if child exited
+        if let Ok(Some(status)) = child.try_wait() {
+            // Try to read any stderr output from the failed child
+            let mut stderr = String::new();
+            if let Some(ref mut err) = child.stderr {
+                let _ = err.read_to_string(&mut stderr);
+            }
+            let mut stdout = String::new();
+            if let Some(ref mut out) = child.stdout {
+                let _ = out.read_to_string(&mut stdout);
+            }
+            bail!(
+                "ublk-azblob NBD server exited before connecting: {} stderr: {} stdout: {}",
+                status, stderr.trim(), stdout.trim()
+            );
+        }
+        
+        // Try to connect to see if server is ready
+        // Use a quick TCP connection test instead of immediately invoking nbd-client
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(
+            &format!("{}:{}", host, port).parse().unwrap(),
+            Duration::from_millis(100),
+        ) {
+            drop(stream);
+            break;  // Server is listening
+        }
+    }
+    
+    // Final check if child is still alive
+    if let Ok(Some(status)) = child.try_wait() {
+        let mut stderr = String::new();
+        if let Some(ref mut err) = child.stderr {
+            let _ = err.read_to_string(&mut stderr);
+        }
+        bail!("ublk-azblob NBD server exited before connecting: {} stderr: {}", status, stderr);
+    }
+
+    // Find an available NBD device
+    let available = list_available_nbd_devices();
+    let nbd_dev = available
+        .iter()
+        .next()
+        .context("no available /dev/nbd* devices")?
+        .clone();
+
+    info!(device = %nbd_dev, host = %host, port = %port, "connecting NBD client");
+
+    // Connect with nbd-client
+    // Use -L (--nonetlink) for compatibility with older kernels
+    let output = Command::new("nbd-client")
+        .arg(host)
+        .arg(port)
+        .arg(&nbd_dev)
+        .arg("-L")  // Disable netlink, use legacy ioctl interface
+        .output()
+        .context("failed to run nbd-client")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("nbd-client failed: {stderr}");
+    }
+
+    // Verify the device is now connected
+    while Instant::now() < deadline {
+        if Path::new(&nbd_dev).exists() {
+            // Additional check: see if it's actually connected (has size)
+            if let Ok(output) = Command::new("blockdev")
+                .arg("--getsize64")
+                .arg(&nbd_dev)
+                .output()
+            {
+                if output.status.success() {
+                    info!(device = %nbd_dev, "NBD device connected");
+                    return Ok(nbd_dev);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    bail!("NBD device {} did not become ready", nbd_dev);
 }
 
 /// True if `dev` already carries a recognised filesystem (via `blkid`).

@@ -208,6 +208,11 @@ impl Node for NodeService {
         let readonly = req.readonly;
         let volumes = self.volumes.clone();
         let publish_lock = self.publish_lock.clone();
+        let use_nbd = self.config.use_nbd;
+        let nbd_host = self.config.nbd_host.clone();
+        let nbd_port_start = self.config.nbd_port_start;
+
+        info!(use_nbd = use_nbd, nbd_host = %nbd_host, nbd_port_start = nbd_port_start, "NodePublishVolume: NBD config");
 
         // The device + filesystem work is blocking; run it off the async runtime.
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -215,16 +220,46 @@ impl Node for NodeService {
             // node under a global lock so concurrent publishes don't collide.
             let (mut child, device) = {
                 let _guard = publish_lock.lock().unwrap();
-                let before = mount::list_ublk_devices();
-                let mut child = mount::spawn_device(size, &env)?;
-                match mount::wait_for_new_device(&before, &mut child, DEVICE_TIMEOUT) {
-                    Ok(dev) => (child, dev),
-                    Err(e) => {
-                        mount::signal_pid(child.id(), libc::SIGINT);
-                        let _ = child.wait();
-                        return Err(e);
+                
+                // Build NBD listen address if NBD mode is enabled
+                let nbd_listen = if use_nbd {
+                    // TODO: allocate unique port per volume (for now just use port_start)
+                    let listen = format!("{}:{}", nbd_host, nbd_port_start);
+                    info!(listen = %listen, "NBD mode enabled, will connect to NBD server");
+                    Some(listen)
+                } else {
+                    info!("ublk mode enabled, will wait for /dev/ublkbN");
+                    None
+                };
+                
+                let mut child = mount::spawn_device(size, &env, nbd_listen.clone())?;
+                
+                let device = if let Some(listen_addr) = nbd_listen {
+                    // NBD mode: wait for server and connect with nbd-client
+                    info!(listen_addr = %listen_addr, "Calling wait_and_connect_nbd");
+                    match mount::wait_and_connect_nbd(&listen_addr, &mut child, DEVICE_TIMEOUT) {
+                        Ok(dev) => dev,
+                        Err(e) => {
+                            mount::signal_pid(child.id(), libc::SIGINT);
+                            let _ = child.wait();
+                            return Err(e);
+                        }
                     }
-                }
+                } else {
+                    // ublk mode: wait for /dev/ublkbN to appear
+                    info!("Calling wait_for_new_device for ublk");
+                    let before = mount::list_ublk_devices();
+                    match mount::wait_for_new_device(&before, &mut child, DEVICE_TIMEOUT) {
+                        Ok(dev) => dev,
+                        Err(e) => {
+                            mount::signal_pid(child.id(), libc::SIGINT);
+                            let _ = child.wait();
+                            return Err(e);
+                        }
+                    }
+                };
+                
+                (child, device)
             };
 
             // Make a filesystem only on a blank device, then mount.
