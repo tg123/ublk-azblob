@@ -39,9 +39,9 @@ pub struct BufferedConfig {
 impl Default for BufferedConfig {
     fn default() -> Self {
         Self {
-            page_size: 4 * 1024 * 1024, // 4 MiB
-            max_dirty_pages: 64,        // 256 MiB total
-            idle_flush_secs: 15,        // flush after 15s idle
+            page_size: 4 * 1024 * 1024,    // 4 MiB
+            max_dirty_pages: 64,           // 256 MiB total
+            idle_flush_secs: 15,           // flush after 15s idle
             force_flush_timeout_secs: 600, // force flush after 10 minutes
         }
     }
@@ -102,7 +102,7 @@ impl BufferedBackend {
                 last_flush: None,
             }),
         });
-        
+
         // Spawn idle flush and force flush task if configured
         if config.idle_flush_secs > 0 || config.force_flush_timeout_secs > 0 {
             let backend_clone = backend.clone();
@@ -113,15 +113,15 @@ impl BufferedBackend {
             };
             let idle_timeout = Duration::from_secs(config.idle_flush_secs);
             let force_timeout = Duration::from_secs(config.force_flush_timeout_secs);
-            
+
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(check_interval).await;
-                    
+
                     let (should_idle_flush, should_force_flush) = {
                         let state = backend_clone.state.lock().await;
                         let has_dirty = state.pages.values().any(|p| p.dirty);
-                        
+
                         let idle_trigger = if config.idle_flush_secs > 0 {
                             if let Some(last_write) = state.last_write {
                                 last_write.elapsed() >= idle_timeout && has_dirty
@@ -131,7 +131,7 @@ impl BufferedBackend {
                         } else {
                             false
                         };
-                        
+
                         let force_trigger = if config.force_flush_timeout_secs > 0 {
                             if let Some(last_flush) = state.last_flush {
                                 last_flush.elapsed() >= force_timeout && has_dirty
@@ -142,19 +142,25 @@ impl BufferedBackend {
                         } else {
                             false
                         };
-                        
+
                         (idle_trigger, force_trigger)
                     };
-                    
+
                     if should_idle_flush {
-                        info!("idle flush triggered after {}s of inactivity", config.idle_flush_secs);
+                        info!(
+                            "idle flush triggered after {}s of inactivity",
+                            config.idle_flush_secs
+                        );
                         if let Err(e) = backend_clone.flush().await {
                             warn!("idle flush failed: {:#}", e);
                         } else {
                             // Update last_flush timestamp (already done in flush())
                         }
                     } else if should_force_flush {
-                        info!("force flush triggered after {}s since last flush", config.force_flush_timeout_secs);
+                        info!(
+                            "force flush triggered after {}s since last flush",
+                            config.force_flush_timeout_secs
+                        );
                         if let Err(e) = backend_clone.flush().await {
                             warn!("force flush failed: {:#}", e);
                         }
@@ -162,7 +168,7 @@ impl BufferedBackend {
                 }
             });
         }
-        
+
         Ok(backend)
     }
 
@@ -256,7 +262,7 @@ impl BufferedBackend {
         } else {
             None
         };
-        
+
         let flush_task = async {
             for &page_idx in indices {
                 // Snapshot the dirty page under a brief lock (no await held).
@@ -308,7 +314,7 @@ impl BufferedBackend {
             }
             Ok::<(), anyhow::Error>(())
         };
-        
+
         if let Some(timeout_duration) = timeout {
             match tokio::time::timeout(timeout_duration, flush_task).await {
                 Ok(result) => result,
@@ -550,7 +556,7 @@ impl BlobBackend for BufferedBackend {
                 "flushing all dirty pages"
             );
             self.flush_indices(&dirty_indices).await?;
-            
+
             // Update last_flush timestamp after successful flush
             let mut state = self.state.lock().await;
             state.last_flush = Some(Instant::now());

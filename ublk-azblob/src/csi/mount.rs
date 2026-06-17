@@ -58,7 +58,11 @@ pub fn list_available_nbd_devices() -> HashSet<String> {
 /// `env` carries the storage selectors and credentials (`AZURE_STORAGE_*`).
 /// `nbd_listen` optionally enables NBD mode with the given listen address (e.g. `127.0.0.1:10809`).
 /// The child keeps the device alive until it is signalled.
-pub fn spawn_device(size: u64, env: &[(String, String)], nbd_listen: Option<String>) -> anyhow::Result<Child> {
+pub fn spawn_device(
+    size: u64,
+    env: &[(String, String)],
+    nbd_listen: Option<String>,
+) -> anyhow::Result<Child> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut cmd = Command::new(exe);
     cmd.arg("run")
@@ -67,19 +71,23 @@ pub fn spawn_device(size: u64, env: &[(String, String)], nbd_listen: Option<Stri
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    
+
     if let Some(ref listen) = nbd_listen {
         info!(listen = %listen, "spawning NBD server");
         cmd.arg("--nbd").arg(listen);
     } else {
         info!("spawning ublk device");
     }
-    
+
     for (k, v) in env {
         cmd.env(k, v);
     }
     let child = cmd.spawn().context("spawn ublk-azblob run")?;
-    info!(pid = child.id(), nbd_mode = nbd_listen.is_some(), "spawned device process");
+    info!(
+        pid = child.id(),
+        nbd_mode = nbd_listen.is_some(),
+        "spawned device process"
+    );
     Ok(child)
 }
 
@@ -121,11 +129,11 @@ pub fn wait_and_connect_nbd(
 
     // Wait a bit for the NBD server to start
     let deadline = Instant::now() + timeout;
-    
+
     // Poll for the child to either start listening or exit
     for _attempt in 0..10 {
         std::thread::sleep(Duration::from_millis(200));
-        
+
         // Check if child exited
         if let Ok(Some(status)) = child.try_wait() {
             // Try to read any stderr output from the failed child
@@ -139,10 +147,12 @@ pub fn wait_and_connect_nbd(
             }
             bail!(
                 "ublk-azblob NBD server exited before connecting: {} stderr: {} stdout: {}",
-                status, stderr.trim(), stdout.trim()
+                status,
+                stderr.trim(),
+                stdout.trim()
             );
         }
-        
+
         // Try to connect to see if server is ready
         // Use a quick TCP connection test instead of immediately invoking nbd-client
         if let Ok(stream) = std::net::TcpStream::connect_timeout(
@@ -150,17 +160,21 @@ pub fn wait_and_connect_nbd(
             Duration::from_millis(100),
         ) {
             drop(stream);
-            break;  // Server is listening
+            break; // Server is listening
         }
     }
-    
+
     // Final check if child is still alive
     if let Ok(Some(status)) = child.try_wait() {
         let mut stderr = String::new();
         if let Some(ref mut err) = child.stderr {
             let _ = err.read_to_string(&mut stderr);
         }
-        bail!("ublk-azblob NBD server exited before connecting: {} stderr: {}", status, stderr);
+        bail!(
+            "ublk-azblob NBD server exited before connecting: {} stderr: {}",
+            status,
+            stderr
+        );
     }
 
     // Find an available NBD device
@@ -179,7 +193,7 @@ pub fn wait_and_connect_nbd(
         .arg(host)
         .arg(port)
         .arg(&nbd_dev)
-        .arg("-L")  // Disable netlink, use legacy ioctl interface
+        .arg("-L") // Disable netlink, use legacy ioctl interface
         .output()
         .context("failed to run nbd-client")?;
 
@@ -231,7 +245,12 @@ pub fn mkfs(dev: &str, fs_type: &str) -> anyhow::Result<()> {
     // For ext4, use lazy_itable_init and lazy_journal_init to speed up mkfs
     // on large devices (avoids writing zeros to entire inode tables and journal).
     let args: Vec<&str> = if fs_type == "ext4" || fs_type == "ext3" || fs_type == "ext2" {
-        vec!["-F", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1", dev]
+        vec![
+            "-F",
+            "-E",
+            "nodiscard,lazy_itable_init=1,lazy_journal_init=1",
+            dev,
+        ]
     } else {
         vec![dev]
     };

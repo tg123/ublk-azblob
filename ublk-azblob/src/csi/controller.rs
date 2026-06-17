@@ -192,7 +192,7 @@ impl Controller for ControllerService {
         volume_context.insert("container".to_string(), container.clone());
         volume_context.insert("blob".to_string(), blob.clone());
         volume_context.insert("account".to_string(), account.clone());
-        
+
         // Build account-specific endpoint for the node
         // Standard Azure: construct from account; Custom (Azurite): use config if has account
         let endpoint = if self.config.endpoint.contains(&account) {
@@ -200,7 +200,7 @@ impl Controller for ControllerService {
         } else {
             format!("https://{account}.blob.core.windows.net/")
         };
-        
+
         volume_context.insert("endpoint".to_string(), endpoint);
         volume_context.insert("size".to_string(), size.to_string());
         if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {

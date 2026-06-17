@@ -243,9 +243,15 @@ pub fn build_backend(
                 .map(UserAssignedIdentity::ClientId),
         )
     } else if let (Some(tenant_id), Some(client_id), Some(client_secret)) = (
-        secrets.get("AZURE_TENANT_ID").or(config.sp_tenant_id.as_ref()),
-        secrets.get("AZURE_CLIENT_ID").or(config.sp_client_id.as_ref()),
-        secrets.get("AZURE_CLIENT_SECRET").or(config.sp_client_secret.as_ref()),
+        secrets
+            .get("AZURE_TENANT_ID")
+            .or(config.sp_tenant_id.as_ref()),
+        secrets
+            .get("AZURE_CLIENT_ID")
+            .or(config.sp_client_id.as_ref()),
+        secrets
+            .get("AZURE_CLIENT_SECRET")
+            .or(config.sp_client_secret.as_ref()),
     ) {
         AuthConfig::ServicePrincipal {
             tenant_id: tenant_id.clone(),

@@ -297,17 +297,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let endpoint = cli
-        .endpoint
-        .clone()
-        .unwrap_or_else(|| {
-            // For CSI mode with empty account, use generic endpoint (will be replaced with actual account)
-            if cli.account.is_empty() {
-                "https://blob.core.windows.net/".to_string()
-            } else {
-                format!("https://{}.blob.core.windows.net/", cli.account)
-            }
-        });
+    let endpoint = cli.endpoint.clone().unwrap_or_else(|| {
+        // For CSI mode with empty account, use generic endpoint (will be replaced with actual account)
+        if cli.account.is_empty() {
+            "https://blob.core.windows.net/".to_string()
+        } else {
+            format!("https://{}.blob.core.windows.net/", cli.account)
+        }
+    });
 
     match cli.command {
         Command::Run {
@@ -399,7 +396,13 @@ async fn main() -> anyhow::Result<()> {
 
             // Wrap with write-back buffer if page_size > 0.
             let backend: Arc<dyn BlobBackend> = if page_size > 0 {
-                info!(page_size, max_dirty_pages, idle_flush_secs, force_flush_timeout_secs, "write-back buffer enabled");
+                info!(
+                    page_size,
+                    max_dirty_pages,
+                    idle_flush_secs,
+                    force_flush_timeout_secs,
+                    "write-back buffer enabled"
+                );
                 BufferedBackend::new(
                     backend,
                     BufferedConfig {
