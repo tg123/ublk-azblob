@@ -17,8 +17,9 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 /// Configuration for the write-back buffer.
 #[derive(Debug, Clone)]
@@ -27,6 +28,12 @@ pub struct BufferedConfig {
     pub page_size: u64,
     /// Maximum number of dirty pages held in memory before auto-flush.
     pub max_dirty_pages: usize,
+    /// Idle flush timeout in seconds: flush dirty pages after N seconds of write inactivity.
+    /// Set to 0 to disable idle flushing. When triggered, resets the force flush timer.
+    pub idle_flush_secs: u64,
+    /// Force flush timeout in seconds: maximum time since last successful flush before
+    /// forcing a flush regardless of activity. Set to 0 for no timeout. Reset by idle flushes.
+    pub force_flush_timeout_secs: u64,
 }
 
 impl Default for BufferedConfig {
@@ -34,6 +41,8 @@ impl Default for BufferedConfig {
         Self {
             page_size: 4 * 1024 * 1024, // 4 MiB
             max_dirty_pages: 64,        // 256 MiB total
+            idle_flush_secs: 15,        // flush after 15s idle
+            force_flush_timeout_secs: 600, // force flush after 10 minutes
         }
     }
 }
@@ -65,10 +74,14 @@ struct BufferState {
     seq_counter: u64,
     /// Total device size (set after create/size call).
     dev_size: u64,
+    /// Timestamp of last write operation (for idle flush detection).
+    last_write: Option<Instant>,
+    /// Timestamp of last successful flush (for force flush timer).
+    last_flush: Option<Instant>,
 }
 
 impl BufferedBackend {
-    pub fn new(inner: Arc<dyn BlobBackend>, config: BufferedConfig) -> anyhow::Result<Self> {
+    pub fn new(inner: Arc<dyn BlobBackend>, config: BufferedConfig) -> anyhow::Result<Arc<Self>> {
         if config.page_size < 512 || !config.page_size.is_multiple_of(512) {
             bail!(
                 "page_size ({}) must be a non-zero multiple of 512",
@@ -78,15 +91,79 @@ impl BufferedBackend {
         if config.max_dirty_pages == 0 {
             bail!("max_dirty_pages must be greater than 0");
         }
-        Ok(Self {
+        let backend = Arc::new(Self {
             inner,
-            config,
+            config: config.clone(),
             state: Mutex::new(BufferState {
                 pages: BTreeMap::new(),
                 seq_counter: 0,
                 dev_size: 0,
+                last_write: None,
+                last_flush: None,
             }),
-        })
+        });
+        
+        // Spawn idle flush and force flush task if configured
+        if config.idle_flush_secs > 0 || config.force_flush_timeout_secs > 0 {
+            let backend_clone = backend.clone();
+            let check_interval = if config.idle_flush_secs > 0 {
+                Duration::from_secs(config.idle_flush_secs.max(1) / 2)
+            } else {
+                Duration::from_secs(config.force_flush_timeout_secs.max(1) / 4)
+            };
+            let idle_timeout = Duration::from_secs(config.idle_flush_secs);
+            let force_timeout = Duration::from_secs(config.force_flush_timeout_secs);
+            
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(check_interval).await;
+                    
+                    let (should_idle_flush, should_force_flush) = {
+                        let state = backend_clone.state.lock().await;
+                        let has_dirty = state.pages.values().any(|p| p.dirty);
+                        
+                        let idle_trigger = if config.idle_flush_secs > 0 {
+                            if let Some(last_write) = state.last_write {
+                                last_write.elapsed() >= idle_timeout && has_dirty
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        
+                        let force_trigger = if config.force_flush_timeout_secs > 0 {
+                            if let Some(last_flush) = state.last_flush {
+                                last_flush.elapsed() >= force_timeout && has_dirty
+                            } else {
+                                // Never flushed yet, trigger if we have dirty pages
+                                has_dirty && state.last_write.is_some()
+                            }
+                        } else {
+                            false
+                        };
+                        
+                        (idle_trigger, force_trigger)
+                    };
+                    
+                    if should_idle_flush {
+                        info!("idle flush triggered after {}s of inactivity", config.idle_flush_secs);
+                        if let Err(e) = backend_clone.flush().await {
+                            warn!("idle flush failed: {:#}", e);
+                        } else {
+                            // Update last_flush timestamp (already done in flush())
+                        }
+                    } else if should_force_flush {
+                        info!("force flush triggered after {}s since last flush", config.force_flush_timeout_secs);
+                        if let Err(e) = backend_clone.flush().await {
+                            warn!("force flush failed: {:#}", e);
+                        }
+                    }
+                }
+            });
+        }
+        
+        Ok(backend)
     }
 
     /// Return the device size, lazily initialising it from the inner backend.
@@ -169,57 +246,82 @@ impl BufferedBackend {
     /// inner backend with the lock released, then marked clean under the lock —
     /// but only if the page was not modified again during the write (detected
     /// via its sequence number).  This guarantees no dirty data is lost.
+    ///
+    /// If force_flush_timeout_secs is configured, the entire flush operation
+    /// must complete within that timeout or it will be aborted.
     async fn flush_indices(&self, indices: &[u64]) -> anyhow::Result<()> {
         let page_size = self.config.page_size;
-        for &page_idx in indices {
-            // Snapshot the dirty page under a brief lock (no await held).
-            let snapshot = {
-                let state = self.state.lock().await;
-                match state.pages.get(&page_idx) {
-                    Some(p) if p.dirty => {
-                        let offset = page_idx * page_size;
-                        let write_len = if state.dev_size > 0 {
-                            (p.data.len() as u64).min(state.dev_size.saturating_sub(offset))
-                        } else {
-                            p.data.len() as u64
-                        };
-                        Some((
-                            p.seq,
-                            offset,
-                            write_len,
-                            Bytes::copy_from_slice(&p.data[..]),
-                        ))
+        let timeout = if self.config.force_flush_timeout_secs > 0 {
+            Some(Duration::from_secs(self.config.force_flush_timeout_secs))
+        } else {
+            None
+        };
+        
+        let flush_task = async {
+            for &page_idx in indices {
+                // Snapshot the dirty page under a brief lock (no await held).
+                let snapshot = {
+                    let state = self.state.lock().await;
+                    match state.pages.get(&page_idx) {
+                        Some(p) if p.dirty => {
+                            let offset = page_idx * page_size;
+                            let write_len = if state.dev_size > 0 {
+                                (p.data.len() as u64).min(state.dev_size.saturating_sub(offset))
+                            } else {
+                                p.data.len() as u64
+                            };
+                            Some((
+                                p.seq,
+                                offset,
+                                write_len,
+                                Bytes::copy_from_slice(&p.data[..]),
+                            ))
+                        }
+                        _ => None,
                     }
-                    _ => None,
+                };
+
+                let Some((seq, offset, write_len, data)) = snapshot else {
+                    continue;
+                };
+
+                if write_len > 0 {
+                    trace!(
+                        page_idx,
+                        offset,
+                        len = write_len,
+                        "flushing page to backend"
+                    );
+                    self.inner
+                        .write(offset, data.slice(..write_len as usize))
+                        .await
+                        .with_context(|| format!("flush page {page_idx} at offset {offset}"))?;
                 }
-            };
 
-            let Some((seq, offset, write_len, data)) = snapshot else {
-                continue;
-            };
-
-            if write_len > 0 {
-                trace!(
-                    page_idx,
-                    offset,
-                    len = write_len,
-                    "flushing page to backend"
-                );
-                self.inner
-                    .write(offset, data.slice(..write_len as usize))
-                    .await
-                    .with_context(|| format!("flush page {page_idx} at offset {offset}"))?;
-            }
-
-            // Mark clean only if the page wasn't re-dirtied during the flush.
-            let mut state = self.state.lock().await;
-            if let Some(p) = state.pages.get_mut(&page_idx) {
-                if p.seq == seq {
-                    p.dirty = false;
+                // Mark clean only if the page wasn't re-dirtied during the flush.
+                let mut state = self.state.lock().await;
+                if let Some(p) = state.pages.get_mut(&page_idx) {
+                    if p.seq == seq {
+                        p.dirty = false;
+                    }
                 }
             }
+            Ok::<(), anyhow::Error>(())
+        };
+        
+        if let Some(timeout_duration) = timeout {
+            match tokio::time::timeout(timeout_duration, flush_task).await {
+                Ok(result) => result,
+                Err(_) => {
+                    bail!(
+                        "flush timed out after {}s (force_flush_timeout_secs exceeded)",
+                        self.config.force_flush_timeout_secs
+                    );
+                }
+            }
+        } else {
+            flush_task.await
         }
-        Ok(())
     }
 
     /// If the number of dirty pages exceeds `max_dirty_pages`, flush the oldest
@@ -372,6 +474,8 @@ impl BlobBackend for BufferedBackend {
                     .copy_from_slice(&data[pos as usize..pos as usize + chunk_len]);
                 page.dirty = true;
                 page.seq = seq;
+                // Track last write time for idle flush
+                state.last_write = Some(Instant::now());
             }
 
             // Keep the dirty-page count bounded (flushes oldest, lock released
@@ -417,6 +521,8 @@ impl BlobBackend for BufferedBackend {
                 page.data[page_offset..page_offset + chunk_len].fill(0);
                 page.dirty = true;
                 page.seq = seq;
+                // Track last write time for idle flush
+                state.last_write = Some(Instant::now());
             }
 
             self.enforce_dirty_limit().await?;
@@ -444,6 +550,10 @@ impl BlobBackend for BufferedBackend {
                 "flushing all dirty pages"
             );
             self.flush_indices(&dirty_indices).await?;
+            
+            // Update last_flush timestamp after successful flush
+            let mut state = self.state.lock().await;
+            state.last_flush = Some(Instant::now());
         }
 
         // Also flush the inner backend in case it has its own buffering.
@@ -468,13 +578,15 @@ mod tests {
     use super::*;
     use crate::backend::mem::MemBackend;
 
-    fn make_backend(dev_size: u64, page_size: u64, max_dirty: usize) -> BufferedBackend {
+    fn make_backend(dev_size: u64, page_size: u64, max_dirty: usize) -> Arc<BufferedBackend> {
         let inner = Arc::new(MemBackend::new(dev_size).unwrap());
         BufferedBackend::new(
             inner,
             BufferedConfig {
                 page_size,
                 max_dirty_pages: max_dirty,
+                idle_flush_secs: 0,
+                force_flush_timeout_secs: 0,
             },
         )
         .unwrap()
@@ -507,6 +619,8 @@ mod tests {
             BufferedConfig {
                 page_size: 1024,
                 max_dirty_pages: 4,
+                idle_flush_secs: 0,
+                force_flush_timeout_secs: 0,
             },
         )
         .unwrap();
@@ -532,6 +646,8 @@ mod tests {
             BufferedConfig {
                 page_size: 1024,
                 max_dirty_pages: 2,
+                idle_flush_secs: 0,
+                force_flush_timeout_secs: 0,
             },
         )
         .unwrap();
@@ -584,6 +700,8 @@ mod tests {
                 BufferedConfig {
                     page_size,
                     max_dirty_pages: 4,
+                    idle_flush_secs: 0,
+                    force_flush_timeout_secs: 0,
                 },
             )
             .unwrap(),

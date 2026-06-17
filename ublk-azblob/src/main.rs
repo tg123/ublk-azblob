@@ -215,6 +215,24 @@ enum Command {
         #[arg(long, default_value = "1048576", env = "UBLK_CACHE_PAGE_SIZE")]
         cache_page_size: u64,
 
+        /// Idle flush timeout in seconds: automatically flush dirty pages after N
+        /// seconds of write inactivity.  Set to 0 to disable idle flushing.
+        ///
+        /// This helps ensure data is periodically persisted to Azure even when
+        /// there's no explicit flush call or dirty-page limit trigger.
+        /// When idle flush is triggered, the force flush timer is reset.
+        #[arg(long, default_value = "15", env = "UBLK_IDLE_FLUSH_SECS")]
+        idle_flush_secs: u64,
+
+        /// Force flush timeout in seconds: maximum time since the last successful
+        /// flush before forcing a flush regardless of idle state.  This acts as a
+        /// hard deadline to ensure data is persisted even if writes are continuous.
+        /// Set to 0 for no timeout. Idle flushes reset this timer.
+        ///
+        /// This prevents data from staying dirty for too long during continuous writes.
+        #[arg(long, default_value = "600", env = "UBLK_FORCE_FLUSH_TIMEOUT_SECS")]
+        force_flush_timeout_secs: u64,
+
         /// Serve over the NBD protocol instead of ublk (compatibility mode).
         ///
         /// When set, the device is exposed as an NBD server bound to this
@@ -308,6 +326,8 @@ async fn main() -> anyhow::Result<()> {
             ref lease_holder,
             ref cache_dir,
             cache_page_size,
+            idle_flush_secs,
+            force_flush_timeout_secs,
             ref nbd,
         } => {
             let backend = build_azure_backend(&cli, &endpoint)?;
@@ -379,17 +399,17 @@ async fn main() -> anyhow::Result<()> {
 
             // Wrap with write-back buffer if page_size > 0.
             let backend: Arc<dyn BlobBackend> = if page_size > 0 {
-                info!(page_size, max_dirty_pages, "write-back buffer enabled");
-                Arc::new(
-                    BufferedBackend::new(
-                        backend,
-                        BufferedConfig {
-                            page_size,
-                            max_dirty_pages,
-                        },
-                    )
-                    .context("configure write-back buffer")?,
+                info!(page_size, max_dirty_pages, idle_flush_secs, force_flush_timeout_secs, "write-back buffer enabled");
+                BufferedBackend::new(
+                    backend,
+                    BufferedConfig {
+                        page_size,
+                        max_dirty_pages,
+                        idle_flush_secs,
+                        force_flush_timeout_secs,
+                    },
                 )
+                .context("configure write-back buffer")?
             } else {
                 info!("write-through mode (no buffering)");
                 backend
