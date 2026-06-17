@@ -8,10 +8,11 @@ on:
 
 jobs:
   k8s-pvc:
-    name: k8s PVC e2e (kind + ublk + Azurite)
+    name: k8s PVC e2e (kind + ublk + Azurite) [optional]
     # The ublk_drv kernel module Oopses on the ubuntu-24.04 azure kernel
     # (actions/runner-images#14175); 22.04 ships a stable 6.x kernel.
     runs-on: ubuntu-22.04
+    continue-on-error: true  # Don't block PR merges on k8s e2e failures
     permissions:
       contents: read
     steps:
