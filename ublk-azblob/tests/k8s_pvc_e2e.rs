@@ -16,7 +16,10 @@
 //!
 //! Requirements (provided by the CI workflow): a Linux host with `ublk_drv`
 //! loaded, root, Docker, `kind`, and `kubectl`.  When any of these is missing
-//! the test *skips* (returns) rather than failing, mirroring `mount_e2e.rs`.
+//! the test *skips* (returns) rather than failing, mirroring `mount_e2e.rs` —
+//! except in the dedicated CI runner (which sets `K8S_E2E_REQUIRE=1`), where an
+//! unmet precondition is a hard failure so a misconfigured environment can't
+//! report a misleading green pass.
 //!
 //! Gated behind the `csi` Cargo feature.  Run it with:
 //!
@@ -63,8 +66,15 @@ fn k8s_dir() -> PathBuf {
 
 /// True when `bin` is runnable (used for preflight skip checks).
 fn have(bin: &str) -> bool {
+    // `kubectl` has no global `--version` flag (it errors with
+    // "unknown flag: --version"); its version subcommand is `version --client`.
+    // `docker`/`kind` accept `--version`.
+    let args: &[&str] = match bin {
+        "kubectl" => &["version", "--client"],
+        _ => &["--version"],
+    };
     Command::new(bin)
-        .arg("--version")
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -137,20 +147,36 @@ impl Drop for ClusterGuard {
     }
 }
 
+/// Handle an unmet precondition.
+///
+/// For local/manual runs the test skips gracefully (mirroring `mount_e2e.rs`).
+/// In the dedicated CI runner (the `tests/e2e/k8s` docker-compose stack, which
+/// exports `K8S_E2E_REQUIRE=1`) every precondition is guaranteed to be
+/// satisfied, so an unmet one means the environment is broken — fail loudly
+/// instead of skipping, which would otherwise report a misleading green pass.
+fn skip_or_fail(reason: &str) {
+    if std::env::var_os("K8S_E2E_REQUIRE").is_some() {
+        panic!("{reason} (K8S_E2E_REQUIRE is set, refusing to skip)");
+    }
+    eprintln!("SKIP: {reason}");
+}
+
 #[test]
 fn pvc_write_remount_verify() {
     // ── Preflight: skip gracefully when the environment can't drive ublk ──────
+    // (but hard-fail in the CI runner where everything must be present — see
+    // `skip_or_fail`).
     if !is_root() {
-        eprintln!("SKIP: must run as root");
+        skip_or_fail("must run as root");
         return;
     }
     if !Path::new("/dev/ublk-control").exists() {
-        eprintln!("SKIP: ublk_drv not loaded (no /dev/ublk-control)");
+        skip_or_fail("ublk_drv not loaded (no /dev/ublk-control)");
         return;
     }
     for tool in ["docker", "kind", "kubectl"] {
         if !have(tool) {
-            eprintln!("SKIP: {tool} not found");
+            skip_or_fail(&format!("{tool} not found"));
             return;
         }
     }
