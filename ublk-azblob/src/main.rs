@@ -16,6 +16,7 @@ mod auth;
 mod backend;
 #[cfg(feature = "bench")]
 mod bench;
+mod nbd_target;
 mod ublk_target;
 
 use anyhow::Context as _;
@@ -140,6 +141,17 @@ enum Command {
         /// Only used when `--cache-dir` is set.
         #[arg(long, default_value = "1048576", env = "UBLK_CACHE_PAGE_SIZE")]
         cache_page_size: u64,
+
+        /// Serve over the NBD protocol instead of ublk (compatibility mode).
+        ///
+        /// When set, the device is exposed as an NBD server bound to this
+        /// `host:port` (e.g. `0.0.0.0:10809`) rather than a `/dev/ublkbN`
+        /// device.  Use this on kernels/platforms without `ublk_drv`: connect
+        /// with the standard NBD client, e.g.
+        /// `nbd-client <host> <port> /dev/nbd0`.  The ublk-specific options
+        /// (`--nr-queues`, `--queue-depth`, `--id`) are ignored in this mode.
+        #[arg(long, env = "NBD_LISTEN")]
+        nbd: Option<String>,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -214,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
             max_dirty_pages,
             cache_dir,
             cache_page_size,
+            nbd,
         } => {
             if create {
                 info!(size, blob = %cli.blob, "creating page blob");
@@ -283,9 +296,16 @@ async fn main() -> anyhow::Result<()> {
                 queue_depth,
                 id,
             };
-            ublk_target::run_ublk_target(backend, cfg)
-                .await
-                .context("ublk target")?;
+            if let Some(addr) = nbd {
+                info!(addr = %addr, "starting NBD compatibility server");
+                nbd_target::run_nbd_target(backend, &addr, actual_size)
+                    .await
+                    .context("nbd target")?;
+            } else {
+                ublk_target::run_ublk_target(backend, cfg)
+                    .await
+                    .context("ublk target")?;
+            }
         }
 
         Command::Test { size } => {
