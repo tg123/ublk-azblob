@@ -45,12 +45,7 @@ pub struct ControllerService {
 }
 
 /// Expand variables in a template string
-fn expand_template(
-    template: &str,
-    pvc_name: &str,
-    pvc_namespace: &str,
-    pv_name: &str,
-) -> String {
+fn expand_template(template: &str, pvc_name: &str, pvc_namespace: &str, pv_name: &str) -> String {
     template
         .replace("${pvc.name}", pvc_name)
         .replace("${pvc.namespace}", pvc_namespace)
@@ -75,10 +70,11 @@ impl ControllerService {
     }
 
     /// Get storage account with variable expansion and secret fallback
+    #[allow(clippy::result_large_err)]
     fn storage_account_for(
         &self,
         parameters: &HashMap<String, String>,
-        secrets: &HashMap<String, Vec<u8>>,
+        secrets: &HashMap<String, String>,
         pvc_name: &str,
         pvc_namespace: &str,
         pv_name: &str,
@@ -87,22 +83,22 @@ impl ControllerService {
         if let Some(template) = parameters.get(PARAM_STORAGE_ACCOUNT) {
             return Ok(expand_template(template, pvc_name, pvc_namespace, pv_name));
         }
-        
+
         // 2. Try secret's AZURE_STORAGE_ACCOUNT
-        if let Some(account_bytes) = secrets.get("AZURE_STORAGE_ACCOUNT") {
-            return String::from_utf8(account_bytes.clone())
-                .map_err(|e| Status::invalid_argument(format!("invalid storage account in secret: {}", e)));
+        if let Some(account) = secrets.get("AZURE_STORAGE_ACCOUNT") {
+            return Ok(account.clone());
         }
-        
+
         // 3. Fall back to config default
         Ok(self.config.account.clone())
     }
 
     /// Get container with variable expansion and secret fallback
+    #[allow(clippy::result_large_err)]
     fn container_for(
         &self,
         parameters: &HashMap<String, String>,
-        secrets: &HashMap<String, Vec<u8>>,
+        secrets: &HashMap<String, String>,
         pvc_name: &str,
         pvc_namespace: &str,
         pv_name: &str,
@@ -111,13 +107,12 @@ impl ControllerService {
         if let Some(template) = parameters.get(PARAM_CONTAINER) {
             return Ok(expand_template(template, pvc_name, pvc_namespace, pv_name));
         }
-        
+
         // 2. Try secret's AZURE_STORAGE_CONTAINER
-        if let Some(container_bytes) = secrets.get("AZURE_STORAGE_CONTAINER") {
-            return String::from_utf8(container_bytes.clone())
-                .map_err(|e| Status::invalid_argument(format!("invalid container in secret: {}", e)));
+        if let Some(container) = secrets.get("AZURE_STORAGE_CONTAINER") {
+            return Ok(container.clone());
         }
-        
+
         // 3. Fall back to config default
         Ok(self.config.default_container.clone())
     }
@@ -143,9 +138,45 @@ impl Controller for ControllerService {
             .unwrap_or(0);
         let size = round_up_512(requested.max(0) as u64);
 
-        let container = self.container_for(&req.parameters);
-        // The blob name is the CSI volume name (e.g. `pvc-<uuid>`).
-        let blob = req.name.clone();
+        // The external-provisioner injects PVC/PV metadata as parameters.
+        let pvc_name = req
+            .parameters
+            .get("csi.storage.k8s.io/pvc/name")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let pvc_namespace = req
+            .parameters
+            .get("csi.storage.k8s.io/pvc/namespace")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let pv_name = &req.name;
+
+        let account = self.storage_account_for(
+            &req.parameters,
+            &req.secrets,
+            pvc_name,
+            pvc_namespace,
+            pv_name,
+        )?;
+        let container = self.container_for(
+            &req.parameters,
+            &req.secrets,
+            pvc_name,
+            pvc_namespace,
+            pv_name,
+        )?;
+        // Determine blob path from template (StorageClass parameter or default).
+        let blob_template = req
+            .parameters
+            .get(PARAM_BLOB_PATH_TEMPLATE)
+            .map(|s| s.as_str())
+            .unwrap_or(DEFAULT_BLOB_PATH_TEMPLATE);
+        let blob = sanitize_path(&expand_template(
+            blob_template,
+            pvc_name,
+            pvc_namespace,
+            pv_name,
+        ));
 
         info!(name = %req.name, container = %container, size, "CreateVolume");
 
@@ -160,7 +191,7 @@ impl Controller for ControllerService {
         let mut volume_context: HashMap<String, String> = HashMap::new();
         volume_context.insert("container".to_string(), container.clone());
         volume_context.insert("blob".to_string(), blob.clone());
-        volume_context.insert("account".to_string(), self.config.account.clone());
+        volume_context.insert("account".to_string(), account.clone());
         volume_context.insert("endpoint".to_string(), self.config.endpoint.clone());
         volume_context.insert("size".to_string(), size.to_string());
         if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {

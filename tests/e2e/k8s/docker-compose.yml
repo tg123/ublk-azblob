@@ -1,0 +1,49 @@
+# docker-compose for the ublk-azblob Kubernetes PVC e2e.
+#
+# Spins up a privileged `runner` container that has access to the host Docker
+# daemon (via socket mount) and the host kernel devices (/dev, /lib/modules),
+# then runs the Rust `k8s_pvc_e2e` integration test, which:
+#
+#   1. Builds the CSI driver image from deploy/Dockerfile.
+#   2. Creates a single-node kind cluster (cluster nodes bind-mount /dev and
+#      /lib/modules from the host so the CSI node plugin can reach ublk_drv).
+#   3. Deploys an in-cluster Azurite + the CSI driver + StorageClass.
+#   4. Exercises the full PVC write → unmount → remount → checksum-verify cycle.
+#
+# Requirements on the **host** (not inside this compose stack):
+#   - Docker daemon running at /var/run/docker.sock
+#   - ublk_drv loaded: `sudo modprobe ublk_drv`
+#
+# Usage:
+#   sudo modprobe ublk_drv
+#   docker compose -f tests/e2e/k8s/docker-compose.yml up --build \
+#     --abort-on-container-exit --exit-code-from runner
+#   docker compose -f tests/e2e/k8s/docker-compose.yml down -v
+
+services:
+  runner:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/k8s/Dockerfile
+    # The ublk block device and mkfs/mount tools need a real kernel with ublk_drv
+    # already loaded on the host; privileged mode + host /dev makes them visible.
+    privileged: true
+    volumes:
+      # Source tree — cargo builds and reads manifests from here
+      - ../../..:/workspace
+      # Host kernel devices (ublk_drv must already be loaded on the host)
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+      # Host Docker socket — kind creates cluster nodes as Docker containers on
+      # the host daemon, and the test builds the driver image via `docker build`
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /workspace
+    environment:
+      CARGO_TERM_COLOR: "always"
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        cargo test --release --features csi -p ublk-azblob \
+          --test k8s_pvc_e2e -- --nocapture
