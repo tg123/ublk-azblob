@@ -64,9 +64,12 @@ pub fn list_available_nbd_devices() -> HashSet<String> {
             if let Some(rest) = name.strip_prefix("nbd") {
                 if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
                     let dev_path = format!("/dev/{name}");
-                    // Check if the device is not in use (no partitions exist)
-                    // An unused NBD device won't have entries like /dev/nbd0p1
-                    if !Path::new(&format!("{}p1", dev_path)).exists() {
+                    // A device is in use once nbd-client connects it: the kernel
+                    // then exposes /sys/block/nbdN/pid. (Checking for a `p1`
+                    // partition is unreliable — the plugin formats/mounts the
+                    // whole device, so a busy device never has a partition node.)
+                    let in_use = Path::new(&format!("/sys/block/{name}/pid")).exists();
+                    if !in_use {
                         set.insert(dev_path);
                     }
                 }
