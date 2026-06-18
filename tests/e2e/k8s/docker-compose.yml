@@ -32,7 +32,7 @@ services:
       - k3s-data:/var/lib/rancher/k3s
       - kubeconfig:/output
       # CSI needs kubelet dir - use named volume shared across all k3s nodes
-      - kubelet-data:/var/lib/kubelet:rshared
+      - kubelet-data:/var/lib/kubelet
     environment:
       K3S_TOKEN: "e2e-test-token"
       K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
@@ -61,7 +61,7 @@ services:
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
       # CSI needs kubelet dir - use named volume shared across all k3s nodes
-      - kubelet-data:/var/lib/kubelet:rshared
+      - kubelet-data:/var/lib/kubelet
     environment:
       K3S_TOKEN: "e2e-test-token"
       K3S_URL: "https://k3s-server:6443"
