@@ -534,7 +534,11 @@ spec:
         .output()
         .expect("read checksum");
     let checksum1 = String::from_utf8_lossy(&checksum1_out.stdout);
-    log(&format!("checksum on node {}: {}", nodes[0], checksum1.trim()));
+    log(&format!(
+        "checksum on node {}: {}",
+        nodes[0],
+        checksum1.trim()
+    ));
 
     // Delete pod to trigger NodeUnpublishVolume
     log(&format!("deleting pod (will trigger graceful shutdown and flush)"));
