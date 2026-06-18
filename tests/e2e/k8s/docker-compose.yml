@@ -118,8 +118,6 @@ services:
       DOCKER_BUILDKIT: "1"
       K8S_E2E_REQUIRE: "1"
       KUBECONFIG: /kubeconfig/kubeconfig.yaml
-      K8S_E2E_USE_EXISTING_CLUSTER: "1"
-      K8S_E2E_CLUSTER_NAME: "k3s"
     command:
       - bash
       - -c

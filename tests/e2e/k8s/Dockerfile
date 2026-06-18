@@ -1,13 +1,12 @@
 # Test runner image for the ublk-azblob Kubernetes PVC e2e.
 #
-# Provides: Rust toolchain, protoc/libprotobuf-dev, the docker CLI, kind,
-# kubectl, and helm.  The source tree is bind-mounted at /workspace at runtime;
+# Provides: Rust toolchain, protoc/libprotobuf-dev, the docker CLI, kubectl,
+# and helm.  The source tree is bind-mounted at /workspace at runtime;
 # nothing is compiled here — only the environment is prepared.
 #
 FROM rust:1.96-slim
 
 ARG DOCKER_VERSION=27.5.1
-ARG KIND_VERSION=v0.26.0
 ARG KUBECTL_VERSION=v1.32.3
 ARG HELM_VERSION=v3.17.3
 
@@ -34,12 +33,6 @@ RUN ARCH=$(dpkg --print-architecture) \
  && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx \
       "https://github.com/docker/buildx/releases/download/v0.20.1/buildx-v0.20.1.linux-${ARCH}" \
  && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
-
-# kind — single static binary, arch-aware
-RUN ARCH=$(dpkg --print-architecture) \
- && curl -fsSL -o /usr/local/bin/kind \
-      "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-${ARCH}" \
- && chmod +x /usr/local/bin/kind
 
 # kubectl — arch-aware
 RUN ARCH=$(dpkg --print-architecture) \

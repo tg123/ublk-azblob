@@ -35,8 +35,7 @@ jobs:
           docker compose -f tests/e2e/k8s/docker-compose.yml up \
             --build --abort-on-container-exit --exit-code-from runner
 
-      - name: Delete leftover clusters (if any)
+      - name: Tear down the compose stack
         if: always()
         run: |
           docker compose -f tests/e2e/k8s/docker-compose.yml down -v || true
-          kind delete cluster --name azblob-e2e || true

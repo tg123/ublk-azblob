@@ -1,23 +1,25 @@
 //! Kubernetes PVC e2e for the `ublk-azblob` CSI driver, written in Rust.
 //!
-//! This is the Rust replacement for the old `tests/e2e/k8s/run.sh` shell script.
-//! It spins up a single-node `kind` cluster, deploys the CSI driver (controller
-//! + node) and an in-cluster Azurite, then exercises the full PVC lifecycle:
+//! It runs against the multi-node k3s cluster provided by the docker-compose
+//! harness (`tests/e2e/k8s/docker-compose.yml`), deploys the CSI driver
+//! (controller + node) and an in-cluster Azurite, then exercises the full PVC
+//! lifecycle:
 //!
 //!   1. create a PVC backed by the `azblob-ublk` StorageClass
 //!   2. run a writer Job that writes random data and records its SHA-256
-//!   3. delete the writer (NodeUnpublishVolume tears the ublk device down and
+//!   3. delete the writer (NodeUnpublishVolume tears the device down and
 //!      flushes the page blob)
-//!   4. run a reader Job that mounts the *same* PVC on a fresh ublk device over
+//!   4. run a reader Job that mounts the *same* PVC on a fresh device over
 //!      the existing page blob and verifies the SHA-256 still matches
 //!
 //! This is the Kubernetes counterpart of `mount_e2e.rs` and proves the data
 //! survives provision → write → unmount → remount through the page blob.
 //!
 //! Requirements (provided by the CI workflow): a Linux host with `ublk_drv`
-//! loaded, root, Docker, `kind`, and `kubectl`.  When any of these is missing
-//! the test *skips* (returns) rather than failing, mirroring `mount_e2e.rs` —
-//! except in the dedicated CI runner (which sets `K8S_E2E_REQUIRE=1`), where an
+//! (or `nbd`) loaded, root, Docker, and `kubectl`/`helm`.  When any of these is
+//! missing the test *skips* (returns) rather than failing, mirroring
+//! `mount_e2e.rs` — except in the dedicated CI runner (which sets
+//! `K8S_E2E_REQUIRE=1`), where an
 //! unmet precondition is a hard failure so a misconfigured environment can't
 //! report a misleading green pass.
 //!
@@ -33,16 +35,6 @@ use std::process::{Command, Stdio};
 
 /// Kubernetes namespace the e2e deploys Azurite and the CSI driver into.
 const NS: &str = "kube-system";
-
-fn cluster_name() -> String {
-    std::env::var("K8S_E2E_CLUSTER_NAME")
-        .or_else(|_| std::env::var("KIND_CLUSTER"))
-        .unwrap_or_else(|_| "azblob-e2e".to_string())
-}
-
-fn use_existing_cluster() -> bool {
-    std::env::var("K8S_E2E_USE_EXISTING_CLUSTER").is_ok()
-}
 
 fn image() -> String {
     std::env::var("E2E_IMAGE").unwrap_or_else(|_| "ublk-azblob:e2e".to_string())
@@ -70,7 +62,7 @@ fn have(bin: &str) -> bool {
     // `kubectl` has no global `--version` flag (it errors with
     // "unknown flag: --version"); its version subcommand is `version --client`.
     // `helm` also errors with "unknown flag: --version", use `version` subcommand.
-    // `docker`/`kind` accept `--version`.
+    // `docker` accepts `--version`.
     let args: &[&str] = match bin {
         "kubectl" => &["version", "--client"],
         "helm" => &["version"],
@@ -158,18 +150,6 @@ fn kubectl_apply_stdin(yaml: &str) {
     assert!(status.success(), "kubectl apply -f - failed with {status}");
 }
 
-/// RAII guard that deletes the kind cluster on drop (mirrors the bash `trap`).
-struct ClusterGuard {
-    name: String,
-}
-
-impl Drop for ClusterGuard {
-    fn drop(&mut self) {
-        log(&format!("tearing down kind cluster {}", self.name));
-        let _ = try_run("kind", &["delete", "cluster", "--name", &self.name]);
-    }
-}
-
 /// Handle an unmet precondition.
 ///
 /// For local/manual runs the test skips gracefully (mirroring `mount_e2e.rs`).
@@ -222,12 +202,7 @@ fn test_basic_mount_and_recovery() {
         return;
     }
     eprintln!("INFO: e2e using {} mode", if nbd { "NBD" } else { "ublk" });
-    let required_tools = if use_existing_cluster() {
-        vec!["docker", "kubectl", "helm"]
-    } else {
-        vec!["docker", "kind", "kubectl", "helm"]
-    };
-    for tool in required_tools {
+    for tool in ["docker", "kubectl", "helm"] {
         if !have(tool) {
             skip_or_fail(&format!("{tool} not found"));
             return;
@@ -236,7 +211,6 @@ fn test_basic_mount_and_recovery() {
 
     let repo = repo_root();
     let here = k8s_dir();
-    let cluster = cluster_name();
     let img = image();
 
     // ── Build + load the driver image ─────────────────────────────────────────
@@ -253,8 +227,8 @@ fn test_basic_mount_and_recovery() {
         ],
     );
 
-    // ── Create cluster or use existing one ────────────────────────────────────
-    let _guard = setup_cluster(&cluster, &img, &here);
+    // ── Load the freshly-built image into the k3s cluster ─────────────────────
+    load_image_into_k3s(&img);
 
     // ── Deploy Azurite ─────────────────────────────────────────────────────────
     log("deploying Azurite");
@@ -281,8 +255,7 @@ fn test_basic_mount_and_recovery() {
 
     // ── Create secret in default namespace for PVC provisioning ───────────────
     log("creating azblob-csi-secret in default namespace");
-    let secret_yaml = format!(
-        r#"apiVersion: v1
+    let secret_yaml = r#"apiVersion: v1
 kind: Secret
 metadata:
   name: azblob-csi-secret
@@ -291,9 +264,8 @@ type: Opaque
 stringData:
   AZURE_STORAGE_ACCOUNT: devstoreaccount1
   accountKey: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
-"#
-    );
-    kubectl_apply_stdin(&secret_yaml);
+"#;
+    kubectl_apply_stdin(secret_yaml);
 
     // ── Run the PVC write/remount/verify cycle ────────────────────────────────
     log("creating PVC");
@@ -377,60 +349,35 @@ stringData:
     log("k8s PVC e2e PASSED ✓");
 }
 
-/// Setup cluster (create or use existing) and load image
-fn setup_cluster(cluster: &str, img: &str, here: &Path) -> Option<ClusterGuard> {
-    if use_existing_cluster() {
-        log(&format!(
-            "using existing cluster {cluster} (K8S_E2E_USE_EXISTING_CLUSTER set)"
-        ));
-        // Import image to containerd in k3s (bypass kind load)
-        log(&format!("importing {img} to k3s containerd"));
-
-        // Import to all k3s nodes (server + agent)
-        for node in &["k8s-k3s-server-1", "k8s-k3s-agent-1"] {
-            log(&format!("importing to {node}"));
-            let docker_save = Command::new("docker")
-                .args(["save", img])
-                .stdout(Stdio::piped())
-                .spawn()
-                .expect("docker save");
-            let status = Command::new("docker")
-                .args([
-                    "exec",
-                    "-i",
-                    node,
-                    "ctr",
-                    "--namespace=k8s.io",
-                    "images",
-                    "import",
-                    "-",
-                ])
-                .stdin(docker_save.stdout.unwrap())
-                .status()
-                .expect("ctr import");
-            assert!(status.success(), "failed to import image to {node}");
-        }
-        None // no cleanup guard for external cluster
-    } else {
-        log(&format!("creating kind cluster {cluster}"));
-        run(
-            "kind",
-            &[
-                "create",
-                "cluster",
-                "--name",
-                cluster,
-                "--config",
-                here.join("kind-config.yaml").to_str().unwrap(),
-                "--wait",
-                "120s",
-            ],
-        );
-        log(&format!("loading {img} into the cluster"));
-        run("kind", &["load", "docker-image", img, "--name", cluster]);
-        Some(ClusterGuard {
-            name: cluster.to_string(),
-        })
+/// Import the freshly-built driver image into the k3s cluster's containerd on
+/// every node (the cluster is provided by the docker-compose harness).
+fn load_image_into_k3s(img: &str) {
+    log(&format!("importing {img} to k3s containerd"));
+    for node in &["k8s-k3s-server-1", "k8s-k3s-agent-1"] {
+        log(&format!("importing to {node}"));
+        let mut docker_save = Command::new("docker")
+            .args(["save", img])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("docker save");
+        let save_stdout = docker_save.stdout.take().expect("docker save stdout");
+        let status = Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                node,
+                "ctr",
+                "--namespace=k8s.io",
+                "images",
+                "import",
+                "-",
+            ])
+            .stdin(save_stdout)
+            .status()
+            .expect("ctr import");
+        let save_status = docker_save.wait().expect("wait docker save");
+        assert!(save_status.success(), "docker save failed for {node}");
+        assert!(status.success(), "failed to import image to {node}");
     }
 }
 

@@ -18,8 +18,8 @@
 //!
 //! ## Signals (feature = "ublk")
 //! Once the device is up the process installs handlers for:
-//! - `SIGINT` / `SIGTERM` → tear the device down cleanly (queues drain, then
-//!   `/dev/ublkbN` is removed).
+//! - `SIGINT` / `SIGTERM` → tear the device down cleanly (queues drain, the
+//!   backend is flushed to durable storage, then `/dev/ublkbN` is removed).
 //! - `SIGUSR1` → force a `BlobBackend::flush`, draining any pending writes to
 //!   durable storage without unmounting.
 
@@ -320,6 +320,15 @@ fn run_ublk_target_blocking(
 
     ctrl.run_target(tgt_init, q_handler, device_fn)
         .map_err(|e| anyhow::anyhow!("run ublk target: {e:?}"))?;
+
+    // The queues have drained and joined, so every acknowledged write is now in
+    // the backend. Flush it to the page blob before returning so buffered data
+    // isn't lost on an abrupt SIGINT/SIGTERM (e.g. pod deletion) that doesn't go
+    // through a kernel umount FLUSH.
+    info!("flushing backend on ublk shutdown");
+    if let Err(e) = rt.block_on(backend.flush()) {
+        error!(err = %e, "final flush on shutdown failed");
+    }
 
     info!("ublk target stopped");
     Ok(())

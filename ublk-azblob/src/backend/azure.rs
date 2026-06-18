@@ -199,6 +199,14 @@ impl BlobBackend for AzurePageBlobBackend {
 /// Holds its own `BlobContainerClient` (with the auth pipeline wired in) and the
 /// target blob name.  Kept next to [`AzurePageBlobBackend`] so all Azure SDK
 /// types stay inside this module.
+///
+/// The lease is intentionally **finite**: Azure caps an explicit lease duration
+/// at 60s, and the coordination layer ([`crate::coordination`]) keeps it alive
+/// with a renewal loop (renewing roughly every `lease_duration / 3`). This is
+/// deliberate — an infinite lease would never expire if the holder node died,
+/// permanently blocking takeover. With a finite lease, a dead holder's lease
+/// lapses within ≤60s, after which another node can break/acquire it (gated by
+/// the cluster-lease recovery timeout). A clean shutdown releases it immediately.
 #[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 pub struct AzureBlobLock {
     container: BlobContainerClient,
