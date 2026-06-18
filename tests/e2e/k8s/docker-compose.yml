@@ -12,9 +12,13 @@
 # Requirements on the **host** (not inside this compose stack):
 #   - Docker daemon running at /var/run/docker.sock
 #   - ublk_drv loaded: `sudo modprobe ublk_drv`
+#   - /var/lib/kubelet must be a shared mount for CSI mount propagation
 #
 # Usage:
 #   sudo modprobe ublk_drv
+#   sudo mkdir -p /var/lib/kubelet
+#   sudo mount -t tmpfs tmpfs /var/lib/kubelet
+#   sudo mount --make-shared /var/lib/kubelet
 #   docker compose -f tests/e2e/k8s/docker-compose.yml up --build \
 #     --abort-on-container-exit --exit-code-from runner
 #   docker compose -f tests/e2e/k8s/docker-compose.yml down -v
@@ -31,7 +35,8 @@ services:
       - /lib/modules:/lib/modules:ro
       - k3s-data:/var/lib/rancher/k3s
       - kubeconfig:/output
-      # Bind mount host /var/lib/kubelet which is made shared in workflow
+      # Bind mount host /var/lib/kubelet with :rshared propagation
+      # Host must have /var/lib/kubelet as a shared mount (see Usage above)
       - /var/lib/kubelet:/var/lib/kubelet:rshared
     environment:
       K3S_TOKEN: "e2e-test-token"
@@ -60,7 +65,8 @@ services:
     volumes:
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
-      # Bind mount host /var/lib/kubelet which is made shared in workflow
+      # Bind mount host /var/lib/kubelet with :rshared propagation
+      # Host must have /var/lib/kubelet as a shared mount (see Usage above)
       - /var/lib/kubelet:/var/lib/kubelet:rshared
     environment:
       K3S_TOKEN: "e2e-test-token"

@@ -56,6 +56,11 @@ impl BlobBackend for AzurePageBlobBackend {
         // A 409 Conflict means it already exists, which is fine.
         if let Err(err) = self.container.create(None).await {
             if err.http_status() != Some(azure_core::http::StatusCode::Conflict) {
+                error!(
+                    "create container failed: status={:?}, error={:?}",
+                    err.http_status(),
+                    err
+                );
                 return Err(err).context("create container");
             }
         }
