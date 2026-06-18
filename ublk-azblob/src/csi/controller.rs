@@ -130,11 +130,13 @@ impl Controller for ControllerService {
             return Err(Status::invalid_argument("volume name is required"));
         }
 
-        // Size: round the requested bytes up to the 512-byte page-blob alignment.
+        // Size: use required_bytes (minimum size) and round up to 512-byte page-blob alignment.
+        // Per CSI spec, required_bytes is the minimum and limit_bytes is the maximum.
+        // Using required_bytes is more cost-efficient for Azure Page Blobs (billed per allocated byte).
         let requested = req
             .capacity_range
             .as_ref()
-            .map(|c| c.required_bytes.max(c.limit_bytes))
+            .map(|c| c.required_bytes)
             .unwrap_or(0);
         let size = round_up_512(requested.max(0) as u64);
 
