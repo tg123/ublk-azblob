@@ -137,6 +137,11 @@ services:
 volumes:
   k3s-data:
   kubeconfig:
+  kubelet-data:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
 
 networks:
   k3s:
