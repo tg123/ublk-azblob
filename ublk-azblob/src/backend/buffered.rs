@@ -152,11 +152,18 @@ impl BufferedBackend {
                         };
 
                         let force_trigger = if config.force_flush_timeout_secs > 0 {
-                            if let Some(last_flush) = state.last_flush {
-                                last_flush.elapsed() >= force_timeout && has_dirty
-                            } else {
-                                // Never flushed yet, trigger if we have dirty pages
-                                has_dirty && state.last_write.is_some()
+                            // Base the timer on the last flush, or — if we have
+                            // never flushed — on the first write, so a force flush
+                            // only fires once `force_flush_timeout_secs` has
+                            // actually elapsed (not immediately on the first write).
+                            match (state.last_flush, state.last_write) {
+                                (Some(last_flush), _) => {
+                                    last_flush.elapsed() >= force_timeout && has_dirty
+                                }
+                                (None, Some(last_write)) => {
+                                    last_write.elapsed() >= force_timeout && has_dirty
+                                }
+                                (None, None) => false,
                             }
                         } else {
                             false
