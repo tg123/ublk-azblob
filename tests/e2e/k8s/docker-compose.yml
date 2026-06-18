@@ -31,8 +31,8 @@ services:
       - /lib/modules:/lib/modules:ro
       - k3s-data:/var/lib/rancher/k3s
       - kubeconfig:/output
-      # CSI needs kubelet dir - use named volume shared across all k3s nodes
-      - kubelet-data:/var/lib/kubelet
+      # Bind mount host /var/lib/kubelet which is made shared in workflow
+      - /var/lib/kubelet:/var/lib/kubelet:rshared
     environment:
       K3S_TOKEN: "e2e-test-token"
       K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
@@ -60,8 +60,8 @@ services:
     volumes:
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
-      # CSI needs kubelet dir - use named volume shared across all k3s nodes
-      - kubelet-data:/var/lib/kubelet
+      # Bind mount host /var/lib/kubelet which is made shared in workflow
+      - /var/lib/kubelet:/var/lib/kubelet:rshared
     environment:
       K3S_TOKEN: "e2e-test-token"
       K3S_URL: "https://k3s-server:6443"
@@ -137,11 +137,6 @@ services:
 volumes:
   k3s-data:
   kubeconfig:
-  kubelet-data:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
 
 networks:
   k3s:
