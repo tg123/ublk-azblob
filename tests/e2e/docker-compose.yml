@@ -41,6 +41,11 @@ services:
       retries: 30
 
   runner:
+    # A fixed tag so CI can pre-build this image with BuildKit + the GitHub
+    # Actions cache (`docker buildx ... --cache-from/--cache-to type=gha`) and
+    # have `compose up` reuse it without `--build`.  Locally `compose up
+    # --build` still rebuilds it under this tag.
+    image: ublk-azblob-e2e-runner:local
     build:
       context: ../..
       dockerfile: tests/e2e/Dockerfile
@@ -59,6 +64,11 @@ services:
       # Reach Azurite over the compose network rather than via localhost.
       AZURE_STORAGE_ENDPOINT: "http://azurite:10000/devstoreaccount1"
       CARGO_TERM_COLOR: "always"
+      # Persist the cargo registry/git cache on a host path (under the
+      # bind-mounted workspace) so it survives the container and can be picked
+      # up by `actions/cache` in CI.  `target/` already lands in the
+      # bind-mounted /workspace/target, so it is cached the same way.
+      CARGO_HOME: "/workspace/.cargo-home"
     command:
       - bash
       - -c
