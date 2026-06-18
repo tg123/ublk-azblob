@@ -264,8 +264,7 @@ metadata:
   namespace: default
 type: Opaque
 stringData:
-  azurestorageaccountname: devstoreaccount1
-  azurestorageaccountkey: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+  accountKey: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
 "#
     );
     kubectl_apply_stdin(&secret_yaml);
