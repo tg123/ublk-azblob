@@ -315,7 +315,7 @@ fn setup_cluster(cluster: &str, img: &str, here: &Path) -> Option<ClusterGuard> 
         ));
         // Import image to containerd in k3s (bypass kind load)
         log(&format!("importing {img} to k3s containerd"));
-        
+
         // Import to all k3s nodes (server + agent)
         for node in &["k8s-k3s-server-1", "k8s-k3s-agent-1"] {
             log(&format!("importing to {node}"));
