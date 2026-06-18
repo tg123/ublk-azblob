@@ -192,14 +192,20 @@ fn pvc_write_remount_verify() {
 
 /// Test 1: Simple mount, read, write
 fn test_basic_mount_and_recovery() {
-    // ── Preflight: skip gracefully when the environment can't drive ublk ──────
+    // ── Preflight: skip gracefully when the environment can't drive ublk or NBD ──────
     if !is_root() {
         skip_or_fail("must run as root");
         return;
     }
-    if !Path::new("/dev/ublk-control").exists() {
-        skip_or_fail("ublk_drv not loaded (no /dev/ublk-control)");
+    // Check if either ublk or NBD is available
+    let has_ublk = Path::new("/dev/ublk-control").exists();
+    let has_nbd = Path::new("/dev/nbd0").exists();
+    if !has_ublk && !has_nbd {
+        skip_or_fail("neither ublk_drv nor nbd module loaded (no /dev/ublk-control or /dev/nbd0)");
         return;
+    }
+    if !has_ublk {
+        eprintln!("INFO: ublk_drv not available, test will use NBD mode (e2e.values.yaml has node.useNbd: true)");
     }
     let required_tools = if use_existing_cluster() {
         vec!["docker", "kubectl", "helm"]
