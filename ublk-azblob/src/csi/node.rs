@@ -241,6 +241,15 @@ impl Node for NodeService {
                     None
                 };
 
+                // Snapshot existing ublk devices *before* spawning the child so a
+                // fast child that creates /dev/ublkbN before we look isn't already
+                // in the "before" set (which would make it invisible as "new").
+                let ublk_before = if nbd_listen.is_none() {
+                    mount::list_ublk_devices()
+                } else {
+                    Default::default()
+                };
+
                 let mut child = mount::spawn_device(size, &env, nbd_listen.clone())?;
 
                 let device = if let Some(listen_addr) = nbd_listen {
@@ -257,8 +266,7 @@ impl Node for NodeService {
                 } else {
                     // ublk mode: wait for /dev/ublkbN to appear
                     info!("Calling wait_for_new_device for ublk");
-                    let before = mount::list_ublk_devices();
-                    match mount::wait_for_new_device(&before, &mut child, DEVICE_TIMEOUT) {
+                    match mount::wait_for_new_device(&ublk_before, &mut child, DEVICE_TIMEOUT) {
                         Ok(dev) => dev,
                         Err(e) => {
                             mount::signal_pid(child.id(), libc::SIGINT);

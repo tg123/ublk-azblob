@@ -185,6 +185,19 @@ fn skip_or_fail(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// Whether the e2e should drive the volume over NBD (vs. ublk).
+///
+/// Honours the `UBLK_E2E_USE_NBD` env override (`1`/`true` → NBD); otherwise
+/// auto-detects: prefer ublk when `/dev/ublk-control` is present (CI loads
+/// `ublk_drv`), and fall back to NBD where it isn't (e.g. WSL2, which ships
+/// `/dev/nbd*` but no ublk).
+fn use_nbd() -> bool {
+    match std::env::var("UBLK_E2E_USE_NBD") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => !Path::new("/dev/ublk-control").exists(),
+    }
+}
+
 #[test]
 fn pvc_write_remount_verify() {
     test_basic_mount_and_recovery();
@@ -197,16 +210,19 @@ fn test_basic_mount_and_recovery() {
         skip_or_fail("must run as root");
         return;
     }
-    // Check if either ublk or NBD is available
+    // Check that the selected backend's device interface is available.
+    let nbd = use_nbd();
     let has_ublk = Path::new("/dev/ublk-control").exists();
     let has_nbd = Path::new("/dev/nbd0").exists();
-    if !has_ublk && !has_nbd {
-        skip_or_fail("neither ublk_drv nor nbd module loaded (no /dev/ublk-control or /dev/nbd0)");
+    if nbd && !has_nbd {
+        skip_or_fail("NBD mode selected but nbd module not loaded (no /dev/nbd0)");
         return;
     }
-    if !has_ublk {
-        eprintln!("INFO: ublk_drv not available, test will use NBD mode (e2e.values.yaml has node.useNbd: true)");
+    if !nbd && !has_ublk {
+        skip_or_fail("ublk mode selected but ublk_drv not loaded (no /dev/ublk-control)");
+        return;
     }
+    eprintln!("INFO: e2e using {} mode", if nbd { "NBD" } else { "ublk" });
     let required_tools = if use_existing_cluster() {
         vec!["docker", "kubectl", "helm"]
     } else {
@@ -439,7 +455,9 @@ fn deploy_csi_driver_helm(repo: &Path, here: &Path, endpoint: &str) {
     let values_tmp = std::env::temp_dir().join("e2e-patched.values.yaml");
     std::fs::write(&values_tmp, patched).expect("write patched values");
 
-    // helm install
+    // helm install. Override node.useNbd for the selected backend so CI (which
+    // loads ublk_drv) exercises ublk while NBD-only hosts (e.g. WSL2) use NBD.
+    let use_nbd_set = format!("node.useNbd={}", use_nbd());
     run(
         "helm",
         &[
@@ -450,6 +468,8 @@ fn deploy_csi_driver_helm(repo: &Path, here: &Path, endpoint: &str) {
             NS,
             "-f",
             values_tmp.to_str().unwrap(),
+            "--set",
+            &use_nbd_set,
             "--wait",
             "--timeout=180s",
         ],
