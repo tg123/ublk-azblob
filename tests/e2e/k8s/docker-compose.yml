@@ -31,6 +31,11 @@ services:
       - /lib/modules:/lib/modules:ro
       - k3s-data:/var/lib/rancher/k3s
       - kubeconfig:/output
+      # Shared mount for CSI drivers
+      - type: tmpfs
+        target: /var/lib/kubelet
+        tmpfs:
+          size: 1G
     environment:
       K3S_TOKEN: "e2e-test-token"
       K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
