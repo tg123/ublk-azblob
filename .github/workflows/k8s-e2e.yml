@@ -17,6 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Make /var/lib/kubelet a shared mount
+        run: |
+          sudo mkdir -p /var/lib/kubelet
+          sudo mount --make-shared /var/lib/kubelet || true
+          sudo mount --make-rshared / || true
+
       - name: Load ublk_drv kernel module
         run: |
           sudo apt-get update
