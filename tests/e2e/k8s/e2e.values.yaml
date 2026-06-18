@@ -14,6 +14,8 @@ controller:
   # Controller needs endpoint too for provisioning
   # Note: endpoint will be patched by test code
   env:
+    - name: RUST_LOG
+      value: "info"
     - name: AZURE_STORAGE_ACCOUNT
       value: "devstoreaccount1"
     - name: AZURE_STORAGE_KEY
