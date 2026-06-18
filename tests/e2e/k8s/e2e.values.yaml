@@ -30,15 +30,15 @@ node:
     #   value: "http://azurite.kube-system.svc.cluster.local:10000/devstoreaccount1"
     
     # Enable caching for migration testing
-    - name: CSI_MEM_BUFFER_NUM_PAGES
+    - name: UBLK_MAX_DIRTY_PAGES
       value: "256"  # 256 * 4MB = 1GB
-    - name: CSI_MEM_BUFFER_PAGE_SIZE
+    - name: UBLK_PAGE_SIZE
       value: "4194304"  # 4MB
     
     # Flush timeouts
-    - name: CSI_IDLE_FLUSH_SECS
+    - name: UBLK_IDLE_FLUSH_SECS
       value: "15"
-    - name: CSI_FORCE_FLUSH_TIMEOUT_SECS
+    - name: UBLK_FORCE_FLUSH_TIMEOUT_SECS
       value: "600"
 
   # Optional: local disk cache (commented out for basic test)
