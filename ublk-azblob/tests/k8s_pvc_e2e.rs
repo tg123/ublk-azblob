@@ -70,9 +70,11 @@ fn k8s_dir() -> PathBuf {
 fn have(bin: &str) -> bool {
     // `kubectl` has no global `--version` flag (it errors with
     // "unknown flag: --version"); its version subcommand is `version --client`.
+    // `helm` also errors with "unknown flag: --version", use `version` subcommand.
     // `docker`/`kind` accept `--version`.
     let args: &[&str] = match bin {
         "kubectl" => &["version", "--client"],
+        "helm" => &["version"],
         _ => &["--version"],
     };
     Command::new(bin)
