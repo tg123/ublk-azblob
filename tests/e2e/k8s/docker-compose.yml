@@ -45,6 +45,8 @@ services:
       - --disable=traefik,metrics-server,local-storage
       # Add k3s-server to TLS SAN for docker-compose service name
       - --tls-san=k3s-server
+      # Allow CSI drivers to use mount propagation
+      - --kubelet-arg=allowed-unsafe-sysctls=kernel.msg*
     networks:
       - k3s
     healthcheck:
@@ -63,6 +65,11 @@ services:
     volumes:
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
+      # Shared mount for CSI drivers
+      - type: tmpfs
+        target: /var/lib/kubelet
+        tmpfs:
+          size: 1G
     environment:
       K3S_TOKEN: "e2e-test-token"
       K3S_URL: "https://k3s-server:6443"
