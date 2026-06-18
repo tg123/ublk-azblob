@@ -160,6 +160,7 @@ impl Controller for ControllerService {
             pvc_namespace,
             pv_name,
         )?;
+        info!(endpoint = %self.config.endpoint, account = %account, "Building backend for CreateVolume");
         let container = self.container_for(
             &req.parameters,
             &req.secrets,
