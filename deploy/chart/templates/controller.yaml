@@ -57,6 +57,10 @@ spec:
             - "csi"
             - "--role=controller"
             - "--csi-endpoint=unix:///csi/csi.sock"
+          {{- with .Values.controller.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
