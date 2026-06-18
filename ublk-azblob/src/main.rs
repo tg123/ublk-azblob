@@ -233,6 +233,13 @@ enum Command {
         #[arg(long, default_value = "600", env = "UBLK_FORCE_FLUSH_TIMEOUT_SECS")]
         force_flush_timeout_secs: u64,
 
+        /// Optional hard timeout (seconds) on a single flush I/O operation.
+        /// Set to 0 (default) for no cap, so explicit/shutdown flushes can finish
+        /// even with many dirty pages or a slow link. This is independent of
+        /// `--force-flush-timeout-secs` (which only schedules background flushes).
+        #[arg(long, default_value = "0", env = "UBLK_FLUSH_IO_TIMEOUT_SECS")]
+        flush_io_timeout_secs: u64,
+
         /// Serve over the NBD protocol instead of ublk (compatibility mode).
         ///
         /// When set, the device is exposed as an NBD server bound to this
@@ -334,6 +341,7 @@ async fn main() -> anyhow::Result<()> {
             cache_page_size,
             idle_flush_secs,
             force_flush_timeout_secs,
+            flush_io_timeout_secs,
             ref nbd,
         } => {
             let backend = build_azure_backend(&cli, &endpoint)?;
@@ -410,6 +418,7 @@ async fn main() -> anyhow::Result<()> {
                     max_dirty_pages,
                     idle_flush_secs,
                     force_flush_timeout_secs,
+                    flush_io_timeout_secs,
                     "write-back buffer enabled"
                 );
                 BufferedBackend::new(
@@ -419,6 +428,7 @@ async fn main() -> anyhow::Result<()> {
                         max_dirty_pages,
                         idle_flush_secs,
                         force_flush_timeout_secs,
+                        flush_io_timeout_secs,
                     },
                 )
                 .context("configure write-back buffer")?

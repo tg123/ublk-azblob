@@ -155,7 +155,11 @@ globalSecret:
   storageAccount: ""
   storageContainer: ""
   
-  # Optional: Custom endpoint (for Azurite or sovereign clouds)
+  # Optional: Custom endpoint (for Azurite or sovereign clouds).
+  # Use the `%s` template for the account name, e.g.
+  #   http://%s.blob.localhost:10000/   or   https://%s.blob.core.usgovcloudapi.net/
+  # `%s` is replaced with the storage account so it becomes the host's first DNS
+  # label (subdomain-style). Leave empty for standard Azure public cloud.
   endpoint: ""
 
 # Per-namespace secret configuration

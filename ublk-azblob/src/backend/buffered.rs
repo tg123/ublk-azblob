@@ -33,7 +33,14 @@ pub struct BufferedConfig {
     pub idle_flush_secs: u64,
     /// Force flush timeout in seconds: maximum time since last successful flush before
     /// forcing a flush regardless of activity. Set to 0 for no timeout. Reset by idle flushes.
+    ///
+    /// This is purely a *scheduling interval* for the background task — it does
+    /// not bound how long an individual flush may take (see `flush_io_timeout_secs`).
     pub force_flush_timeout_secs: u64,
+    /// Optional hard timeout (in seconds) on a single flush I/O operation.
+    /// Set to 0 (the default) for no cap, so explicit and shutdown flushes can
+    /// run to completion even when there are many dirty pages or a slow link.
+    pub flush_io_timeout_secs: u64,
 }
 
 impl Default for BufferedConfig {
@@ -43,6 +50,7 @@ impl Default for BufferedConfig {
             max_dirty_pages: 64,           // 256 MiB total
             idle_flush_secs: 15,           // flush after 15s idle
             force_flush_timeout_secs: 600, // force flush after 10 minutes
+            flush_io_timeout_secs: 0,      // no per-flush I/O cap by default
         }
     }
 }
@@ -105,7 +113,10 @@ impl BufferedBackend {
 
         // Spawn idle flush and force flush task if configured
         if config.idle_flush_secs > 0 || config.force_flush_timeout_secs > 0 {
-            let backend_clone = backend.clone();
+            // Hold a Weak reference so this task does not keep the backend alive:
+            // when the last owner drops the `Arc`, `upgrade()` returns `None` and
+            // the task exits instead of leaking the backend in an infinite loop.
+            let backend_weak = Arc::downgrade(&backend);
             let check_interval = if config.idle_flush_secs > 0 {
                 Duration::from_secs(config.idle_flush_secs.max(1) / 2)
             } else {
@@ -117,6 +128,11 @@ impl BufferedBackend {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(check_interval).await;
+
+                    // Stop once the backend has been dropped.
+                    let Some(backend_clone) = backend_weak.upgrade() else {
+                        break;
+                    };
 
                     let (should_idle_flush, should_force_flush) = {
                         let state = backend_clone.state.lock().await;
@@ -253,12 +269,12 @@ impl BufferedBackend {
     /// but only if the page was not modified again during the write (detected
     /// via its sequence number).  This guarantees no dirty data is lost.
     ///
-    /// If force_flush_timeout_secs is configured, the entire flush operation
+    /// If `flush_io_timeout_secs` is configured, the entire flush operation
     /// must complete within that timeout or it will be aborted.
     async fn flush_indices(&self, indices: &[u64]) -> anyhow::Result<()> {
         let page_size = self.config.page_size;
-        let timeout = if self.config.force_flush_timeout_secs > 0 {
-            Some(Duration::from_secs(self.config.force_flush_timeout_secs))
+        let timeout = if self.config.flush_io_timeout_secs > 0 {
+            Some(Duration::from_secs(self.config.flush_io_timeout_secs))
         } else {
             None
         };
@@ -320,8 +336,8 @@ impl BufferedBackend {
                 Ok(result) => result,
                 Err(_) => {
                     bail!(
-                        "flush timed out after {}s (force_flush_timeout_secs exceeded)",
-                        self.config.force_flush_timeout_secs
+                        "flush timed out after {}s (flush_io_timeout_secs exceeded)",
+                        self.config.flush_io_timeout_secs
                     );
                 }
             }
@@ -593,6 +609,7 @@ mod tests {
                 max_dirty_pages: max_dirty,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
+                flush_io_timeout_secs: 0,
             },
         )
         .unwrap()
@@ -627,6 +644,7 @@ mod tests {
                 max_dirty_pages: 4,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
+                flush_io_timeout_secs: 0,
             },
         )
         .unwrap();
@@ -654,6 +672,7 @@ mod tests {
                 max_dirty_pages: 2,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
+                flush_io_timeout_secs: 0,
             },
         )
         .unwrap();
@@ -708,6 +727,7 @@ mod tests {
                     max_dirty_pages: 4,
                     idle_flush_secs: 0,
                     force_flush_timeout_secs: 0,
+                    flush_io_timeout_secs: 0,
                 },
             )
             .unwrap(),

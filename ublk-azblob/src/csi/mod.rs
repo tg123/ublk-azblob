@@ -267,20 +267,13 @@ pub fn build_backend(
         );
     };
 
-    // Build the account-specific endpoint URL
-    // For standard Azure, construct from account: https://{account}.blob.core.windows.net/
-    // For custom endpoints (Azurite, sovereign clouds):
-    //   - Template format with %s: http://%s.blob.localhost:10000/ → replace %s with account
-    //   - Path-style with account: http://azurite:10000/devstoreaccount1 → use as-is
-    //   - Generic endpoint: use standard subdomain format
+    // Build the account-specific endpoint URL.
+    // - Template form `http://%s.host/` → substitute `%s` with the account name
+    //   (subdomain-style; covers Azurite and sovereign clouds).
+    // - Otherwise build the standard Azure endpoint from the account.
     let endpoint = if config.endpoint.contains("%s") {
-        // Template format - substitute %s with account name
         config.endpoint.replace("%s", account)
-    } else if config.endpoint.contains(account) {
-        // Custom endpoint already has account name (e.g., Azurite path-style: http://127.0.0.1:10000/devstoreaccount1)
-        config.endpoint.clone()
     } else {
-        // Standard Azure or generic endpoint - construct account-specific URL
         format!("https://{account}.blob.core.windows.net/")
     };
 

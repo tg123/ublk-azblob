@@ -196,10 +196,11 @@ impl Controller for ControllerService {
         volume_context.insert("blob".to_string(), blob.clone());
         volume_context.insert("account".to_string(), account.clone());
 
-        // Build account-specific endpoint for the node
-        // Standard Azure: construct from account; Custom (Azurite): use config if has account
-        let endpoint = if self.config.endpoint.contains(account.as_str()) {
-            self.config.endpoint.clone()
+        // Build the account-specific endpoint for the node.
+        // Template form `http://%s.host/` substitutes the account name;
+        // otherwise build the standard Azure endpoint from the account.
+        let endpoint = if self.config.endpoint.contains("%s") {
+            self.config.endpoint.replace("%s", account.as_str())
         } else {
             format!("https://{account}.blob.core.windows.net/")
         };

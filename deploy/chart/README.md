@@ -140,7 +140,7 @@ The following table lists the configurable parameters of the chart and their def
 | `globalSecret.sharedKey.accountKey` | SharedKey account key | `""` |
 | `globalSecret.storageAccount` | Storage account name | `""` |
 | `globalSecret.storageContainer` | Storage container name | `""` |
-| `globalSecret.endpoint` | Custom endpoint (Azurite/sovereign clouds) | `""` |
+| `globalSecret.endpoint` | Custom endpoint with `%s` account template (Azurite/sovereign clouds), e.g. `http://%s.blob.localhost:10000/` | `""` |
 
 ### Per-Namespace Secret Configuration (deploymentMode: per-namespace)
 
