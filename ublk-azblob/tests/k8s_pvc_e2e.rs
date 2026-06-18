@@ -254,6 +254,22 @@ fn test_basic_mount_and_recovery() {
     let endpoint = format!("http://azurite.{NS}.svc.cluster.local:10000/devstoreaccount1");
     deploy_csi_driver_helm(&repo, &here, &endpoint);
 
+    // ── Create secret in default namespace for PVC provisioning ───────────────
+    log("creating azblob-csi-secret in default namespace");
+    let secret_yaml = format!(
+        r#"apiVersion: v1
+kind: Secret
+metadata:
+  name: azblob-csi-secret
+  namespace: default
+type: Opaque
+stringData:
+  azurestorageaccountname: devstoreaccount1
+  azurestorageaccountkey: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+"#
+    );
+    kubectl_apply_stdin(&secret_yaml);
+
     // ── Run the PVC write/remount/verify cycle ────────────────────────────────
     log("creating PVC");
     kubectl_apply(&repo.join("deploy/example/pvc.yaml"));
