@@ -21,6 +21,26 @@ deferred to follow-up PRs to keep the diff reviewable.
     path installs no signal handler" is stale — `run_nbd_target` flushes on
     SIGINT/SIGTERM.)
 
+## Bugs found in review (not yet fixed)
+
+- [ ] **Coordination opt-in never reaches the node** (`csi/controller.rs` ~195).
+      `CreateVolume` builds `volume_context` with container/blob/account/endpoint/
+      size/fsType but not the `coordination` / `leaseNamespace` /
+      `recoveryTimeoutSecs` keys, so the node's `child_env` never enables the
+      cluster/blob lease even when the StorageClass opts in. Propagate those
+      StorageClass parameters into `volume_context`.
+- [ ] **Blob lease is not threaded into the device data path**
+      (`coordination/mod.rs` ~226). The lease id is only used by the renewal loop;
+      the device serves I/O through a separate `AzurePageBlobBackend` whose writes
+      don't carry the lease condition, leaving a split-brain write window if the
+      lease is broken. Condition writes/flush on the held lease (or document the
+      guarantee precisely).
+- [ ] **Long-lived child's stdout/stderr are piped but never drained**
+      (`csi/mount.rs` ~99 / `spawn_device`). On the success path neither pipe is
+      read, so a chatty `ublk-azblob run` child can fill the 64 KiB pipe buffer
+      and block on write, hanging the device. Either inherit the streams (so they
+      flow to the node plugin's logs) or drain them on a background thread.
+
 ## CI
 
 - [ ] **Merge `e2e` and `k8s-e2e` workflows so the image/binary is built once.**
