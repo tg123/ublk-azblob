@@ -274,6 +274,35 @@ stringData:
     log("creating PVC");
     kubectl_apply(&repo.join("deploy/example/pvc.yaml"));
 
+    // Debug: Check CSI controller logs before creating writer
+    log("checking CSI controller logs");
+    let _ = try_run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "logs",
+            "-l",
+            "app=csi-ublk-azblob-controller",
+            "-c",
+            "azblob",
+            "--tail=50",
+        ],
+    );
+    let _ = try_run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "logs",
+            "-l",
+            "app=csi-ublk-azblob-controller",
+            "-c",
+            "csi-provisioner",
+            "--tail=50",
+        ],
+    );
+
     log("running writer Job");
     kubectl_apply(&here.join("writer.yaml"));
     if !try_run(
@@ -649,11 +678,45 @@ spec:
 
 /// Best-effort cluster diagnostics on failure (mirrors the bash failure dumps).
 fn dump_diagnostics(app: &str) {
+    log(&format!("=== diagnostics for {app} ==="));
     let _ = try_run("kubectl", &["describe", &format!("job/{app}")]);
     let _ = try_run(
         "kubectl",
         &["logs", "-l", &format!("app={app}"), "--tail=200"],
     );
+    
+    // Dump CSI controller logs (both containers)
+    log("=== CSI controller logs (azblob) ===");
+    let _ = try_run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "logs",
+            "-l",
+            "app=csi-ublk-azblob-controller",
+            "-c",
+            "azblob",
+            "--tail=200",
+        ],
+    );
+    log("=== CSI controller logs (csi-provisioner) ===");
+    let _ = try_run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "logs",
+            "-l",
+            "app=csi-ublk-azblob-controller",
+            "-c",
+            "csi-provisioner",
+            "--tail=200",
+        ],
+    );
+    
+    // Dump CSI node logs
+    log("=== CSI node logs ===");
     let _ = try_run(
         "kubectl",
         &[
@@ -667,4 +730,9 @@ fn dump_diagnostics(app: &str) {
             "--tail=200",
         ],
     );
+    
+    // Dump PVC/PV status
+    log("=== PVC/PV status ===");
+    let _ = try_run("kubectl", &["get", "pvc,pv", "-o", "wide"]);
+    let _ = try_run("kubectl", &["describe", "pvc"]);
 }
