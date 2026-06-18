@@ -315,27 +315,31 @@ fn setup_cluster(cluster: &str, img: &str, here: &Path) -> Option<ClusterGuard> 
         ));
         // Import image to containerd in k3s (bypass kind load)
         log(&format!("importing {img} to k3s containerd"));
-        // Save docker image as tarball and pipe to ctr import
-        let docker_save = Command::new("docker")
-            .args(["save", img])
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("docker save");
-        let status = Command::new("docker")
-            .args([
-                "exec",
-                "-i",
-                "k8s-k3s-server-1", // docker-compose service name
-                "ctr",
-                "--namespace=k8s.io",
-                "images",
-                "import",
-                "-",
-            ])
-            .stdin(docker_save.stdout.unwrap())
-            .status()
-            .expect("ctr import");
-        assert!(status.success(), "failed to import image to k3s");
+        
+        // Import to all k3s nodes (server + agent)
+        for node in &["k8s-k3s-server-1", "k8s-k3s-agent-1"] {
+            log(&format!("importing to {node}"));
+            let docker_save = Command::new("docker")
+                .args(["save", img])
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("docker save");
+            let status = Command::new("docker")
+                .args([
+                    "exec",
+                    "-i",
+                    node,
+                    "ctr",
+                    "--namespace=k8s.io",
+                    "images",
+                    "import",
+                    "-",
+                ])
+                .stdin(docker_save.stdout.unwrap())
+                .status()
+                .expect("ctr import");
+            assert!(status.success(), "failed to import image to {node}");
+        }
         None // no cleanup guard for external cluster
     } else {
         log(&format!("creating kind cluster {cluster}"));
