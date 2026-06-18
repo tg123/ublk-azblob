@@ -587,7 +587,7 @@ spec:
 
     log(&format!("recreating deployment on node {}", nodes[1]));
     kubectl_apply_stdin(&deployment_yaml2);
-    
+
     // Wait for pod to be ready
     if !try_run(
         "kubectl",
@@ -619,7 +619,15 @@ spec:
     log("✓ Pod migration test PASSED: data survived node migration");
 
     // Cleanup
-    run("kubectl", &["delete", "deployment", "azblob-migration-test", "--wait=true"]);
+    run(
+        "kubectl",
+        &[
+            "delete",
+            "deployment",
+            "azblob-migration-test",
+            "--wait=true",
+        ],
+    );
 }
 
 /// Render the driver config map (endpoint + container).

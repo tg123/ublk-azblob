@@ -37,10 +37,8 @@ services:
       K3S_KUBECONFIG_MODE: "644"
     command:
       - server
-      - --disable=traefik,metrics-server
+      - --disable=traefik,metrics-server,local-storage
       - --kube-apiserver-arg=feature-gates=CSINodeExpandSecret=true
-      # Allow pods to schedule on server (for single-node fallback)
-      - --no-deploy=local-storage
     networks:
       - k3s
     healthcheck:
