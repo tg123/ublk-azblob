@@ -1,6 +1,9 @@
 # Helm values for e2e testing with k3s
 # This configures the CSI driver for testing with Azurite + NBD mode
 
+# Override the default Helm name (csi-ublk-azblob-ublk-azblob-csi)
+fullnameOverride: csi-ublk-azblob
+
 image:
   repository: ublk-azblob
   tag: e2e
