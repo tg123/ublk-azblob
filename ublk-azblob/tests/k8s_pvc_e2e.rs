@@ -257,8 +257,8 @@ fn test_basic_mount_and_recovery() {
     );
 
     // ── Deploy CSI driver using Helm ──────────────────────────────────────────
-    // Azurite endpoint: just the service URL, SDK will append /account/container
-    let endpoint = format!("http://azurite.{NS}.svc.cluster.local:10000");
+    // Azurite endpoint with account in path (required for SharedKey double-account canonicalization)
+    let endpoint = format!("http://azurite.{NS}.svc.cluster.local:10000/devstoreaccount1");
     deploy_csi_driver_helm(&repo, &here, &endpoint);
 
     // ── Create secret in default namespace for PVC provisioning ───────────────
