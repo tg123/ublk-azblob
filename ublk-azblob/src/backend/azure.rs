@@ -17,7 +17,7 @@ use azure_storage_blob::{
     BlobContainerClient,
 };
 use bytes::Bytes;
-use tracing::{instrument, trace};
+use tracing::{error, instrument, trace};
 
 /// Azure Page Blob backend.
 ///

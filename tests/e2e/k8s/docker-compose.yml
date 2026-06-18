@@ -12,9 +12,20 @@
 # Requirements on the **host** (not inside this compose stack):
 #   - Docker daemon running at /var/run/docker.sock
 #   - ublk_drv loaded: `sudo modprobe ublk_drv`
-#   - /var/lib/kubelet must be a shared mount for CSI mount propagation
+#   - A shared mount for CSI mount propagation (CI uses /var/lib/kubelet, local can use /tmp)
 #
-# Usage:
+# Usage (local with /tmp):
+#   sudo modprobe ublk_drv
+#   KUBELET_DIR=/tmp/kubelet-test
+#   sudo mkdir -p $KUBELET_DIR
+#   sudo mount -t tmpfs tmpfs $KUBELET_DIR
+#   sudo mount --make-shared $KUBELET_DIR
+#   KUBELET_DIR=$KUBELET_DIR docker compose -f tests/e2e/k8s/docker-compose.yml up --build \
+#     --abort-on-container-exit --exit-code-from runner
+#   docker compose -f tests/e2e/k8s/docker-compose.yml down -v
+#   sudo umount $KUBELET_DIR
+#
+# Usage (CI with /var/lib/kubelet):
 #   sudo modprobe ublk_drv
 #   sudo mkdir -p /var/lib/kubelet
 #   sudo mount -t tmpfs tmpfs /var/lib/kubelet
@@ -35,9 +46,10 @@ services:
       - /lib/modules:/lib/modules:ro
       - k3s-data:/var/lib/rancher/k3s
       - kubeconfig:/output
-      # Bind mount host /var/lib/kubelet with :rshared propagation
-      # Host must have /var/lib/kubelet as a shared mount (see Usage above)
-      - /var/lib/kubelet:/var/lib/kubelet:rshared
+      # Bind mount host kubelet dir with :rshared propagation
+      # Defaults to /var/lib/kubelet, can be overridden with KUBELET_DIR env var
+      # Host path must be a shared mount (see Usage above)
+      - ${KUBELET_DIR:-/var/lib/kubelet}:/var/lib/kubelet:rshared
     environment:
       K3S_TOKEN: "e2e-test-token"
       K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
@@ -65,9 +77,10 @@ services:
     volumes:
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
-      # Bind mount host /var/lib/kubelet with :rshared propagation
-      # Host must have /var/lib/kubelet as a shared mount (see Usage above)
-      - /var/lib/kubelet:/var/lib/kubelet:rshared
+      # Bind mount host kubelet dir with :rshared propagation
+      # Defaults to /var/lib/kubelet, can be overridden with KUBELET_DIR env var
+      # Host path must be a shared mount (see Usage above)
+      - ${KUBELET_DIR:-/var/lib/kubelet}:/var/lib/kubelet:rshared
     environment:
       K3S_TOKEN: "e2e-test-token"
       K3S_URL: "https://k3s-server:6443"
