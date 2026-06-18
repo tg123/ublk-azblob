@@ -684,7 +684,7 @@ fn dump_diagnostics(app: &str) {
         "kubectl",
         &["logs", "-l", &format!("app={app}"), "--tail=200"],
     );
-    
+
     // Dump CSI controller logs (both containers)
     log("=== CSI controller logs (azblob) ===");
     let _ = try_run(
@@ -714,7 +714,7 @@ fn dump_diagnostics(app: &str) {
             "--tail=200",
         ],
     );
-    
+
     // Dump CSI node logs
     log("=== CSI node logs ===");
     let _ = try_run(
@@ -730,7 +730,7 @@ fn dump_diagnostics(app: &str) {
             "--tail=200",
         ],
     );
-    
+
     // Dump PVC/PV status
     log("=== PVC/PV status ===");
     let _ = try_run("kubectl", &["get", "pvc,pv", "-o", "wide"]);
