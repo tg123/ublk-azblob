@@ -541,8 +541,16 @@ spec:
     ));
 
     // Delete pod to trigger NodeUnpublishVolume
-    log(&format!("deleting pod (will trigger graceful shutdown and flush)"));
-    run("kubectl", &["delete", "deployment", "azblob-migration-test", "--wait=true"]);
+    log("deleting pod (will trigger graceful shutdown and flush)");
+    run(
+        "kubectl",
+        &[
+            "delete",
+            "deployment",
+            "azblob-migration-test",
+            "--wait=true",
+        ],
+    );
 
     // Recreate deployment on different node
     let deployment_yaml2 = format!(

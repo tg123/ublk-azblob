@@ -38,7 +38,6 @@ services:
     command:
       - server
       - --disable=traefik,metrics-server,local-storage
-      - --kube-apiserver-arg=feature-gates=CSINodeExpandSecret=true
       # Add k3s-server to TLS SAN for docker-compose service name
       - --tls-san=k3s-server
     networks:
