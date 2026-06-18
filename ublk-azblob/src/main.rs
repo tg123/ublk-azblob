@@ -51,6 +51,14 @@ struct Cli {
     #[arg(long, env = "AZURE_STORAGE_BLOB")]
     blob: String,
 
+    /// Target a specific blob *snapshot* (the `x-ms-snapshot` timestamp).
+    ///
+    /// A snapshot is an immutable, point-in-time view of the blob.  Selecting a
+    /// snapshot implies read-only mode: the device is exposed read-only and all
+    /// write/discard operations are rejected.
+    #[arg(long, env = "AZURE_STORAGE_SNAPSHOT")]
+    snapshot: Option<String>,
+
     /// Azure Storage service endpoint URL.
     ///
     /// Defaults to `https://<account>.blob.core.windows.net/`.
@@ -95,6 +103,14 @@ enum Command {
         /// Create (or overwrite) the page blob before starting the device.
         #[arg(long)]
         create: bool,
+
+        /// Expose the device read-only.
+        ///
+        /// The ublk device / NBD export is advertised read-only and every
+        /// write, discard, and write-zeroes request is rejected.  Implied when
+        /// `--snapshot` is set.
+        #[arg(long, env = "UBLK_READ_ONLY")]
+        read_only: bool,
 
         /// Number of io_uring queues.
         #[arg(long, default_value = "1")]
@@ -180,15 +196,21 @@ async fn main() -> anyhow::Result<()> {
     let container_client = auth::build_container_client(&endpoint, &cli.container, &auth)
         .context("build container client")?;
 
-    let backend: Arc<dyn BlobBackend> = Arc::new(AzurePageBlobBackend::new(
-        container_client,
-        cli.blob.clone(),
-    ));
+    let azure_backend = AzurePageBlobBackend::new(container_client, cli.blob.clone());
+    let azure_backend = match &cli.snapshot {
+        Some(snapshot) => {
+            info!(blob = %cli.blob, snapshot = %snapshot, "targeting blob snapshot (read-only)");
+            azure_backend.with_snapshot(snapshot.clone())
+        }
+        None => azure_backend,
+    };
+    let backend: Arc<dyn BlobBackend> = Arc::new(azure_backend);
 
     match cli.command {
         Command::Run {
             size,
             create,
+            read_only,
             nr_queues,
             queue_depth,
             id,
@@ -198,7 +220,17 @@ async fn main() -> anyhow::Result<()> {
             cache_page_size,
             nbd,
         } => {
+            // A snapshot is immutable, so selecting one forces read-only mode.
+            let read_only = read_only || cli.snapshot.is_some();
+            if read_only {
+                info!("read-only mode: writes, discards, and creation are disabled");
+            }
             if create {
+                if read_only {
+                    anyhow::bail!(
+                        "--create cannot be used in read-only mode (--read-only/--snapshot)"
+                    );
+                }
                 info!(size, blob = %cli.blob, "creating page blob");
                 backend.create(size).await.context("create page blob")?;
             }
@@ -241,8 +273,13 @@ async fn main() -> anyhow::Result<()> {
                 backend
             };
 
-            // Wrap with write-back buffer if page_size > 0.
-            let backend: Arc<dyn BlobBackend> = if page_size > 0 {
+            // Wrap with write-back buffer if page_size > 0.  The buffer only
+            // serves to batch writes, so it is skipped entirely in read-only
+            // mode where no writes ever reach the backend.
+            let backend: Arc<dyn BlobBackend> = if read_only {
+                info!("write-through mode (read-only)");
+                backend
+            } else if page_size > 0 {
                 info!(page_size, max_dirty_pages, "write-back buffer enabled");
                 Arc::new(
                     BufferedBackend::new(
@@ -265,10 +302,11 @@ async fn main() -> anyhow::Result<()> {
                 nr_queues,
                 queue_depth,
                 id,
+                read_only,
             };
             if let Some(addr) = nbd {
                 info!(addr = %addr, "starting NBD compatibility server");
-                nbd_target::run_nbd_target(backend, &addr, actual_size)
+                nbd_target::run_nbd_target(backend, &addr, actual_size, read_only)
                     .await
                     .context("nbd target")?;
             } else {

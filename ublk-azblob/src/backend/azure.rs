@@ -10,7 +10,7 @@ use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use azure_storage_blob::{
     models::{BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders, HttpRange},
-    BlobContainerClient,
+    BlobClient, BlobContainerClient,
 };
 use bytes::Bytes;
 use tracing::{instrument, trace};
@@ -25,6 +25,10 @@ use tracing::{instrument, trace};
 pub struct AzurePageBlobBackend {
     container: BlobContainerClient,
     blob_name: String,
+    /// Optional snapshot ID (`x-ms-snapshot` timestamp).  When set, every
+    /// operation targets the immutable snapshot rather than the live blob, so
+    /// the backend is effectively read-only.
+    snapshot: Option<String>,
 }
 
 impl AzurePageBlobBackend {
@@ -37,6 +41,29 @@ impl AzurePageBlobBackend {
         Self {
             container,
             blob_name: blob_name.into(),
+            snapshot: None,
+        }
+    }
+
+    /// Target a specific blob snapshot.
+    ///
+    /// A blob snapshot is an immutable, read-only view of the blob taken at a
+    /// point in time; mutating operations against it are rejected by Azure.
+    /// Callers should pair this with a read-only mount.
+    pub fn with_snapshot(mut self, snapshot: impl Into<String>) -> Self {
+        self.snapshot = Some(snapshot.into());
+        self
+    }
+
+    /// Build a `BlobClient` for the target blob, scoped to the configured
+    /// snapshot when one is set.
+    fn blob_client(&self) -> anyhow::Result<BlobClient> {
+        let client = self.container.blob_client(&self.blob_name);
+        match &self.snapshot {
+            Some(snapshot) => client
+                .with_snapshot(snapshot)
+                .with_context(|| format!("target snapshot '{snapshot}'")),
+            None => Ok(client),
         }
     }
 }
@@ -45,6 +72,9 @@ impl AzurePageBlobBackend {
 impl BlobBackend for AzurePageBlobBackend {
     #[instrument(skip(self), fields(blob = %self.blob_name))]
     async fn create(&self, size: u64) -> anyhow::Result<()> {
+        if self.snapshot.is_some() {
+            bail!("cannot create: backend targets a read-only blob snapshot");
+        }
         if size == 0 || !size.is_multiple_of(512) {
             bail!("size must be a non-zero multiple of 512 bytes, got {size}");
         }
@@ -73,7 +103,7 @@ impl BlobBackend for AzurePageBlobBackend {
         if !len.is_multiple_of(512) {
             bail!("len {len} is not 512-byte aligned");
         }
-        let blob_client = self.container.blob_client(&self.blob_name);
+        let blob_client = self.blob_client()?;
         trace!(offset, len, "downloading range");
         let opts = BlobClientDownloadOptions {
             range: Some(HttpRange::new(offset, len)),
@@ -95,6 +125,9 @@ impl BlobBackend for AzurePageBlobBackend {
 
     #[instrument(skip(self, data), fields(blob = %self.blob_name, offset, len = data.len()))]
     async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+        if self.snapshot.is_some() {
+            bail!("cannot write: backend targets a read-only blob snapshot");
+        }
         if !offset.is_multiple_of(512) {
             bail!("offset {offset} is not 512-byte aligned");
         }
@@ -125,6 +158,9 @@ impl BlobBackend for AzurePageBlobBackend {
 
     #[instrument(skip(self), fields(blob = %self.blob_name, offset, len))]
     async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+        if self.snapshot.is_some() {
+            bail!("cannot clear: backend targets a read-only blob snapshot");
+        }
         if !offset.is_multiple_of(512) {
             bail!("offset {offset} is not 512-byte aligned");
         }
@@ -155,7 +191,7 @@ impl BlobBackend for AzurePageBlobBackend {
 
     #[instrument(skip(self), fields(blob = %self.blob_name))]
     async fn size(&self) -> anyhow::Result<u64> {
-        let blob_client = self.container.blob_client(&self.blob_name);
+        let blob_client = self.blob_client()?;
         let props = blob_client
             .get_properties(None)
             .await

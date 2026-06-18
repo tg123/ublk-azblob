@@ -40,6 +40,8 @@ pub struct UblkConfig {
     pub queue_depth: u16,
     /// Device id to request (`-1` lets the kernel auto-allocate).
     pub id: i32,
+    /// Expose the device read-only (kernel rejects writes with `EROFS`).
+    pub read_only: bool,
 }
 
 impl Default for UblkConfig {
@@ -50,6 +52,7 @@ impl Default for UblkConfig {
             nr_queues: 1,
             queue_depth: 64,
             id: -1,
+            read_only: false,
         }
     }
 }
@@ -164,6 +167,7 @@ fn run_ublk_target_blocking(
         nr_queues = cfg.nr_queues,
         queue_depth = cfg.queue_depth,
         id = cfg.id,
+        read_only = cfg.read_only,
         "starting ublk target"
     );
 
@@ -178,6 +182,7 @@ fn run_ublk_target_blocking(
 
     let dev_size = cfg.dev_size;
     let block_size = cfg.block_size;
+    let read_only = cfg.read_only;
     if block_size < 512 || !block_size.is_multiple_of(512) || !block_size.is_power_of_two() {
         anyhow::bail!(
             "block_size ({block_size}) must be a power of two that is >= 512 and a multiple of 512"
@@ -192,6 +197,11 @@ fn run_ublk_target_blocking(
         // shift for `block_size`.
         dev.set_default_params(dev_size);
         dev.tgt.params.basic.logical_bs_shift = block_size.trailing_zeros() as u8;
+        // In read-only mode advertise UBLK_ATTR_READ_ONLY so the kernel marks
+        // /dev/ublkbN read-only and rejects writes with EROFS.
+        if read_only {
+            dev.tgt.params.basic.attrs |= sys::UBLK_ATTR_READ_ONLY;
+        }
         Ok(())
     };
 
