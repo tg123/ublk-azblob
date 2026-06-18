@@ -27,6 +27,10 @@ spec:
     spec:
       serviceAccountName: {{ include "ublk-azblob-csi.node.serviceAccountName" . }}
       hostPID: true
+      {{- with .Values.node.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.node.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

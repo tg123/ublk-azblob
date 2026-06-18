@@ -257,8 +257,11 @@ fn test_basic_mount_and_recovery() {
     );
 
     // ── Deploy CSI driver using Helm ──────────────────────────────────────────
-    // Azurite endpoint with account in path (required for SharedKey double-account canonicalization)
-    let endpoint = format!("http://azurite.{NS}.svc.cluster.local:10000/devstoreaccount1");
+    // Subdomain-style endpoint: http://<account>.azurite.<ns>.svc.cluster.local:10000/
+    // The CSI pods resolve this via hostAliases (see e2e.values.yaml) pointing at
+    // Azurite's fixed ClusterIP. This mirrors how real Azure uses <account>.blob.* and
+    // keeps SharedKey canonicalization single-account (no /account/account double path).
+    let endpoint = format!("http://%s.azurite.{NS}.svc.cluster.local:10000/");
     deploy_csi_driver_helm(&repo, &here, &endpoint);
 
     // ── Create secret in default namespace for PVC provisioning ───────────────
@@ -543,15 +546,15 @@ spec:
 
     log(&format!("creating deployment on node {}", nodes[0]));
     kubectl_apply_stdin(&deployment_yaml);
-    // Wait for pod to be ready
+    // Wait for the deployment to roll out. Use `rollout status` (not
+    // `kubectl wait` on a label) so the wait tracks only this deployment's
+    // ReplicaSet and is not tripped up by old/terminating pods sharing the label.
     if !try_run(
         "kubectl",
         &[
-            "wait",
-            "--for=condition=Ready",
-            "pod",
-            "-l",
-            "app=azblob-migration-test",
+            "rollout",
+            "status",
+            "deployment/azblob-migration-test",
             "--timeout=180s",
         ],
     ) {
@@ -641,16 +644,18 @@ spec:
     log(&format!("recreating deployment on node {}", nodes[1]));
     kubectl_apply_stdin(&deployment_yaml2);
 
-    // Wait for pod to be ready
+    // Wait for the migrated deployment to roll out on the new node. Use
+    // `rollout status` so the wait follows only the new ReplicaSet and isn't
+    // tripped up by the old pod (which may still be terminating and shares the
+    // `app=azblob-migration-test` label, causing `kubectl wait` to error when it
+    // disappears mid-wait).
     if !try_run(
         "kubectl",
         &[
-            "wait",
-            "--for=condition=Ready",
-            "pod",
-            "-l",
-            "app=azblob-migration-test",
-            "--timeout=180s",
+            "rollout",
+            "status",
+            "deployment/azblob-migration-test",
+            "--timeout=240s",
         ],
     ) {
         dump_diagnostics("azblob-migration-test");

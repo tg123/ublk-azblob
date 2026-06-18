@@ -22,6 +22,10 @@ spec:
         {{- include "ublk-azblob-csi.controller.labels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "ublk-azblob-csi.controller.serviceAccountName" . }}
+      {{- with .Values.controller.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

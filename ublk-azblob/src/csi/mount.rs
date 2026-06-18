@@ -5,12 +5,35 @@
 
 use std::collections::HashSet;
 use std::io::Read;
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
 use tracing::{info, warn};
+
+/// Find a free TCP port on `host` at or after `start`, scanning up to `span`
+/// candidates. Used to give every NBD-mode volume its own listen port so a
+/// second volume (or a remount that races a still-flushing previous server) on
+/// the same node does not fail with "Address already in use". The caller is
+/// expected to hold a lock and spawn the NBD server (which binds the port)
+/// before releasing it, so the brief window between probe and bind is safe.
+pub fn find_free_port(host: &str, start: u16, span: u16) -> anyhow::Result<u16> {
+    for offset in 0..span {
+        let port = match start.checked_add(offset) {
+            Some(p) => p,
+            None => break,
+        };
+        if TcpListener::bind((host, port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    bail!(
+        "no free NBD port in {host}:{start}..{}",
+        start.saturating_add(span)
+    );
+}
 
 /// Return the set of currently-present `/dev/ublkbN` device nodes.
 pub fn list_ublk_devices() -> HashSet<String> {
@@ -202,25 +225,38 @@ pub fn wait_and_connect_nbd(
         bail!("nbd-client failed: {stderr}");
     }
 
-    // Verify the device is now connected
+    // Verify the device is now connected *and* the kernel has propagated a
+    // non-zero size. nbd-client returns as soon as it has handed the socket to
+    // the kernel, but `/dev/nbdN`'s size is published a moment later; running
+    // mkfs too early fails with "Device size reported to be zero". Poll
+    // `blockdev --getsize64` until it reports a non-zero size.
+    let mut last_size: u64 = 0;
     while Instant::now() < deadline {
         if Path::new(&nbd_dev).exists() {
-            // Additional check: see if it's actually connected (has size)
             if let Ok(output) = Command::new("blockdev")
                 .arg("--getsize64")
                 .arg(&nbd_dev)
                 .output()
             {
                 if output.status.success() {
-                    info!(device = %nbd_dev, "NBD device connected");
-                    return Ok(nbd_dev);
+                    last_size = String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    if last_size > 0 {
+                        info!(device = %nbd_dev, size = last_size, "NBD device connected");
+                        return Ok(nbd_dev);
+                    }
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    bail!("NBD device {} did not become ready", nbd_dev);
+    bail!(
+        "NBD device {} did not report a non-zero size (last={last_size}) before timeout",
+        nbd_dev
+    );
 }
 
 /// True if `dev` already carries a recognised filesystem (via `blkid`).

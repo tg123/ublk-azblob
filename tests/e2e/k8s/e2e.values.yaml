@@ -11,6 +11,12 @@ image:
 
 controller:
   replicas: 1
+  # Resolve <account>.azurite.kube-system.svc.cluster.local to Azurite's fixed
+  # ClusterIP (subdomain-style URL, same idea as bbb's docker extra_hosts).
+  hostAliases:
+    - ip: "10.43.0.200"
+      hostnames:
+        - "devstoreaccount1.azurite.kube-system.svc.cluster.local"
   # Controller needs endpoint too for provisioning
   # Note: endpoint will be patched by test code
   env:
@@ -22,13 +28,20 @@ controller:
       value: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
     # Azurite endpoint - will be set by test
     # - name: AZURE_STORAGE_ENDPOINT
-    #   value: "http://azurite.kube-system.svc.cluster.local:10000/devstoreaccount1"
+    #   value: "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/"
 
 node:
   # NBD mode for better portability
   useNbd: true
   nbd:
     portStart: 10809
+
+  # Resolve <account>.azurite.kube-system.svc.cluster.local to Azurite's fixed
+  # ClusterIP so the node plugin can reach blob storage to mount the volume.
+  hostAliases:
+    - ip: "10.43.0.200"
+      hostnames:
+        - "devstoreaccount1.azurite.kube-system.svc.cluster.local"
 
   # Storage account credentials (Azurite well-known)
   # Note: endpoint will be patched by test code
@@ -39,7 +52,7 @@ node:
       value: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
     # Azurite endpoint - will be set by test
     # - name: AZURE_STORAGE_ENDPOINT
-    #   value: "http://azurite.kube-system.svc.cluster.local:10000/devstoreaccount1"
+    #   value: "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/"
     
     # Enable caching for migration testing
     - name: UBLK_MAX_DIRTY_PAGES

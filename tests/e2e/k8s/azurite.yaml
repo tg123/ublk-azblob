@@ -46,6 +46,11 @@ metadata:
   name: azurite
   namespace: kube-system
 spec:
+  # Fixed ClusterIP so the CSI pods' hostAliases can map
+  # <account>.azurite.kube-system.svc.cluster.local to it (subdomain-style URL,
+  # the same trick bbb does locally with docker extra_hosts). Must be inside the
+  # k3s service CIDR (10.43.0.0/16).
+  clusterIP: 10.43.0.200
   selector:
     app: azurite
   ports:

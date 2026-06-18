@@ -305,6 +305,15 @@ async fn main() -> anyhow::Result<()> {
             format!("https://{}.blob.core.windows.net/", cli.account)
         }
     });
+    // Support the subdomain-style endpoint template `http://%s.host/` (the same
+    // convention bbb/Azurite use): substitute `%s` with the account name so the
+    // account appears as the host's first DNS label (single-account SharedKey
+    // canonicalization, no path-style double-account).
+    let endpoint = if endpoint.contains("%s") {
+        endpoint.replace("%s", &cli.account)
+    } else {
+        endpoint
+    };
 
     match cli.command {
         Command::Run {

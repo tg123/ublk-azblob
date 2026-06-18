@@ -229,8 +229,11 @@ impl Node for NodeService {
 
                 // Build NBD listen address if NBD mode is enabled
                 let nbd_listen = if use_nbd {
-                    // TODO: allocate unique port per volume (for now just use port_start)
-                    let listen = format!("{}:{}", nbd_host, nbd_port_start);
+                    // Allocate a unique free port per volume so multiple volumes
+                    // (or a remount racing a still-flushing previous server) on
+                    // the same node don't collide on a single shared port.
+                    let port = mount::find_free_port(&nbd_host, nbd_port_start, 1024)?;
+                    let listen = format!("{}:{}", nbd_host, port);
                     info!(listen = %listen, "NBD mode enabled, will connect to NBD server");
                     Some(listen)
                 } else {
