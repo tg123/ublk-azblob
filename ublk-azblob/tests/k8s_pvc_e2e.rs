@@ -214,42 +214,35 @@ fn test_basic_mount_and_recovery() {
     let img = image();
 
     // ── Build + load the driver image ─────────────────────────────────────────
-    log(&format!("building driver image {img}"));
-    run(
-        "docker",
-        &[
-            "build",
-            "-f",
-            repo.join("deploy/Dockerfile").to_str().unwrap(),
-            "-t",
-            &img,
-            repo.to_str().unwrap(),
-        ],
-    );
+    // When the harness has already built the image (the unified e2e runner
+    // packages the once-compiled binary into a thin image and sets
+    // `K8S_E2E_SKIP_IMAGE_BUILD=1`), skip the in-test build so the crate is
+    // compiled exactly once across the whole suite.
+    if std::env::var("K8S_E2E_SKIP_IMAGE_BUILD").is_ok() {
+        log(&format!("using prebuilt driver image {img}"));
+    } else {
+        log(&format!("building driver image {img}"));
+        run(
+            "docker",
+            &[
+                "build",
+                "-f",
+                repo.join("deploy/Dockerfile").to_str().unwrap(),
+                "-t",
+                &img,
+                repo.to_str().unwrap(),
+            ],
+        );
+    }
 
     // ── Load the freshly-built image into the k3s cluster ─────────────────────
     load_image_into_k3s(&img);
 
-    // ── Deploy Azurite ─────────────────────────────────────────────────────────
-    log("deploying Azurite");
-    kubectl_apply(&here.join("azurite.yaml"));
-    run(
-        "kubectl",
-        &[
-            "-n",
-            NS,
-            "rollout",
-            "status",
-            "deployment/azurite",
-            "--timeout=120s",
-        ],
-    );
-
     // ── Deploy CSI driver using Helm ──────────────────────────────────────────
-    // Subdomain-style endpoint: http://<account>.azurite.<ns>.svc.cluster.local:10000/
-    // The CSI pods resolve this via hostAliases (see e2e.values.yaml) pointing at
-    // Azurite's fixed ClusterIP. This mirrors how real Azure uses <account>.blob.* and
-    // keeps SharedKey canonicalization single-account (no /account/account double path).
+    // Azurite runs as the docker-compose `azurite` service (shared with the
+    // mount/NBD e2e); the CSI pods reach it subdomain-style via hostAliases (see
+    // e2e.values.yaml) pointing at its fixed compose IP. Subdomain form keeps the
+    // SharedKey canonicalization single-account (no /account/account double path).
     let endpoint = format!("http://%s.azurite.{NS}.svc.cluster.local:10000/");
     deploy_csi_driver_helm(&repo, &here, &endpoint);
 
@@ -353,7 +346,7 @@ stringData:
 /// every node (the cluster is provided by the docker-compose harness).
 fn load_image_into_k3s(img: &str) {
     log(&format!("importing {img} to k3s containerd"));
-    for node in &["k8s-k3s-server-1", "k8s-k3s-agent-1"] {
+    for node in &["ublk-e2e-k3s-server", "ublk-e2e-k3s-agent"] {
         log(&format!("importing to {node}"));
         let mut docker_save = Command::new("docker")
             .args(["save", img])

@@ -43,9 +43,8 @@ deferred to follow-up PRs to keep the diff reviewable.
 
 ## CI
 
-- [ ] **Merge `e2e` and `k8s-e2e` workflows so the image/binary is built once.**
-      Today `e2e.yml` builds the `tests/e2e/Dockerfile` runner (compiles
-      `--features ublk`, runs `mount_e2e`/`nbd_e2e`) and `k8s-e2e.yml` builds the
-      `tests/e2e/k8s/Dockerfile` runner *and* the `deploy/Dockerfile` driver
-      image. Consolidate into a single workflow that builds the driver image once
-      and shares it (artifact or local registry) across both suites.
+(done) Merged `e2e` and `k8s-e2e` into a single workflow + docker-compose that
+compiles the crate once (`--features "ublk csi"`) and runs mount/NBD and the
+k8s PVC e2e from that one build (the binary is packaged into a thin image via
+`deploy/Dockerfile --target runtime-prebuilt`). See `tests/e2e/docker-compose.yml`
+and `tests/e2e/run.sh`.

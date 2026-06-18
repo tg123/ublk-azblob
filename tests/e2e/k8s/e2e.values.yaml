@@ -11,10 +11,10 @@ image:
 
 controller:
   replicas: 1
-  # Resolve <account>.azurite.kube-system.svc.cluster.local to Azurite's fixed
-  # ClusterIP (subdomain-style URL, the k8s equivalent of a docker extra_hosts alias).
+  # Resolve <account>.azurite.kube-system.svc.cluster.local to the docker-compose
+  # Azurite's fixed IP (subdomain-style URL; pods egress to it via the node).
   hostAliases:
-    - ip: "10.43.0.200"
+    - ip: "172.30.0.10"
       hostnames:
         - "devstoreaccount1.azurite.kube-system.svc.cluster.local"
   # Controller needs endpoint too for provisioning
@@ -36,10 +36,10 @@ node:
   nbd:
     portStart: 10809
 
-  # Resolve <account>.azurite.kube-system.svc.cluster.local to Azurite's fixed
-  # ClusterIP so the node plugin can reach blob storage to mount the volume.
+  # Resolve <account>.azurite.kube-system.svc.cluster.local to the docker-compose
+  # Azurite's fixed IP so the node plugin can reach blob storage to mount the volume.
   hostAliases:
-    - ip: "10.43.0.200"
+    - ip: "172.30.0.10"
       hostnames:
         - "devstoreaccount1.azurite.kube-system.svc.cluster.local"
 
@@ -78,6 +78,3 @@ node:
 
 storageClass:
   name: azblob-ublk
-  parameters:
-    # Use page blob for better performance
-    skuName: Premium_LRS
