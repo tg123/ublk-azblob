@@ -386,15 +386,17 @@ fn deploy_csi_driver_helm(repo: &Path, here: &Path, endpoint: &str) {
 
     // Copy e2e.values.yaml and patch endpoint
     let values_src = here.join("e2e.values.yaml");
-    let values_content = std::fs::read_to_string(&values_src)
-        .expect("read e2e.values.yaml");
-    
+    let values_content = std::fs::read_to_string(&values_src).expect("read e2e.values.yaml");
+
     // Add endpoint to env section
     let patched = values_content.replace(
         "# Azurite endpoint - will be set by test",
-        &format!("# Azurite endpoint\n    - name: AZURE_STORAGE_ENDPOINT\n      value: \"{}\"", endpoint)
+        &format!(
+            "# Azurite endpoint\n    - name: AZURE_STORAGE_ENDPOINT\n      value: \"{}\"",
+            endpoint
+        ),
     );
-    
+
     let values_tmp = std::env::temp_dir().join("e2e-patched.values.yaml");
     std::fs::write(&values_tmp, patched).expect("write patched values");
 
@@ -442,7 +444,7 @@ fn deploy_csi_driver_helm(repo: &Path, here: &Path, endpoint: &str) {
 /// Test pod migration between nodes
 fn test_pod_migration(here: &Path) {
     log("TEST 2: Pod migration between nodes");
-    
+
     // Get list of nodes
     let nodes_out = Command::new("kubectl")
         .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
@@ -450,13 +452,17 @@ fn test_pod_migration(here: &Path) {
         .expect("get nodes");
     let nodes_str = String::from_utf8_lossy(&nodes_out.stdout);
     let nodes: Vec<&str> = nodes_str.split_whitespace().collect();
-    
+
     if nodes.len() < 2 {
         log("SKIP pod migration test: cluster has <2 nodes");
         return;
     }
-    
-    log(&format!("found {} nodes: {}", nodes.len(), nodes.join(", ")));
+
+    log(&format!(
+        "found {} nodes: {}",
+        nodes.len(),
+        nodes.join(", ")
+    ));
 
     // Create a deployment with PVC (instead of job)
     let deployment_yaml = format!(
@@ -501,7 +507,6 @@ spec:
 
     log(&format!("creating deployment on node {}", nodes[0]));
     kubectl_apply_stdin(&deployment_yaml);
-    
     // Wait for pod to be ready
     if !try_run(
         "kubectl",

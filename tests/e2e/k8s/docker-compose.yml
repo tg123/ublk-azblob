@@ -84,7 +84,8 @@ services:
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
       - /var/run/docker.sock:/var/run/docker.sock
-      - kubeconfig:/kubeconfig:ro
+      # Remove :ro from kubeconfig so we can modify it
+      - kubeconfig:/kubeconfig
     working_dir: /workspace
     networks:
       - k3s
@@ -111,8 +112,10 @@ services:
           sleep 1
         done
         
-        # Update kubeconfig server to point to k3s service
-        sed -i 's|https://127.0.0.1:6443|https://k3s-server:6443|g' /kubeconfig/kubeconfig.yaml
+        # Copy kubeconfig to writable location and update server
+        cp /kubeconfig/kubeconfig.yaml /tmp/kubeconfig.yaml
+        sed -i 's|https://127.0.0.1:6443|https://k3s-server:6443|g' /tmp/kubeconfig.yaml
+        export KUBECONFIG=/tmp/kubeconfig.yaml
         
         # Verify cluster is accessible
         kubectl cluster-info
