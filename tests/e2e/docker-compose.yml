@@ -5,7 +5,8 @@
 #   * `azurite`  — a local Azure Storage emulator (the one external service the
 #     test talks to).
 #   * `runner`   — builds `ublk-azblob` (`--features ublk`) and runs the Rust
-#     mount e2e (`tests/mount_e2e.rs`) and NBD e2e (`tests/nbd_e2e.rs`) against
+#     mount e2e (`tests/mount_e2e.rs`, including the read-only mount test) and
+#     NBD e2e (`tests/nbd_e2e.rs`, including the read-only export test) against
 #     Azurite.
 #
 # The `runner` shares the host kernel: it is `privileged` and bind-mounts

@@ -27,6 +27,11 @@
 //!   AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
 //!   cargo test --release --features ublk --test mount_e2e -- --nocapture
 //! ```
+//!
+//! A second test, [`mount_read_only`](fn.mount_read_only.html), exercises
+//! `run --read-only`: it asserts the kernel marks `/dev/ublkbN` read-only,
+//! verifies the data is still readable, and confirms a write to the read-only
+//! mount fails without mutating the backing blob.
 #![cfg(feature = "ublk")]
 
 use std::fs;
@@ -118,14 +123,23 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
 /// `stop_device`), so the zombie-process lint does not apply.
 #[allow(clippy::zombie_processes)]
 fn start_device(spec: &DeviceSpec, create: bool) -> Child {
+    start_device_opts(spec, create, false)
+}
+
+/// Like [`start_device`] but lets the caller expose the device read-only
+/// (`run --read-only`).  `create` and `read_only` are mutually exclusive at the
+/// CLI level, so callers pass `create=false` when `read_only=true`.
+#[allow(clippy::zombie_processes)]
+fn start_device_opts(spec: &DeviceSpec, create: bool, read_only: bool) -> Child {
     let dev = spec.dev_path();
     log(&format!(
-        "starting ublk device {dev} ({}{})",
+        "starting ublk device {dev} ({}{}{})",
         if create {
             "--create"
         } else {
             "reuse existing blob"
         },
+        if read_only { ", --read-only" } else { "" },
         match &spec.cache_dir {
             Some(d) => format!(", cache_dir={}", d.display()),
             None => String::new(),
@@ -140,6 +154,9 @@ fn start_device(spec: &DeviceSpec, create: bool) -> Child {
         .arg(BLOB_SIZE.to_string());
     if create {
         cmd.arg("--create");
+    }
+    if read_only {
+        cmd.arg("--read-only");
     }
     if let Some(dir) = &spec.cache_dir {
         cmd.arg("--cache-dir").arg(dir);
@@ -353,4 +370,125 @@ fn run_mount_roundtrip(spec: DeviceSpec) {
     let _ = fs::remove_dir_all(&mnt);
 
     log("mount e2e PASSED ✓");
+}
+
+/// e2e for read-only mode (`run --read-only`) over the kernel ublk path.
+///
+/// Cycle:
+///   1. provision the device writable, make an ext4 filesystem, write random
+///      files, record their checksums, flush and tear the device down
+///   2. bring the device back up over the *same* blob with `--read-only` and
+///      assert:
+///      * the kernel marks `/dev/ublkbN` read-only
+///        (`/sys/block/ublkbN/ro == 1`, courtesy of `UBLK_ATTR_READ_ONLY`)
+///      * the filesystem can be mounted read-only and every file's checksum
+///        still matches (data round-tripped and is served read-only)
+///      * an attempt to write a new file fails (the mount is read-only)
+///   3. reopen the device writable and confirm the blob was never modified
+#[test]
+fn mount_read_only() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_read_only: requires root and a loaded ublk_drv \
+             (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let spec = DeviceSpec {
+        // Distinct device id and blob so this test never collides with the
+        // other mount tests.
+        dev_id: "2".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-ro", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: None,
+    };
+    let dev = spec.dev_path();
+    let mnt = tempdir("ublk-azblob-ro-mnt");
+
+    // ── Phase 1: provision the device writable and seed known files ───────────
+    let child = start_device(&spec, true);
+    log(&format!("mkfs.ext4 on {dev}"));
+    run("mkfs.ext4", &["-q", "-F", "-E", "nodiscard", &dev]);
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+
+    log(&format!("writing {NUM_FILES} random files"));
+    let mut checksums: Vec<(String, String)> = Vec::with_capacity(NUM_FILES);
+    for i in 1..=NUM_FILES {
+        let name = format!("random_{i}.bin");
+        let path = mnt.join(&name);
+        let len = 1024 * (1 + (i * 509) % 4096);
+        write_random_file(&path, len);
+        checksums.push((name, sha256_file(&path)));
+    }
+
+    log("sync + SIGUSR1 to force flush to the page blob");
+    run("sync", &[]);
+    signal(&child, libc::SIGUSR1);
+    sleep(Duration::from_secs(2));
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // ── Phase 2: reopen read-only and assert the device rejects writes ────────
+    let child = start_device_opts(&spec, false, true);
+
+    // The kernel exposes the read-only attribute via /sys/block/<dev>/ro.
+    let ro_attr = format!("/sys/block/ublkb{}/ro", spec.dev_id);
+    let ro_val = fs::read_to_string(&ro_attr)
+        .unwrap_or_else(|e| panic!("read {ro_attr}: {e}"))
+        .trim()
+        .to_string();
+    assert_eq!(
+        ro_val, "1",
+        "{dev} should be read-only ({ro_attr} = {ro_val}, expected 1)"
+    );
+
+    // Mount read-only.  `noload` skips ext4 journal recovery, which would
+    // otherwise try to write to the (now read-only) device.
+    log(&format!("mounting {dev} read-only at {}", mnt.display()));
+    run("mount", &["-o", "ro,noload", &dev, mnt.to_str().unwrap()]);
+
+    log("verifying checksums on the read-only mount");
+    for (name, expected) in &checksums {
+        let actual = sha256_file(&mnt.join(name));
+        assert_eq!(
+            &actual, expected,
+            "checksum mismatch for {name} (read-only)"
+        );
+    }
+
+    log("verifying a write to the read-only mount fails");
+    let new_file = mnt.join("should_not_write.bin");
+    assert!(
+        fs::write(&new_file, b"nope").is_err(),
+        "writing {new_file:?} unexpectedly succeeded on a read-only mount"
+    );
+    assert!(
+        !new_file.exists(),
+        "{new_file:?} should not exist after a rejected write"
+    );
+
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // ── Phase 3: reopen writable and confirm the blob was untouched ───────────
+    let child = start_device(&spec, false);
+    log(&format!("remounting {dev} writable at {}", mnt.display()));
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+    for (name, expected) in &checksums {
+        let actual = sha256_file(&mnt.join(name));
+        assert_eq!(
+            &actual, expected,
+            "blob changed despite read-only mount for {name}"
+        );
+    }
+    assert!(
+        !mnt.join("should_not_write.bin").exists(),
+        "a file rejected by the read-only mount leaked into the blob"
+    );
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    let _ = fs::remove_dir_all(&mnt);
+    log("mount read-only e2e PASSED ✓");
 }
