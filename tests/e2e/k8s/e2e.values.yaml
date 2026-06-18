@@ -15,7 +15,7 @@ controller:
   # Note: endpoint will be patched by test code
   env:
     - name: RUST_LOG
-      value: "info"
+      value: "info,azure_core=debug"
     - name: AZURE_STORAGE_ACCOUNT
       value: "devstoreaccount1"
     - name: AZURE_STORAGE_KEY
