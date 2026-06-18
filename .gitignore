@@ -2,6 +2,9 @@
 /target
 **/*.rs.bk
 
+# e2e runner cargo home (host-persisted CARGO_HOME for tests/e2e)
+/.cargo-home
+
 # Env / secrets
 .env
 *.env.local
