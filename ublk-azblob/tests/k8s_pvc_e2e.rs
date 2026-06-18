@@ -33,11 +33,7 @@ use std::process::{Command, Stdio};
 
 /// Azurite well-known development account + key (public, not a real secret).
 /// NEVER use these credentials against real Azure Storage / in production.
-const ACCOUNT: &str = "devstoreaccount1";
-const KEY: &str =
-    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 const NS: &str = "kube-system";
-const CONTAINER: &str = "pvc";
 
 fn cluster_name() -> String {
     std::env::var("K8S_E2E_CLUSTER_NAME")
@@ -309,24 +305,6 @@ fn test_basic_mount_and_recovery() {
     log("k8s PVC e2e PASSED ✓");
 }
 
-/// Render the driver secret manifest (account + accountKey).
-fn render_secret() -> String {
-    use std::fmt::Write as _;
-    let account_b64 = b64(ACCOUNT.as_bytes());
-    let key_b64 = b64(KEY.as_bytes());
-    let mut s = String::new();
-    writeln!(s, "apiVersion: v1").unwrap();
-    writeln!(s, "kind: Secret").unwrap();
-    writeln!(s, "metadata:").unwrap();
-    writeln!(s, "  name: csi-ublk-azblob-secret").unwrap();
-    writeln!(s, "  namespace: {NS}").unwrap();
-    writeln!(s, "type: Opaque").unwrap();
-    writeln!(s, "data:").unwrap();
-    writeln!(s, "  account: {account_b64}").unwrap();
-    writeln!(s, "  accountKey: {key_b64}").unwrap();
-    s
-}
-
 /// Setup cluster (create or use existing) and load image
 fn setup_cluster(cluster: &str, img: &str, here: &Path) -> Option<ClusterGuard> {
     if use_existing_cluster() {
@@ -442,7 +420,7 @@ fn deploy_csi_driver_helm(repo: &Path, here: &Path, endpoint: &str) {
 }
 
 /// Test pod migration between nodes
-fn test_pod_migration(here: &Path) {
+fn test_pod_migration(_here: &Path) {
     log("TEST 2: Pod migration between nodes");
 
     // Get list of nodes
@@ -645,49 +623,6 @@ spec:
             "--wait=true",
         ],
     );
-}
-
-/// Render the driver config map (endpoint + container).
-fn render_config(endpoint: &str) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::new();
-    writeln!(s, "apiVersion: v1").unwrap();
-    writeln!(s, "kind: ConfigMap").unwrap();
-    writeln!(s, "metadata:").unwrap();
-    writeln!(s, "  name: csi-ublk-azblob-config").unwrap();
-    writeln!(s, "  namespace: {NS}").unwrap();
-    writeln!(s, "data:").unwrap();
-    writeln!(s, "  endpoint: {endpoint}").unwrap();
-    writeln!(s, "  container: {CONTAINER}").unwrap();
-    s
-}
-
-/// Copy the deploy manifests to a temp dir and pin the image to the local build
-/// (image + imagePullPolicy: Never), mirroring the `sed` rewrites in run.sh.
-fn stage_manifests(repo: &Path, img: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("ublk-azblob-manifests-{nanos}"));
-    std::fs::create_dir_all(&dir).expect("create manifest staging dir");
-    let src = repo.join("deploy/kubernetes");
-    for entry in std::fs::read_dir(&src).expect("read deploy/kubernetes") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
-            continue;
-        }
-        let content = std::fs::read_to_string(&path).expect("read manifest");
-        let content = content
-            .replace(
-                "image: docker.io/farmer1992/ublk-azblob:latest",
-                &format!("image: {img}"),
-            )
-            .replace("imagePullPolicy: IfNotPresent", "imagePullPolicy: Never");
-        std::fs::write(dir.join(entry.file_name()), content).expect("write staged manifest");
-    }
-    dir
 }
 
 /// Best-effort cluster diagnostics on failure (mirrors the bash failure dumps).
