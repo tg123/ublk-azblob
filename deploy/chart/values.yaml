@@ -11,15 +11,16 @@ deploymentMode: per-namespace
 driver:
   name: azblob.ublk.csi.tg123.github.io
 
+# Container image for both the controller and node plugins.
+image:
+  repository: docker.io/farmer1992/ublk-azblob
+  tag: latest
+  pullPolicy: IfNotPresent
+
 # Controller deployment configuration
 controller:
   replicas: 1
-  
-  image:
-    repository: docker.io/farmer1992/ublk-azblob
-    tag: latest
-    pullPolicy: IfNotPresent
-  
+
   resources:
     limits:
       cpu: 200m
@@ -34,11 +35,6 @@ controller:
 
 # Node DaemonSet configuration
 node:
-  image:
-    repository: docker.io/farmer1992/ublk-azblob
-    tag: latest
-    pullPolicy: IfNotPresent
-  
   # Use NBD (Network Block Device) instead of ublk (for older kernels)
   # When enabled, uses NBD protocol instead of ublk_drv kernel module
   # - Requires nbd kernel module (available in most kernels)

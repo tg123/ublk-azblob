@@ -64,19 +64,18 @@ jobs:
           '
           echo "::endgroup::"
 
-          echo "::group::binary is statically linked (no dynamic loader)"
-          # musl's ldd is quirky on static-PIE binaries (may exit non-zero and
-          # print "Not a valid dynamic program"); treat any of the known
-          # "no shared libs" markers as static, and only fail if we actually see
-          # shared-library resolution lines (" => /path/lib.so").
+          echo "::group::binary's shared libraries all resolve"
+          # The image ships a Debian/glibc dynamically-linked binary, so verify
+          # every shared-library dependency resolves inside the runtime image
+          # (a missing lib would show up as "not found").
           docker run --rm --entrypoint sh "$img" -ec '
-            out=$(ldd /usr/local/bin/ublk-azblob 2>&1 || true)
+            out=$(ldd /usr/local/bin/ublk-azblob 2>&1)
             echo "$out"
-            if printf "%s" "$out" | grep -q " => /"; then
-              echo "ERROR: binary is dynamically linked" >&2
+            if printf "%s" "$out" | grep -q "not found"; then
+              echo "ERROR: unresolved shared library dependency" >&2
               exit 1
             fi
-            echo "ok: no shared library dependencies"
+            echo "ok: all shared library dependencies resolve"
           '
           echo "::endgroup::"
 

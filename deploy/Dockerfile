@@ -1,8 +1,8 @@
 # Container image for the ublk-azblob CSI driver.
 #
 # Builds the binary with both the `ublk` (real block device) and `csi`
-# (Kubernetes Container Storage Interface) features, and ships it on a tiny
-# Alpine runtime that carries the userspace tools the node plugin shells out to
+# (Kubernetes Container Storage Interface) features, and ships it on a slim
+# Debian runtime that carries the userspace tools the node plugin shells out to
 # (`mkfs.ext4`, `mount`/`umount`, `blkid`).
 #
 # Build from the repository root:

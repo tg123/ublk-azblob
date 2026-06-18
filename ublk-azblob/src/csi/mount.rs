@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::io::Read;
-use std::net::TcpListener;
+use std::net::{TcpListener, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -149,12 +149,23 @@ pub fn wait_and_connect_nbd(
     }
     let host = parts[0];
     let port = parts[1];
+    let port_num: u16 = port
+        .parse()
+        .with_context(|| format!("invalid NBD port in listen address: {nbd_listen}"))?;
 
-    // Wait a bit for the NBD server to start
+    // Resolve the listen address once so the readiness probe can use
+    // `connect_timeout` without panicking on a non-IP host (the host comes from
+    // user-configurable CSI env vars and may be a hostname like `localhost`).
+    let addr = (host, port_num)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve NBD listen address: {nbd_listen}"))?
+        .next()
+        .with_context(|| format!("no address resolved for NBD listen address: {nbd_listen}"))?;
+
     let deadline = Instant::now() + timeout;
 
-    // Poll for the child to either start listening or exit
-    for _attempt in 0..10 {
+    // Poll for the child to start listening or exit, honouring `timeout`.
+    while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
 
         // Check if child exited
@@ -176,12 +187,9 @@ pub fn wait_and_connect_nbd(
             );
         }
 
-        // Try to connect to see if server is ready
-        // Use a quick TCP connection test instead of immediately invoking nbd-client
-        if let Ok(stream) = std::net::TcpStream::connect_timeout(
-            &format!("{}:{}", host, port).parse().unwrap(),
-            Duration::from_millis(100),
-        ) {
+        // Try to connect to see if the server is ready.
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+        {
             drop(stream);
             break; // Server is listening
         }

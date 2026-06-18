@@ -31,8 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Azurite well-known development account + key (public, not a real secret).
-/// NEVER use these credentials against real Azure Storage / in production.
+/// Kubernetes namespace the e2e deploys Azurite and the CSI driver into.
 const NS: &str = "kube-system";
 
 fn cluster_name() -> String {
