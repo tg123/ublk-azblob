@@ -66,7 +66,6 @@ tonic = { version = "0.12.3", optional = true }
 prost = { version = "0.13.4", optional = true }
 prost-types = { version = "0.13.4", optional = true }
 tokio-stream = { version = "0.1.17", features = ["net"], optional = true }
-uuid = { version = "1.11.0", features = ["v4"], optional = true }
 
 # ── Cluster coordination (Kubernetes Lease) ─────────────────────────────────
 # Gated behind the `coordination` feature.  The Azure blob-lease half of the
@@ -92,7 +91,7 @@ coordination = ["dep:kube", "dep:k8s-openapi"]
 # the `ublk` feature to actually attach block devices; enable both together with
 # `--features "ublk csi"` for a fully functional node plugin.  CSI implies
 # `coordination` so node mounts are guarded by the cluster + blob locks.
-csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "dep:uuid", "dep:libc", "coordination"]
+csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "dep:libc", "coordination"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full", "test-util"] }

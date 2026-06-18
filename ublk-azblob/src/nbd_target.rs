@@ -127,7 +127,16 @@ pub async fn run_nbd_target(
 
     loop {
         tokio::select! {
-            Ok((stream, peer)) = listener.accept() => {
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        // Transient accept errors (e.g. ECONNABORTED) shouldn't
+                        // tear down the server; log and keep listening.
+                        warn!(err = %e, "NBD accept failed");
+                        continue;
+                    }
+                };
                 let backend = backend.clone();
                 info!(peer = %peer, "NBD client connected");
                 tokio::spawn(async move {

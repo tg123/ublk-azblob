@@ -304,22 +304,25 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let endpoint = cli.endpoint.clone().unwrap_or_else(|| {
-        // For CSI mode with empty account, use generic endpoint (will be replaced with actual account)
+    // The endpoint *template* may contain a `%s` placeholder for the account
+    // (subdomain-style, e.g. `http://%s.blob.localhost:10000/`). The CSI driver
+    // keeps the template verbatim and substitutes `%s` per volume in
+    // `csi::build_backend` (each volume can target a different account). The
+    // single-device `run`/`test` paths know their account up-front, so they
+    // substitute it here.
+    let endpoint_template = cli.endpoint.clone().unwrap_or_else(|| {
+        // For CSI mode with empty account, use generic endpoint (account is
+        // substituted per volume later).
         if cli.account.is_empty() {
             "https://blob.core.windows.net/".to_string()
         } else {
             format!("https://{}.blob.core.windows.net/", cli.account)
         }
     });
-    // Support the subdomain-style endpoint template `http://%s.host/` (the same
-    // convention bbb/Azurite use): substitute `%s` with the account name so the
-    // account appears as the host's first DNS label (single-account SharedKey
-    // canonicalization, no path-style double-account).
-    let endpoint = if endpoint.contains("%s") {
-        endpoint.replace("%s", &cli.account)
+    let endpoint = if endpoint_template.contains("%s") {
+        endpoint_template.replace("%s", &cli.account)
     } else {
-        endpoint
+        endpoint_template.clone()
     };
 
     match cli.command {
@@ -478,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let config = csi::DriverConfig {
                 account: cli.account.clone(),
-                endpoint: endpoint.clone(),
+                endpoint: endpoint_template.clone(),
                 default_container: cli.container.clone(),
                 account_key: cli.account_key.clone(),
                 use_msi: cli.msi

@@ -236,10 +236,11 @@ impl Controller for ControllerService {
 
         info!(volume_id = %req.volume_id, "DeleteVolume");
 
-        // For delete, try to get account from secrets or fall back to config
+        // For delete, get the account from the secret (same key CreateVolume's
+        // `storage_account_for` reads) or fall back to the driver config.
         let account = req
             .secrets
-            .get(PARAM_STORAGE_ACCOUNT)
+            .get("AZURE_STORAGE_ACCOUNT")
             .map(|s| s.as_str())
             .unwrap_or(&self.config.account);
 

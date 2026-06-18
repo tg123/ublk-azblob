@@ -12,7 +12,7 @@ image:
 controller:
   replicas: 1
   # Resolve <account>.azurite.kube-system.svc.cluster.local to Azurite's fixed
-  # ClusterIP (subdomain-style URL, same idea as bbb's docker extra_hosts).
+  # ClusterIP (subdomain-style URL, the k8s equivalent of a docker extra_hosts alias).
   hostAliases:
     - ip: "10.43.0.200"
       hostnames:

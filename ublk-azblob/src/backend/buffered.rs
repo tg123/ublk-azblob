@@ -117,10 +117,13 @@ impl BufferedBackend {
             // when the last owner drops the `Arc`, `upgrade()` returns `None` and
             // the task exits instead of leaking the backend in an infinite loop.
             let backend_weak = Arc::downgrade(&backend);
+            // Check at least twice as often as the smallest configured timeout,
+            // but never faster than once per second (the `/2` and `/4` divisions
+            // can otherwise round down to a 0s interval and busy-loop).
             let check_interval = if config.idle_flush_secs > 0 {
-                Duration::from_secs(config.idle_flush_secs.max(1) / 2)
+                Duration::from_secs((config.idle_flush_secs / 2).max(1))
             } else {
-                Duration::from_secs(config.force_flush_timeout_secs.max(1) / 4)
+                Duration::from_secs((config.force_flush_timeout_secs / 4).max(1))
             };
             let idle_timeout = Duration::from_secs(config.idle_flush_secs);
             let force_timeout = Duration::from_secs(config.force_flush_timeout_secs);

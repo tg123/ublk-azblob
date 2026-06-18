@@ -681,15 +681,29 @@ spec:
         panic!("migration test pod did not become ready on new node");
     }
 
-    // Check logs for success message
-    let logs_out = Command::new("kubectl")
-        .args(["logs", "deployment/azblob-migration-test"])
-        .output()
-        .expect("get logs");
-    let logs = String::from_utf8_lossy(&logs_out.stdout);
+    // Check logs for the success message. The in-pod check (sha256sum over the
+    // remounted volume) runs after the container becomes Ready, so poll the logs
+    // for a bit rather than reading once — otherwise we can race the check.
+    let mut logs = String::new();
+    let mut migrated = false;
+    for _ in 0..30 {
+        let logs_out = Command::new("kubectl")
+            .args(["logs", "deployment/azblob-migration-test"])
+            .output()
+            .expect("get logs");
+        logs = String::from_utf8_lossy(&logs_out.stdout).to_string();
+        if logs.contains("MIGRATION SUCCESS") {
+            migrated = true;
+            break;
+        }
+        if logs.contains("MIGRATION FAILED") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
     log(&format!("migration test logs:\n{}", logs));
 
-    if !logs.contains("MIGRATION SUCCESS") {
+    if !migrated {
         panic!("pod migration failed: data did not survive node migration");
     }
 
