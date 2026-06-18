@@ -386,7 +386,7 @@ fn deploy_csi_driver_helm(repo: &Path, here: &Path, endpoint: &str) {
         &[
             "install",
             "csi-ublk-azblob",
-            repo.join("deploy/helm/csi-ublk-azblob").to_str().unwrap(),
+            repo.join("deploy/chart").to_str().unwrap(),
             "-n",
             NS,
             "-f",
