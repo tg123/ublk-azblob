@@ -527,7 +527,9 @@ fn nbd_graceful_shutdown_flush() {
     let child = start_server_opts(&container, &blob, true, true);
     let mut client = NbdClient::connect();
 
-    log(&format!("writing {NUM_REGIONS} random regions (no NBD_CMD_FLUSH)"));
+    log(&format!(
+        "writing {NUM_REGIONS} random regions (no NBD_CMD_FLUSH)"
+    ));
     let mut checksums: Vec<(u64, usize, String)> = Vec::with_capacity(NUM_REGIONS);
     for i in 0..NUM_REGIONS {
         let offset = (i as u64) * 1024 * 1024;
