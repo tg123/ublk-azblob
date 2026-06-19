@@ -61,6 +61,9 @@ struct DeviceSpec {
     container: String,
     blob: String,
     cache_dir: Option<PathBuf>,
+    /// Shared local-disk cache byte budget (`--cache-max-bytes`); `0` (the
+    /// default) means unlimited.  Only meaningful when `cache_dir` is `Some`.
+    cache_max_bytes: u64,
 }
 
 impl DeviceSpec {
@@ -148,6 +151,10 @@ fn start_device(spec: &DeviceSpec, create: bool) -> Child {
     }
     if let Some(dir) = &spec.cache_dir {
         cmd.arg("--cache-dir").arg(dir);
+        if spec.cache_max_bytes > 0 {
+            cmd.arg("--cache-max-bytes")
+                .arg(spec.cache_max_bytes.to_string());
+        }
     }
     azure_env(&mut cmd, &spec.container, &spec.blob);
 
@@ -257,6 +264,7 @@ fn mount_roundtrip() {
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB),
         cache_dir: None,
+        cache_max_bytes: 0,
     });
 }
 
@@ -286,6 +294,38 @@ fn mount_roundtrip_file_cache() {
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-fcache", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: Some(cache_dir.clone()),
+        cache_max_bytes: 0,
+    });
+    let _ = fs::remove_dir_all(&cache_dir);
+}
+
+/// Same round-trip cycle as `mount_roundtrip_file_cache`, but with a *capped*
+/// local-disk cache (`--cache-max-bytes`) that is much smaller than the data
+/// written.  This forces the LRU eviction path to fire under a real ublk
+/// workload: clean pages are punched out of the cache file while we keep
+/// writing, yet every file must still flush to the page blob and read back
+/// correctly after a remount with a fresh cache (i.e. via read-through from the
+/// blob, not from cached pages that were evicted).
+#[test]
+fn mount_roundtrip_file_cache_budget() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_roundtrip_file_cache_budget: requires root and a \
+             loaded ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let cache_dir = tempdir("ublk-azblob-cache-budget");
+    run_mount_roundtrip(DeviceSpec {
+        // Distinct device id, container and blob (see other tests' comments).
+        dev_id: "42".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-fcache-budget", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: Some(cache_dir.clone()),
+        // 8 MiB budget while the test writes well over that (up to ~4 MiB per
+        // file across NUM_FILES files), so eviction is exercised.
+        cache_max_bytes: 8 * 1024 * 1024,
     });
     let _ = fs::remove_dir_all(&cache_dir);
 }

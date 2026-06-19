@@ -78,6 +78,30 @@ impl Default for FileCacheConfig {
 /// Tracks the recency of every present page and which of them are *evictable*
 /// (present **and** clean — dirty pages must be flushed, never dropped).  Only
 /// maintained when a [`CacheBudget`] is active.
+///
+/// # Why a purpose-built structure instead of an off-the-shelf LRU crate
+///
+/// Off-the-shelf caches (`lru`, `clru`, `quick_cache`, `moka`, `foyer`, …) own
+/// the cached *values* and evict purely by recency (optionally by a byte
+/// weight).  This cache is structurally different on three axes that none of
+/// them model:
+///
+/// - **Values live on disk, not in the map.**  Page bytes are stored in a
+///   sparse data file addressed by page index; eviction is a `PUNCH_HOLE` plus
+///   a bitmap-bit clear, so the LRU only needs to order page *indices*.
+/// - **A pinned, non-evictable subset.**  Dirty (unflushed) pages must never be
+///   dropped or data is lost; generic LRUs have no notion of "evict by recency,
+///   but only among the clean pages".  Here `evictable` is a second index that
+///   excludes dirty pages, and pages move in/out of it as they are
+///   dirtied/flushed.
+/// - **A cross-process byte budget.**  The real limit is shared between
+///   processes via the `flock`-coordinated [`CacheBudget`]; an in-process cache
+///   crate cannot enforce it.  `foyer` is the closest "disk block cache" but it
+///   owns its own on-disk format and recovery, which would replace this whole
+///   backend and still not provide the cross-process budget.
+///
+/// The structure is intentionally small: a monotonic recency clock plus two
+/// indexes giving O(log n) insert/touch and O(1)-amortised LRU selection.
 #[derive(Default)]
 struct Lru {
     /// Monotonic access clock; higher = more recently used.
@@ -1257,5 +1281,154 @@ mod tests {
         b.flush().await.unwrap();
         assert_eq!(b.present_count().await, 4);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn evicted_pages_reload_correct_data() {
+        // After a clean page is evicted to honour the budget, a later read of it
+        // must transparently reload the exact bytes from the inner backend, while
+        // the most-recently-written page stays resident in the cache.
+        let dir = tmp_dir("reload");
+        let inner = Arc::new(MemBackend::new(8192).unwrap());
+        let (b, _) = open_budgeted(inner.clone(), &dir, 4096, 8192, 4096);
+
+        // Page 0 becomes clean + resident, filling the whole one-page budget.
+        b.write(0, Bytes::from(vec![0xD0; 4096])).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 1);
+
+        // Writing page 1 admits it over budget and evicts the older clean page 0.
+        b.write(4096, Bytes::from(vec![0xD1; 4096])).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 1);
+        assert_eq!(b.resident_bytes().await, 4096);
+
+        // Both pages read back their correct values: page 1 from the resident
+        // cache, page 0 reloaded from the blob after its eviction.
+        assert_eq!(b.read(4096, 4096).await.unwrap(), Bytes::from(vec![0xD1; 4096]));
+        assert_eq!(b.read(0, 4096).await.unwrap(), Bytes::from(vec![0xD0; 4096]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn eviction_reclaims_disk_space() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // Eviction must physically reclaim disk via PUNCH_HOLE, not merely clear
+        // a bit: with a 4-page budget, churning through 8 pages keeps the data
+        // file's allocated block count near 4 pages, far below the 8 pages it
+        // would reach if nothing were reclaimed.
+        let dir = tmp_dir("reclaim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = 4096u64;
+        let dev_size = 8 * page;
+        let inner = Arc::new(MemBackend::new(dev_size).unwrap());
+        let (b, _) = open_budgeted(inner.clone(), &dir, page, dev_size, 4 * page);
+
+        let data_file = dir.join("test.dat");
+        let blocks = || std::fs::metadata(&data_file).unwrap().blocks();
+        let page_blocks = page / 512;
+
+        // Fill the budget with four clean pages.
+        for i in 0..4u64 {
+            b.write(i * page, Bytes::from(vec![0xE0 + i as u8; page as usize]))
+                .await
+                .unwrap();
+        }
+        b.flush().await.unwrap();
+        let baseline = blocks();
+
+        // Write four more pages; each admission evicts an LRU clean page.
+        for i in 4..8u64 {
+            b.write(i * page, Bytes::from(vec![0xE0 + i as u8; page as usize]))
+                .await
+                .unwrap();
+            b.flush().await.unwrap();
+        }
+
+        assert_eq!(b.present_count().await, 4);
+        assert_eq!(b.resident_bytes().await, 4 * page);
+        // Without reclaiming, all eight pages would stay allocated (≈ 2×baseline).
+        // Allow one page of slack for filesystem rounding.
+        assert!(
+            blocks() <= baseline + page_blocks,
+            "data file kept {} blocks (baseline {baseline}); holes were not punched",
+            blocks()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lru_orders_by_recency() {
+        let mut lru = Lru::default();
+        lru.touch(0, true);
+        lru.touch(1, true);
+        lru.touch(2, true);
+        // Least-recently-used first.
+        assert_eq!(lru.pop_lru(None), Some(0));
+        assert_eq!(lru.pop_lru(None), Some(1));
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_touch_refreshes_recency() {
+        let mut lru = Lru::default();
+        lru.touch(0, true);
+        lru.touch(1, true);
+        lru.touch(2, true);
+        // Re-touching page 0 makes it most-recently-used.
+        lru.touch(0, true);
+        assert_eq!(lru.pop_lru(None), Some(1));
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), Some(0));
+    }
+
+    #[test]
+    fn lru_dirty_pages_are_not_evictable() {
+        let mut lru = Lru::default();
+        lru.touch(0, true); // clean
+        lru.touch(1, false); // dirty
+        lru.touch(2, true); // clean
+        // Page 1 is present but never an eviction candidate.
+        assert!(lru.contains(1));
+        assert_eq!(lru.pop_lru(None), Some(0));
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), None);
+        assert!(lru.contains(1));
+    }
+
+    #[test]
+    fn lru_reclassifies_between_clean_and_dirty() {
+        let mut lru = Lru::default();
+        lru.touch(0, true); // evictable
+        lru.touch(0, false); // now dirty → no longer evictable
+        assert_eq!(lru.pop_lru(None), None);
+        lru.touch(0, true); // flushed → evictable again
+        assert_eq!(lru.pop_lru(None), Some(0));
+    }
+
+    #[test]
+    fn lru_pop_skips_protected_page() {
+        let mut lru = Lru::default();
+        lru.touch(0, true);
+        lru.touch(1, true);
+        // The LRU page (0) is protected, so page 1 is chosen instead.
+        assert_eq!(lru.pop_lru(Some(0)), Some(1));
+        // Page 0 is still present; with no protection it is now evictable.
+        assert!(lru.contains(0));
+        assert_eq!(lru.pop_lru(Some(0)), None);
+        assert_eq!(lru.pop_lru(None), Some(0));
+    }
+
+    #[test]
+    fn lru_clear_empties_all_state() {
+        let mut lru = Lru::default();
+        lru.touch(0, true);
+        lru.touch(1, false);
+        lru.clear();
+        assert!(!lru.contains(0));
+        assert!(!lru.contains(1));
+        assert_eq!(lru.pop_lru(None), None);
     }
 }
