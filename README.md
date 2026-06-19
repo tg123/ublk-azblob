@@ -128,52 +128,6 @@ in NBD mode. The local-disk / write-back cache options behave identically.
 
 ---
 
-## Standalone tools
-
-Two standalone binaries ship alongside `ublk-azblob`. They accept the same
-storage/auth flags (`--account`, `--container`, `--blob`, `--endpoint`,
-`--account-key`, `--msi*`) and their environment-variable equivalents.
-
-### `ublk-azblob-import` — import a folder into a blob
-
-Packages a local folder into a single **tar** archive and writes it to the page
-blob as a raw image. With `--snapshot`, a read-only point-in-time snapshot of the
-blob is created immediately after the import and its identifier is printed to
-stdout.
-
-```bash
-# Import ./mydir into the blob, sizing it automatically, then snapshot it
-./target/release/ublk-azblob-import \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
-  --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob folder.img \
-  --path ./mydir \
-  --snapshot
-```
-
-`--size <BYTES>` (a multiple of 512) optionally pins the blob size; it must be
-large enough to hold the archive. When omitted the blob is sized to the archive
-rounded up to the next 512-byte boundary. Recover the files later with any tar
-client, e.g. `tar -xf folder.img`.
-
-### `ublk-azblob-snapshot` — snapshot a blob
-
-Creates a read-only snapshot of the configured blob and prints the snapshot
-identifier (the snapshot timestamp) to stdout.
-
-```bash
-./target/release/ublk-azblob-snapshot \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
-  --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob folder.img
-```
-
----
-
 ## Helper scripts
 
 The [`scripts/`](scripts/) folder holds convenience bash scripts for common
@@ -183,7 +137,7 @@ stop — and prints the resulting blob URL:
 
 ```bash
 sudo modprobe ublk_drv
-cargo build --release --features ublk -p ublk-azblob
+cargo build --release -p ublk-azblob --features ublk
 
 sudo AZURE_STORAGE_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
   scripts/import-folder.sh \
@@ -196,9 +150,7 @@ sudo AZURE_STORAGE_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErC
 # prints the blob URL on success
 ```
 
-Unlike `ublk-azblob-import` (which packs a folder into a single tar image), this
-script writes a real mounted filesystem image. See
-[scripts/README.md](scripts/README.md) for details.
+See [scripts/README.md](scripts/README.md) for details.
 
 ---
 
@@ -332,16 +284,9 @@ ublk-azblob/
 ├── ublk-azblob/
 │   ├── Cargo.toml              # pinned dependencies
 │   ├── src/
-│   │   ├── main.rs             # `ublk-azblob` device-server binary (clap)
-│   │   ├── lib.rs              # shared library crate (re-exports modules below)
-│   │   ├── cli.rs              # shared storage/auth CLI options + backend factory
+│   │   ├── main.rs             # CLI entry point (clap)
 │   │   ├── auth.rs             # MSI + SharedKey credential factory
-│   │   ├── import.rs           # folder → tar → page-blob import logic
-│   │   ├── nbd_target.rs       # NBD compatibility server
 │   │   ├── ublk_target.rs      # ublk device I/O loop (gated on --features ublk)
-│   │   ├── bin/
-│   │   │   ├── ublk-azblob-import.rs    # standalone folder-import tool
-│   │   │   └── ublk-azblob-snapshot.rs  # standalone snapshot tool
 │   │   └── backend/
 │   │       ├── mod.rs          # BlobBackend trait (SDK isolation boundary)
 │   │       ├── azure.rs        # AzurePageBlobBackend (real SDK impl)

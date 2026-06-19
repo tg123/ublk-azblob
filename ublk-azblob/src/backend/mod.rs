@@ -51,15 +51,4 @@ pub trait BlobBackend: Send + Sync {
 
     /// Return the current size of the backing store in bytes.
     async fn size(&self) -> anyhow::Result<u64>;
-
-    /// Create a read-only point-in-time snapshot of the backing store and
-    /// return an identifier for it (for Azure Page Blobs this is the snapshot
-    /// timestamp).
-    ///
-    /// Implementations that wrap an inner backend should first flush any
-    /// pending writes so the snapshot reflects the latest data.  Backends that
-    /// do not support snapshots return an error.
-    async fn snapshot(&self) -> anyhow::Result<String> {
-        anyhow::bail!("snapshot is not supported by this backend")
-    }
 }

@@ -3,8 +3,7 @@
 # import-folder.sh — load a local folder into an Azure Page Blob through the
 # ublk-azblob block device, then print the resulting blob URL.
 #
-# Unlike the `ublk-azblob-import` tool (which packs a folder into a single tar
-# image), this script drives the *full block-device* path end to end:
+# This script drives the *full block-device* path end to end:
 #
 #   1. start the ublk device over the page blob   (ublk-azblob run --create)
 #   2. mkfs   — create a filesystem on /dev/ublkbN (default ext4)
@@ -52,7 +51,6 @@ ublk-azblob block device, then print the resulting blob URL.
 
 It drives the full block-device path: start the ublk device, mkfs, mount, copy
 the folder in, sync + SIGUSR1 flush, unmount, stop, then print the blob URL.
-(Unlike `ublk-azblob-import`, which packs a folder into a single tar image.)
 
 Requirements: Linux >= 6.0 with `ublk_drv` loaded (`sudo modprobe ublk_drv`),
 root / CAP_SYS_ADMIN, and `mkfs.<fs>` (e.g. e2fsprogs for ext4).

@@ -18,9 +18,6 @@ and prints the resulting blob URL. It performs the full cycle:
 The data lands in the blob as a real filesystem image, so it can later be served
 read/write with `ublk-azblob run` (or NBD) and mounted directly.
 
-> This differs from the `ublk-azblob-import` tool, which packs a folder into a
-> single **tar** image rather than a mounted filesystem.
-
 ### Requirements
 
 - Linux ≥ 6.0 with `ublk_drv` loaded (`sudo modprobe ublk_drv`)

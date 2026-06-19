@@ -26,10 +26,6 @@ async-trait = "0.1.89"
 # Byte buffers
 bytes = "1.11.1"
 
-# tar archive writer/reader — used by the `ublk-azblob-import` tool to package a
-# local folder into a single image written to the page blob.
-tar = "0.4.44"
-
 # Error handling
 anyhow = "1.0.102"
 
