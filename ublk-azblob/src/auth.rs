@@ -93,6 +93,13 @@ pub enum AuthConfig {
         account_name: String,
         account_key: String,
     },
+
+    /// Shared Access Signature (SAS) token.
+    ///
+    /// The token is the query string of a SAS URL (with or without a leading
+    /// `?`).  Used to read a `templateBlobUrl` that carries its own SAS, possibly
+    /// from a different storage account than the driver's own credentials.
+    Sas { sas_token: String },
 }
 
 // ── BlobContainerClient factory ───────────────────────────────────────────────
@@ -191,6 +198,23 @@ pub fn build_container_client(
                 .with_context(|| format!("parse container URL: {container_url}"))?;
             BlobContainerClient::new(container_url, None, Some(container_opts))
                 .context("create BlobContainerClient (SharedKey)")
+        }
+
+        AuthConfig::Sas { sas_token } => {
+            debug!("using SAS token credential");
+            let policy = SasPolicy::new(sas_token);
+            let mut container_opts = BlobContainerClientOptions::default();
+            container_opts
+                .client_options
+                .per_try_policies
+                .push(Arc::new(policy));
+            let container_url = format!("{}/{container_name}", service_url.trim_end_matches('/'));
+            let container_url = azure_core::http::Url::parse(&container_url)
+                .with_context(|| format!("parse container URL: {container_url}"))?;
+            // `None` credential: the SasPolicy appends the SAS query string to
+            // every request, so the SDK must not also add an auth header.
+            BlobContainerClient::new(container_url, None, Some(container_opts))
+                .context("create BlobContainerClient (SAS)")
         }
     }
 }
@@ -364,6 +388,66 @@ impl Policy for SharedKeyPolicy {
         request.insert_header("authorization", auth);
 
         // Continue down the pipeline
+        next[0].send(ctx, request, &next[1..]).await
+    }
+}
+
+// ── SasPolicy ─────────────────────────────────────────────────────────────────
+
+/// Appends a SAS (Shared Access Signature) query string to every request URL.
+///
+/// A SAS URL authenticates the request entirely through its query parameters
+/// (`sv`, `sig`, `se`, …), so this policy merges those parameters into each
+/// outgoing request URL.  It is injected via `per_try_policies` (like
+/// [`SharedKeyPolicy`]) and the client is built with a `None` credential so the
+/// SDK does not add a conflicting `Authorization` header.
+#[derive(Debug)]
+pub struct SasPolicy {
+    /// SAS query pairs, parsed once (leading `?` stripped).
+    pairs: Vec<(String, String)>,
+}
+
+impl SasPolicy {
+    pub fn new(sas_token: &str) -> Self {
+        let trimmed = sas_token.trim_start_matches('?');
+        let pairs = azure_core::http::Url::parse(&format!("https://x/?{trimmed}"))
+            .map(|u| {
+                u.query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { pairs }
+    }
+}
+
+#[async_trait::async_trait]
+impl Policy for SasPolicy {
+    async fn send(
+        &self,
+        ctx: &Context,
+        request: &mut Request,
+        next: &[Arc<dyn Policy>],
+    ) -> PolicyResult {
+        // Merge the SAS pairs into the request URL, skipping any already present
+        // so a snapshot/comp query the SDK added is preserved.
+        let existing: std::collections::HashSet<String> = request
+            .url()
+            .query_pairs()
+            .map(|(k, _)| k.into_owned())
+            .collect();
+        let to_add: Vec<(String, String)> = self
+            .pairs
+            .iter()
+            .filter(|(k, _)| !existing.contains(k))
+            .cloned()
+            .collect();
+        if !to_add.is_empty() {
+            let mut qp = request.url_mut().query_pairs_mut();
+            for (k, v) in &to_add {
+                qp.append_pair(k, v);
+            }
+        }
         next[0].send(ctx, request, &next[1..]).await
     }
 }

@@ -83,6 +83,14 @@ struct Cli {
     #[arg(long, env = "AZURE_STORAGE_KEY", conflicts_with_all = ["msi", "msi_client_id", "msi_object_id", "msi_resource_id", "workload_identity"])]
     account_key: Option<String>,
 
+    /// Shared Access Signature (SAS) token authenticating the blob.
+    ///
+    /// The query string of a SAS URL (with or without a leading `?`). Used to
+    /// read a `templateBlobUrl` golden image that carries its own SAS (possibly
+    /// in a different storage account). Takes precedence over other auth modes.
+    #[arg(long, env = "AZURE_STORAGE_SAS")]
+    sas_token: Option<String>,
+
     /// Enable system-assigned Managed Identity.
     #[arg(long, env = "AZURE_USE_MSI")]
     msi: bool,
@@ -152,7 +160,14 @@ enum Command {
         /// The ublk device / NBD export is advertised read-only and every
         /// write, discard, and write-zeroes request is rejected.  Implied when
         /// `--snapshot` is set.
-        #[arg(long, env = "UBLK_READ_ONLY")]
+        #[arg(
+            long,
+            env = "UBLK_READ_ONLY",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
         read_only: bool,
 
         /// Number of io_uring queues.
@@ -187,7 +202,14 @@ enum Command {
         /// ("blob lock") and a Kubernetes `coordination.k8s.io` Lease ("cluster
         /// lease") before mounting, so at most one node serves the volume.
         /// Requires the `coordination` build feature.
-        #[arg(long, env = "UBLK_COORDINATION")]
+        #[arg(
+            long,
+            env = "UBLK_COORDINATION",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
         coordination: bool,
 
         /// Recovery timeout (seconds): how long a holder's cluster lease may go
@@ -272,6 +294,26 @@ enum Command {
     Test {
         /// Device size to use for the test blob.
         #[arg(long, default_value = "4096")]
+        size: u64,
+    },
+
+    /// Copy a golden-image *template* blob into the configured target blob
+    /// (`--container` / `--blob`), then exit.
+    ///
+    /// This is the same server-side-style streamed copy the CSI controller uses
+    /// to provision a read-write volume from `templateBlobUrl`. The target blob
+    /// is created sized to hold the template (and at least `--size`). Requires
+    /// the `csi` build feature.
+    #[cfg(feature = "csi")]
+    Copy {
+        /// Full Azure blob URL of the template (may carry a SAS and/or
+        /// `snapshot=` query).
+        #[arg(long, env = "TEMPLATE_BLOB_URL")]
+        template_url: String,
+
+        /// Minimum target size in bytes (the target is grown to the template
+        /// size when larger). Rounded up to 512.
+        #[arg(long, default_value = "0")]
         size: u64,
     },
 
@@ -515,6 +557,14 @@ async fn main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "csi")]
+        Command::Copy {
+            ref template_url,
+            size,
+        } => {
+            run_template_copy(&cli, &endpoint, template_url, size).await?;
+        }
+
+        #[cfg(feature = "csi")]
         Command::Csi {
             csi_endpoint,
             node_id,
@@ -580,7 +630,55 @@ fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<AzurePag
     Ok(Arc::new(backend))
 }
 
-/// Best-effort node hostname for the CSI `--node-id` default.
+/// Copy a `templateBlobUrl` golden image into the configured target blob
+/// (`--container` / `--blob`) using the shared streamed copy. Mirrors what the
+/// CSI controller does when provisioning a read-write volume from a template.
+#[cfg(feature = "csi")]
+async fn run_template_copy(
+    cli: &Cli,
+    endpoint: &str,
+    template_url: &str,
+    min_size: u64,
+) -> anyhow::Result<()> {
+    use backend::azure::AzurePageBlobBackend;
+    use csi::{copy_blob, parse_blob_url, round_up_512};
+
+    let tmpl = parse_blob_url(template_url).context("parse --template-url")?;
+
+    // Authenticate the source with its own SAS when present; otherwise reuse the
+    // CLI credentials (the template must then be reachable with them).
+    let (src_service_url, src_auth) = if let Some(sas) = &tmpl.sas {
+        (
+            format!("{}/", tmpl.service_url.trim_end_matches('/')),
+            AuthConfig::Sas {
+                sas_token: sas.clone(),
+            },
+        )
+    } else {
+        (endpoint.to_string(), build_auth(cli)?)
+    };
+    let src_container = auth::build_container_client(&src_service_url, &tmpl.container, &src_auth)
+        .context("build template container client")?;
+    let mut source = AzurePageBlobBackend::new(src_container, tmpl.blob.clone());
+    if let Some(snapshot) = &tmpl.snapshot {
+        source = source.with_snapshot(snapshot.clone());
+    }
+    let source_size = source.size().await.context("stat template blob")?;
+    let size = round_up_512(source_size.max(min_size));
+
+    let dest = build_azure_backend(cli, endpoint)?;
+    info!(
+        template = %template_url, source_size, target_size = size,
+        container = %cli.container, "copying template into target blob"
+    );
+    dest.create(size).await.context("create target blob")?;
+    copy_blob(&source, dest.as_ref(), source_size)
+        .await
+        .context("copy template blob")?;
+    info!("template copy complete");
+    Ok(())
+}
+
 #[cfg(feature = "csi")]
 fn hostname() -> String {
     std::env::var("HOSTNAME")
@@ -700,6 +798,12 @@ fn cache_file_name(container: &str, blob: &str) -> String {
 }
 
 fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
+    if let Some(sas) = &cli.sas_token {
+        return Ok(AuthConfig::Sas {
+            sas_token: sas.clone(),
+        });
+    }
+
     if let Some(key) = &cli.account_key {
         return Ok(AuthConfig::SharedKey {
             account_name: cli.account.clone(),

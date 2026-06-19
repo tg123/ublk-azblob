@@ -130,6 +130,7 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.fsType` | Filesystem type | `ext4` |
 | `storageClass.parameters.snapshot` | Target an immutable blob snapshot (implies read-only) | `""` |
 | `storageClass.parameters.readOnly` | Expose the volume read-only (`"true"`/`"false"`) | `""` |
+| `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (SAS/snapshot optional). Read-only/snapshot ⇒ mount directly (no copy, no lock/lease); read-write ⇒ copy into the per-PVC blob and skip format | `""` |
 
 ### Global Secret Configuration (secretSearchMode: global)
 

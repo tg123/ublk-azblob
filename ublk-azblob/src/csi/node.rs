@@ -163,6 +163,12 @@ impl NodeService {
         if read_only {
             env.push(("UBLK_READ_ONLY".to_string(), "1".to_string()));
         }
+        // SAS token from a `templateBlobUrl` that carries its own signature; the
+        // child `run` process authenticates the (possibly cross-account) template
+        // blob with it instead of the driver credentials.
+        if let Some(sas) = get("sasToken").filter(|s| !s.is_empty()) {
+            env.push(("AZURE_STORAGE_SAS".to_string(), sas));
+        }
         Ok(env)
     }
 }
@@ -243,6 +249,13 @@ impl Node for NodeService {
                 .get("snapshot")
                 .is_some_and(|s| !s.is_empty());
         let readonly = req.readonly || device_read_only;
+        // A volume copied from a `templateBlobUrl` already carries a filesystem;
+        // never reformat it (the copy is the user's golden image).
+        let from_template = req
+            .volume_context
+            .get("fromTemplate")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
         let volumes = self.volumes.clone();
         let publish_lock = self.publish_lock.clone();
         let use_nbd = self.config.use_nbd;
@@ -314,6 +327,10 @@ impl Node for NodeService {
             let outcome = (|| -> anyhow::Result<()> {
                 if mount::has_filesystem(&device) {
                     info!(device = %device, "existing filesystem detected; skipping mkfs");
+                } else if from_template {
+                    // The blob was copied from a golden-image template, which is
+                    // already formatted; never reformat it.
+                    info!(device = %device, "volume copied from template; skipping mkfs");
                 } else if readonly {
                     // A read-only device has no filesystem we can create; the
                     // blob must already contain one.

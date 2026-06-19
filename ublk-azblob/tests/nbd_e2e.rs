@@ -60,6 +60,9 @@ const NBD_ADDR_ROUNDTRIP: &str = "127.0.0.1:11809";
 /// from [`NBD_ADDR_ROUNDTRIP`] so the two tests can run in parallel (the default
 /// for `cargo test`) without racing for a single socket.
 const NBD_ADDR_READ_ONLY: &str = "127.0.0.1:11810";
+/// Host:port for the `nbd_template_copy` test (distinct so it can run in
+/// parallel with the others).
+const NBD_ADDR_TEMPLATE: &str = "127.0.0.1:11811";
 const BLOB_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 const NUM_REGIONS: usize = 8;
 /// Logical block size advertised by the NBD target (matches `BLOCK_SIZE` in
@@ -623,10 +626,113 @@ fn nbd_read_only() {
     log("nbd read-only e2e PASSED ✓");
 }
 
+/// e2e for the `templateBlobUrl` read-write copy path (`ublk-azblob copy`).
+///
+/// Cycle:
+///   1. provision a *template* blob, write random regions, flush, stop — this is
+///      the golden image
+///   2. run `ublk-azblob copy` to clone the template into a fresh target blob
+///   3. open the target read-write over NBD and assert every region matches the
+///      template (the copy round-tripped), and that the target is writable
+///      (write a new region and read it back)
+#[test]
+fn nbd_template_copy() {
+    if !azurite_available() {
+        eprintln!(
+            "skipping nbd_template_copy: Azurite is not reachable at {} \
+             (set AZURE_STORAGE_ENDPOINT and start Azurite to run this test)",
+            endpoint_authority()
+        );
+        return;
+    }
+    assert!(
+        TcpStream::connect(NBD_ADDR_TEMPLATE).is_err(),
+        "{NBD_ADDR_TEMPLATE} is already in use; another NBD server is running"
+    );
+
+    let container = env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER);
+    let template_blob = format!("{}-tmpl-src", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB));
+    let target_blob = format!("{}-tmpl-dst", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB));
+
+    // ── Phase 1: build the golden-image template blob ─────────────────────────
+    let child = start_server(NBD_ADDR_TEMPLATE, &container, &template_blob, true);
+    let mut client = NbdClient::connect(NBD_ADDR_TEMPLATE);
+    log(&format!(
+        "writing {NUM_REGIONS} random regions to the template"
+    ));
+    let mut checksums: Vec<(u64, usize, String)> = Vec::with_capacity(NUM_REGIONS);
+    for i in 0..NUM_REGIONS {
+        let offset = (i as u64) * 1024 * 1024;
+        let blocks = 1 + (i * 7) % 64;
+        let len = blocks * BLOCK_SIZE as usize;
+        let data = random_bytes(len);
+        client.write_at(offset, &data);
+        checksums.push((offset, len, sha256_hex(&data)));
+    }
+    client.flush();
+    client.disconnect();
+    sleep(Duration::from_secs(1));
+    stop_server(child);
+    wait_for_port_release(NBD_ADDR_TEMPLATE);
+
+    // ── Phase 2: copy the template into a fresh target blob ───────────────────
+    let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
+    let template_url = format!(
+        "{}/{}/{}",
+        endpoint.trim_end_matches('/'),
+        container,
+        template_blob
+    );
+    run_copy(&template_url, &container, &target_blob);
+
+    // ── Phase 3: open the target read-write and verify the copy ───────────────
+    let child = start_server(NBD_ADDR_TEMPLATE, &container, &target_blob, false);
+    let mut client = NbdClient::connect(NBD_ADDR_TEMPLATE);
+    log("verifying the copied target matches the template");
+    for (offset, len, expected) in &checksums {
+        let got = client.read_at(*offset, *len as u32);
+        assert_eq!(
+            &sha256_hex(&got),
+            expected,
+            "copied target differs from template at offset {offset}"
+        );
+    }
+    // The target is a writable per-volume blob (unlike a read-only mount): write
+    // a fresh region and read it back to prove it accepts writes.
+    let extra_offset = 32 * 1024 * 1024;
+    let extra = random_bytes(BLOCK_SIZE as usize);
+    client.write_at(extra_offset, &extra);
+    let got = client.read_at(extra_offset, BLOCK_SIZE as u32);
+    assert_eq!(
+        sha256_hex(&got),
+        sha256_hex(&extra),
+        "target is not writable after copy"
+    );
+    client.flush();
+    client.disconnect();
+    sleep(Duration::from_secs(1));
+    stop_server(child);
+
+    log("nbd template copy e2e PASSED ✓");
+}
+
 /// Wait for `addr` to be released so the next server can bind it.
 fn wait_for_port_release(addr: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && TcpStream::connect(addr).is_ok() {
         sleep(Duration::from_millis(500));
     }
+}
+
+/// Run the one-shot `ublk-azblob copy --template-url <url>` subcommand, copying
+/// the template into the target `container`/`blob`. Panics on failure.
+fn run_copy(template_url: &str, container: &str, target_blob: &str) {
+    let bin = std::env::var("UBLK_AZBLOB_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
+    let mut cmd = Command::new(&bin);
+    cmd.arg("copy").arg("--template-url").arg(template_url);
+    azure_env(&mut cmd, container, target_blob);
+    log(&format!("$ ublk-azblob copy --template-url {template_url}"));
+    let status = cmd.status().expect("spawn ublk-azblob copy");
+    assert!(status.success(), "`ublk-azblob copy` failed with {status}");
 }
