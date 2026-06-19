@@ -174,6 +174,34 @@ identifier (the snapshot timestamp) to stdout.
 
 ---
 
+## Helper scripts
+
+The [`scripts/`](scripts/) folder holds convenience bash scripts for common
+workflows. `scripts/import-folder.sh` drives the full block-device path —
+start device → `mkfs` → mount → copy a folder in → flush (`SIGUSR1`) → unmount →
+stop — and prints the resulting blob URL:
+
+```bash
+sudo modprobe ublk_drv
+cargo build --release --features ublk -p ublk-azblob
+
+sudo AZURE_STORAGE_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
+  scripts/import-folder.sh \
+    --endpoint http://127.0.0.1:10000/devstoreaccount1 \
+    --account devstoreaccount1 \
+    --container mycontainer \
+    --blob folder.img \
+    --src ./mydir \
+    --size 268435456
+# prints the blob URL on success
+```
+
+Unlike `ublk-azblob-import` (which packs a folder into a single tar image), this
+script writes a real mounted filesystem image. See
+[scripts/README.md](scripts/README.md) for details.
+
+---
+
 ## Environment variables
 
 All CLI flags have environment-variable equivalents:
@@ -299,6 +327,8 @@ ublk-azblob/
 ├── Cargo.toml                  # workspace root
 ├── DESIGN.md                   # architecture & phased plan
 ├── README.md                   # this file
+├── scripts/
+│   └── import-folder.sh        # start → mkfs → mount → copy → flush → URL
 ├── ublk-azblob/
 │   ├── Cargo.toml              # pinned dependencies
 │   ├── src/
