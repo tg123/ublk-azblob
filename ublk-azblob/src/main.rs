@@ -520,6 +520,7 @@ async fn main() -> anyhow::Result<()> {
             workload,
             create,
         } => {
+            let backend: Arc<dyn BlobBackend> = build_azure_backend(&cli, &endpoint)?;
             bench::run_bench(
                 backend,
                 bench::BenchConfig {
