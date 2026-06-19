@@ -136,6 +136,15 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
 /// `stop_server`), so the zombie-process lint does not apply.
 #[allow(clippy::zombie_processes)]
 fn start_server(container: &str, blob: &str, create: bool) -> Child {
+    start_server_opts(container, blob, create, false)
+}
+
+/// Like [`start_server`] but with an explicit `disable_auto_flush` toggle. When
+/// set, the server runs with `--idle-flush-secs 0 --force-flush-timeout-secs 0`
+/// so the only thing that can persist a buffered write is an explicit
+/// `NBD_CMD_FLUSH` or the flush-on-shutdown path.
+#[allow(clippy::zombie_processes)]
+fn start_server_opts(container: &str, blob: &str, create: bool, disable_auto_flush: bool) -> Child {
     log(&format!(
         "starting NBD server on {NBD_ADDR} ({})",
         if create { "--create" } else { "reuse blob" }
@@ -152,6 +161,12 @@ fn start_server(container: &str, blob: &str, create: bool) -> Child {
         .arg(NBD_ADDR);
     if create {
         cmd.arg("--create");
+    }
+    if disable_auto_flush {
+        cmd.arg("--idle-flush-secs")
+            .arg("0")
+            .arg("--force-flush-timeout-secs")
+            .arg("0");
     }
     azure_env(&mut cmd, container, blob);
 
@@ -175,12 +190,40 @@ fn start_server(container: &str, blob: &str, create: bool) -> Child {
 }
 
 /// Stop the running NBD server: the data was already flushed (`NBD_CMD_FLUSH` +
-/// `NBD_CMD_DISC`) before this is called, so the process is simply killed.  The
-/// NBD path installs no signal handler, so a clean exit status is not expected.
+/// `NBD_CMD_DISC`) before this is called, so the process is simply killed.
 fn stop_server(mut child: Child) {
     log(&format!("stopping NBD server (pid {})", child.id()));
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Send `sig` to the running child process.
+fn signal(child: &Child, sig: i32) {
+    // SAFETY: `kill` is safe to call with a valid pid and signal number.
+    let rc = unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+    assert_eq!(
+        rc,
+        0,
+        "kill({sig}) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Stop the NBD server cleanly via `SIGINT` and wait for it to exit.
+///
+/// `run_nbd_target` installs SIGINT/SIGTERM handlers that flush all dirty data
+/// to the page blob before exiting, so a clean (zero) exit status is expected.
+fn stop_server_graceful(mut child: Child) {
+    log(&format!(
+        "SIGINT NBD server (pid {}) — relies on the shutdown flush",
+        child.id()
+    ));
+    signal(&child, libc::SIGINT);
+    let status = child.wait().expect("wait for NBD server to exit");
+    assert!(
+        status.success(),
+        "NBD server exited with non-zero status on SIGINT: {status}"
+    );
 }
 
 /// SHA-256 of a byte slice, as a lowercase hex string.
@@ -446,4 +489,86 @@ fn nbd_roundtrip() {
     stop_server(child);
 
     log("nbd e2e PASSED ✓");
+}
+
+/// Graceful-shutdown e2e for the NBD target: prove a write buffered only in
+/// memory is flushed to the page blob when the server receives `SIGINT` — with
+/// **no** explicit `NBD_CMD_FLUSH`, **no** disconnect FLUSH, and **no**
+/// automatic (idle/force) flush — and that the data survives restarting the
+/// server over the same blob.
+///
+/// This validates the SIGINT/SIGTERM shutdown flush in
+/// `nbd_target::run_nbd_target`: the client writes a pattern and then the
+/// process is SIGINT'd directly (instead of `kill`), so without the
+/// flush-on-shutdown the pattern would be lost after the restart.
+#[test]
+fn nbd_graceful_shutdown_flush() {
+    if !azurite_available() {
+        eprintln!(
+            "skipping nbd_graceful_shutdown_flush: Azurite is not reachable at {} \
+             (set AZURE_STORAGE_ENDPOINT and start Azurite to run this test)",
+            endpoint_authority()
+        );
+        return;
+    }
+    assert!(
+        TcpStream::connect(NBD_ADDR).is_err(),
+        "{NBD_ADDR} is already in use; another NBD server is running"
+    );
+
+    let container = env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER);
+    // Distinct blob so this test never collides with `nbd_roundtrip`.
+    let blob = format!("{}-shutdown", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB));
+
+    // ── Phase 1: provision the blob, write regions, then SIGINT (no FLUSH) ─────
+    // Auto-flushing is disabled so only the shutdown flush can persist the data.
+    let child = start_server_opts(&container, &blob, true, true);
+    let mut client = NbdClient::connect();
+
+    log(&format!("writing {NUM_REGIONS} random regions (no NBD_CMD_FLUSH)"));
+    let mut checksums: Vec<(u64, usize, String)> = Vec::with_capacity(NUM_REGIONS);
+    for i in 0..NUM_REGIONS {
+        let offset = (i as u64) * 1024 * 1024;
+        let blocks = 1 + (i * 7) % 64;
+        let len = blocks * BLOCK_SIZE as usize;
+        let data = random_bytes(len);
+        client.write_at(offset, &data);
+        let sum = sha256_hex(&data);
+        println!("{sum}  offset={offset} len={len}");
+        checksums.push((offset, len, sum));
+    }
+
+    // Drop the connection *without* NBD_CMD_FLUSH or NBD_CMD_DISC, so the only
+    // path that can persist the buffered writes is the SIGINT shutdown flush.
+    drop(client);
+    log("SIGINT the server (relies solely on the shutdown flush)");
+    stop_server_graceful(child);
+
+    // Wait for the port to be released so the second server can bind it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && TcpStream::connect(NBD_ADDR).is_ok() {
+        sleep(Duration::from_millis(500));
+    }
+
+    // ── Phase 2: restart over the same blob and verify the pattern survived ────
+    let child = start_server(&container, &blob, false);
+    let mut client = NbdClient::connect();
+
+    log("verifying regions after SIGINT shutdown + restart");
+    for (offset, len, expected) in &checksums {
+        let got = client.read_at(*offset, *len as u32);
+        assert_eq!(
+            &sha256_hex(&got),
+            expected,
+            "post-shutdown checksum mismatch at offset {offset} — the buffered \
+             write was not flushed on SIGINT"
+        );
+        println!("offset={offset}: OK");
+    }
+
+    client.disconnect();
+    sleep(Duration::from_secs(1));
+    stop_server(child);
+
+    log("nbd graceful shutdown e2e PASSED ✓");
 }
