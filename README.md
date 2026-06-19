@@ -34,6 +34,11 @@ cargo build --release -p ublk-azblob
 
 # Build with real ublk device support (requires Linux ≥6.0 + ublk_drv)
 cargo build --release -p ublk-azblob --features ublk
+
+# Build with the Kubernetes CSI driver
+# (needs `protoc` plus the protobuf well-known types, e.g. apt
+#  `protobuf-compiler libprotobuf-dev`; combine with `ublk`)
+cargo build --release -p ublk-azblob --features "ublk csi"
 ```
 
 ---
@@ -221,6 +226,82 @@ it is gated behind the `ublk` feature and skips itself when not run as root with
 
 ---
 
+## Kubernetes (CSI driver)
+
+`ublk-azblob` ships an in-tree **Container Storage Interface (CSI)** driver so
+each `PersistentVolumeClaim` is provisioned as one Azure Page Blob and exposed
+to pods as an ext4 filesystem on a ublk block device. The driver is the same
+binary, built with `--features "ublk csi"` and run via the `csi` subcommand:
+
+```bash
+# controller (provisions/deletes page blobs) — runs in a Deployment
+ublk-azblob csi --role controller --csi-endpoint unix:///csi/csi.sock
+
+# node (attaches the ublk device + mounts the filesystem) — runs in a DaemonSet
+ublk-azblob csi --role node --csi-endpoint unix:///csi/csi.sock
+```
+
+Driver name: `azblob.ublk.csi.tg123.github.io`. Volume IDs encode the blob
+location as `<account>/<container>/<blob>`; the endpoint comes from the driver's
+environment (`AZURE_STORAGE_*`), while the storage account and container can be
+overridden per `StorageClass` via the `storageAccount` and `container`
+parameters (the account is encoded in the volume ID so `DeleteVolume` can recover
+a per-volume account).
+
+### Deploy
+
+The `ublk_drv` kernel module must be loaded on every node
+(`sudo modprobe ublk_drv`); a container cannot load it.
+
+```bash
+# 1. Build + publish the driver image (or load it into your cluster).
+#    CI publishes ghcr.io/tg123/ublk-azblob (and Docker Hub) on push to
+#    main and on version tags via .github/workflows/docker.yml; to build
+#    locally instead:
+docker build -f deploy/Dockerfile -t ghcr.io/tg123/ublk-azblob:latest .
+
+# 2. Install the Helm chart (CSIDriver, RBAC, controller, node, StorageClass).
+#    See deploy/chart/README.md for all values (auth, NBD mode, secrets, ...).
+helm install csi-ublk-azblob deploy/chart \
+  --namespace kube-system \
+  --set image.repository=ghcr.io/tg123/ublk-azblob --set image.tag=latest
+
+# 3. Provide storage credentials to the namespace that will use the driver
+#    (per-namespace mode, the default). For SharedKey auth:
+kubectl -n <your-namespace> create secret generic azblob-csi-secret \
+  --from-literal=AZURE_STORAGE_ACCOUNT=<storage-account> \
+  --from-literal=accountKey=<storage-key>   # omit when using Managed Identity
+
+# 4. Create a PVC + pod
+kubectl apply -f deploy/example/pvc.yaml
+kubectl apply -f deploy/example/pod.yaml
+```
+
+On an Azure VM/AKS node with Managed Identity, drop `accountKey` from the secret
+and add `AZURE_USE_MSI=true` (optionally `AZURE_MSI_CLIENT_ID`) to the driver
+containers instead.
+
+### Kubernetes e2e
+
+The **PVC lifecycle** e2e ([tests/k8s_pvc_e2e.rs](ublk-azblob/tests/k8s_pvc_e2e.rs))
+runs against a multi-node `k3s` cluster started by
+[tests/e2e/docker-compose.yml](tests/e2e/docker-compose.yml): it deploys the
+driver via Helm, provisions a PVC, writes random data, tears the pod down, and
+remounts the same PVC (including across nodes) to verify the data survived the
+round-trip through the page blob. The whole suite — mount, NBD and PVC — shares
+one compile of the shipped image and runs together:
+
+```bash
+sudo modprobe ublk_drv
+sudo mkdir -p /var/lib/kubelet && sudo mount -t tmpfs tmpfs /var/lib/kubelet \
+  && sudo mount --make-shared /var/lib/kubelet
+docker compose -f tests/e2e/docker-compose.yml up \
+  --build --abort-on-container-exit --exit-code-from runner
+docker compose -f tests/e2e/docker-compose.yml down -v
+```
+
+---
+
 ## Running unit tests
 
 ```bash
@@ -235,9 +316,11 @@ Unit tests run against `MemBackend` — no network, no kernel required.
 
 GitHub Actions runs on every push to `main` and every pull request:
 - `cargo fmt --check`
-- `cargo clippy -- -D warnings` (with and without `--features ublk`)
-- `cargo test` (unit tests, `MemBackend`)
-- the full mount-based e2e (`/dev/ublkbN` + ext4 ↔ Azurite)
+- `cargo clippy --all-features -- -D warnings`
+- `cargo test --all-features` (unit tests, `MemBackend`)
+- the `e2e` workflow: one job that builds the shipped image once and runs the
+  mount (`/dev/ublkbN` + ext4 ↔ Azurite), NBD, and Kubernetes PVC e2e against a
+  k3s cluster from `tests/e2e/docker-compose.yml`.
 
 The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
 `linux-modules-extra`, and runs the mount/remount/checksum cycle as root.
@@ -259,17 +342,29 @@ ublk-azblob/
 │   │   ├── main.rs             # CLI entry point (clap)
 │   │   ├── auth.rs             # MSI + SharedKey credential factory
 │   │   ├── ublk_target.rs      # ublk device I/O loop (gated on --features ublk)
+│   │   ├── csi/                # Kubernetes CSI driver (gated on --features csi)
+│   │   │   ├── mod.rs          # gRPC server, role/config, volume-id encoding
+│   │   │   ├── identity.rs     # CSI Identity service
+│   │   │   ├── controller.rs   # CSI Controller service (Create/DeleteVolume)
+│   │   │   ├── node.rs         # CSI Node service (attach ublk device + mount)
+│   │   │   └── mount.rs        # mkfs/mount/umount + ublk device discovery
 │   │   └── backend/
 │   │       ├── mod.rs          # BlobBackend trait (SDK isolation boundary)
 │   │       ├── azure.rs        # AzurePageBlobBackend (real SDK impl)
 │   │       ├── buffered.rs     # BufferedBackend (in-memory write-back cache)
 │   │       ├── file.rs         # FileCacheBackend (persistent local-disk cache)
 │   │       └── mem.rs          # MemBackend (in-memory, for unit tests)
+│   ├── proto/csi/csi.proto     # vendored CSI spec (codegen via build.rs)
 │   └── tests/
 │       └── mount_e2e.rs        # full mount → write → flush → remount → verify
+├── deploy/
+│   ├── Dockerfile              # CSI driver image (--features "ublk csi")
+│   ├── chart/                  # Helm chart (CSIDriver, RBAC, controller, node, StorageClass)
+│   └── example/                # sample PVC + pod
 ├── tests/
 │   └── e2e/
-│       ├── docker-compose.yml  # Azurite + test runner for the e2e test
-│       └── Dockerfile          # build + test runner image (rust + e2fsprogs)
+│       ├── docker-compose.yml  # Azurite + k3s + runner for the whole e2e suite
+│       ├── Dockerfile          # e2e runner image (rust + docker/kubectl/helm)
+│       └── k8s/                # k8s manifests for the PVC e2e (helm values, writer/reader jobs)
 └── LICENSE.md                  # MIT license
 ```

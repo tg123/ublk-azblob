@@ -25,14 +25,16 @@ jobs:
           sudo modprobe ublk_drv
           ls -l /dev/ublk-control
 
+      - name: Make a shared mount for CSI mount propagation
+        run: |
+          sudo mkdir -p /tmp/ublk-e2e/kubelet
+          sudo mount -t tmpfs tmpfs /tmp/ublk-e2e/kubelet
+          sudo mount --make-shared /tmp/ublk-e2e/kubelet
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build e2e runner image (BuildKit + GHA cache)
-        # Pre-build the `runner` image with BuildKit so its apt layers
-        # (e2fsprogs/util-linux/kmod/libclang-dev) are cached across runs in the
-        # GitHub Actions cache.  Tagged to match the `image:` in the compose
-        # file so the later `up` (without --build) reuses it.
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -42,11 +44,10 @@ jobs:
           cache-from: type=gha,scope=e2e-runner
           cache-to: type=gha,mode=max,scope=e2e-runner
 
-      - name: Cache cargo registry and target (e2e, --features ublk)
-        # The compile happens inside the `runner` container, which writes
+      - name: Cache cargo registry and target
+        # The compile happens inside the runner container, which writes
         # CARGO_HOME to /workspace/.cargo-home and target/ to /workspace/target
-        # (both on the bind-mounted workspace, i.e. this checkout).  A distinct
-        # key keeps this --features ublk build separate from the ci.yml cache.
+        # (both on the bind-mounted checkout).
         uses: actions/cache@v4
         with:
           path: |
@@ -54,22 +55,17 @@ jobs:
             .cargo-home/registry/cache
             .cargo-home/git/db
             target
-          key: e2e-ublk-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: e2e-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            e2e-ublk-cargo-${{ runner.os }}-
+            e2e-cargo-${{ runner.os }}-
 
-      - name: Run e2e (build + test in docker compose runner)
-        # The `runner` service builds with --features ublk and runs both the
-        # ublk mount/remount/checksum test and the NBD roundtrip test; Azurite
-        # is brought up as its dependency.  No --build: the image was prebuilt
-        # above so the GHA-cached layers are reused.
+      - name: Run e2e (compile once, mount + NBD + k8s PVC)
         run: |
+          KUBELET_DIR=/tmp/ublk-e2e/kubelet \
           docker compose -f tests/e2e/docker-compose.yml up \
             --abort-on-container-exit --exit-code-from runner
 
       - name: Normalize cache ownership
-        # The container builds as root, so the cargo/target files it wrote are
-        # root-owned; chown them back so actions/cache can read them on save.
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" .cargo-home target || true
 

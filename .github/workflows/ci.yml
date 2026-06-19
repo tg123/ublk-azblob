@@ -21,14 +21,22 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      - name: Install build dependencies (protoc + libclang for all features)
+        run: |
+          sudo apt-get update
+          # protobuf-compiler + libprotobuf-dev: protoc and the well-known types
+          #   (google/protobuf/*.proto) imported by csi.proto.
+          # libclang-dev: libclang for the libublk bindgen (ublk feature).
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev libclang-dev
+
       - name: cargo fmt --check
         run: cargo fmt --check
 
-      - name: cargo clippy
-        run: cargo clippy -- -D warnings
+      # Lint and test the full shipped feature set in one pass — we never ship a
+      # partially-compiled binary, so CI checks everything together.
+      - name: cargo clippy (all features)
+        run: cargo clippy --all-features -- -D warnings
 
-      - name: cargo clippy (ublk feature — kernel target compiles)
-        run: cargo clippy --features ublk -- -D warnings
-
-      - name: cargo test (unit tests, MemBackend — no kernel required)
-        run: cargo test
+      - name: cargo test (all features)
+        run: cargo test --all-features

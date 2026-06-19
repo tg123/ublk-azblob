@@ -162,6 +162,53 @@ the filesystem or application.  The device does **not** silently eat errors.
 
 ---
 
+## Kubernetes CSI Driver
+
+The same binary doubles as a Kubernetes **Container Storage Interface (CSI)**
+driver (built with `--features "ublk csi"`, run via the `csi` subcommand). It
+reuses the ublk + Page Blob stack unchanged: each PVC maps to one page blob,
+attached as a ublk device and mounted as ext4.
+
+```
+   kube-apiserver
+        │  PVC
+        ▼
+   external-provisioner ──unix──► CSI Controller (`csi --role controller`)
+                                     └─ BlobBackend::create / delete  → page blob
+   ─────────────────────────────────────────────────────────────────────────────
+   kubelet ──unix──► CSI Node (`csi --role node`)   (DaemonSet, privileged)
+                        ├─ NodePublishVolume → spawn `ublk-azblob run` → /dev/ublkbN
+                        │                      → mkfs.ext4 (first use) → mount(target)
+                        └─ NodeUnpublishVolume → umount → SIGINT child (flush + teardown)
+```
+
+Key decisions:
+
+1. **One binary, two roles.** Controller and node are split by `--role` so they
+   can run as a Deployment and a DaemonSet respectively, sharing all backend and
+   auth code.
+2. **No attach stage.** `attachRequired: false`; the node plugin attaches the
+   ublk device directly in `NodePublishVolume`, so there is no
+   ControllerPublish/VolumeAttachment round-trip.
+3. **Volume identity.** A volume ID is `<account>/<container>/<blob>` (account
+   and container names cannot contain `/`). The blob name comes from the
+   configured blob-path template (default `ublk-azblob-disk/${pv.name}`), not
+   necessarily the raw CSI volume name. The endpoint is driver-level config
+   (env); the account and container are `StorageClass` parameters, and the
+   account is encoded in the ID so `DeleteVolume` — which only gets the volume
+   ID and secrets — can recover a per-volume account.
+4. **Node spawns the existing `run` path.** Rather than re-implementing the
+   device loop, the node plugin spawns `ublk-azblob run` as a child per volume,
+   discovers the new `/dev/ublkbN` under a publish lock, and tracks the child so
+   `NodeUnpublishVolume` can signal it for a clean flush + teardown. The device
+   sizes itself from the existing blob, so a remount reuses the persisted data.
+
+The CSI protobuf is vendored at `ublk-azblob/proto/csi/csi.proto` and compiled
+by `build.rs` **only** when the `csi` feature is enabled, so the default build
+needs no `protoc`.
+
+---
+
 ## The Thin SDK Trait Boundary
 
 The Azure Rust SDK is preview (`0.x`); its API has changed in every minor

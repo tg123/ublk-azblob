@@ -45,7 +45,9 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000/devstoreaccount1";
 const DEFAULT_CONTAINER: &str = "e2etest";
 const DEFAULT_BLOB: &str = "mounttest";
 
-const DEV_ID: &str = "0";
+// High device id (away from 0,1,…) so these tests don't collide with the ublk
+// devices the k8s CSI e2e auto-assigns from 0 when the whole suite runs together.
+const DEV_ID: &str = "40";
 const BLOB_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 const NUM_FILES: usize = 8;
 
@@ -131,8 +133,11 @@ fn start_device(spec: &DeviceSpec, create: bool) -> Child {
             None => String::new(),
         },
     ));
-    let bin = env!("CARGO_BIN_EXE_ublk-azblob");
-    let mut cmd = Command::new(bin);
+    // Prefer an externally-provided binary (the e2e runs the actual image built
+    // from deploy/Dockerfile); fall back to the cargo-built binary for local runs.
+    let bin = std::env::var("UBLK_AZBLOB_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
+    let mut cmd = Command::new(&bin);
     cmd.arg("run")
         .arg("--id")
         .arg(&spec.dev_id)
@@ -276,8 +281,8 @@ fn mount_roundtrip_file_cache() {
     let cache_dir = tempdir("ublk-azblob-cache");
     run_mount_roundtrip(DeviceSpec {
         // Distinct device id, container and blob so this test never collides
-        // with `mount_roundtrip`.
-        dev_id: "1".to_string(),
+        // with `mount_roundtrip` (or the k8s CSI e2e's low auto-assigned ids).
+        dev_id: "41".to_string(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-fcache", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: Some(cache_dir.clone()),

@@ -1,0 +1,80 @@
+# Helm values for e2e testing with k3s
+# This configures the CSI driver for testing with Azurite + NBD mode
+
+# Override the default Helm name (csi-ublk-azblob-ublk-azblob-csi)
+fullnameOverride: csi-ublk-azblob
+
+image:
+  repository: ublk-azblob
+  tag: e2e
+  pullPolicy: Never  # Use locally-loaded image
+
+controller:
+  replicas: 1
+  # Resolve <account>.azurite.kube-system.svc.cluster.local to the docker-compose
+  # Azurite's fixed IP (subdomain-style URL; pods egress to it via the node).
+  hostAliases:
+    - ip: "172.30.0.10"
+      hostnames:
+        - "devstoreaccount1.azurite.kube-system.svc.cluster.local"
+  # Controller needs endpoint too for provisioning
+  # Note: endpoint will be patched by test code
+  env:
+    - name: RUST_LOG
+      value: "info,azure_core=debug"
+    - name: AZURE_STORAGE_ACCOUNT
+      value: "devstoreaccount1"
+    - name: AZURE_STORAGE_KEY
+      value: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+    # Azurite endpoint - will be set by test
+    # - name: AZURE_STORAGE_ENDPOINT
+    #   value: "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/"
+
+node:
+  # NBD mode for better portability
+  useNbd: true
+  nbd:
+    portStart: 10809
+
+  # Resolve <account>.azurite.kube-system.svc.cluster.local to the docker-compose
+  # Azurite's fixed IP so the node plugin can reach blob storage to mount the volume.
+  hostAliases:
+    - ip: "172.30.0.10"
+      hostnames:
+        - "devstoreaccount1.azurite.kube-system.svc.cluster.local"
+
+  # Storage account credentials (Azurite well-known)
+  # Note: endpoint will be patched by test code
+  env:
+    - name: AZURE_STORAGE_ACCOUNT
+      value: "devstoreaccount1"
+    - name: AZURE_STORAGE_KEY
+      value: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+    # Azurite endpoint - will be set by test
+    # - name: AZURE_STORAGE_ENDPOINT
+    #   value: "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/"
+    
+    # Enable caching for migration testing
+    - name: UBLK_MAX_DIRTY_PAGES
+      value: "256"  # 256 * 4MB = 1GB
+    - name: UBLK_PAGE_SIZE
+      value: "4194304"  # 4MB
+    
+    # Flush timeouts
+    - name: UBLK_IDLE_FLUSH_SECS
+      value: "15"
+    - name: UBLK_FORCE_FLUSH_TIMEOUT_SECS
+      value: "600"
+
+  # Optional: local disk cache (commented out for basic test)
+  # volumeMounts:
+  #   - name: disk-cache
+  #     mountPath: /var/lib/ublk-cache
+  # 
+  # volumes:
+  #   - name: disk-cache
+  #     emptyDir:
+  #       sizeLimit: 1Gi
+
+storageClass:
+  name: azblob-ublk
