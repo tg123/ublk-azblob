@@ -261,8 +261,8 @@ GitHub-hosted runners do **not** load `ublk_drv` by default, but the module
 ships in `linux-modules-extra-$(uname -r)` and can be loaded with `modprobe`.
 The CI workflow therefore:
 
-1. **Always runs** `cargo fmt --check`, `cargo clippy` (default features and
-   `--no-default-features`), and `cargo test` (unit tests against `MemBackend`).
+1. **Always runs** `cargo fmt --check`, `cargo clippy`, and `cargo test` (unit
+   tests against `MemBackend`).
 2. **Runs the full mount e2e** on `ubuntu-22.04`: it loads `ublk_drv`, starts
    Azurite, builds the default (ublk) binary, then mounts an ext4 filesystem on
    `/dev/ublkbN`, writes random files, forces a flush via `SIGUSR1`, unmounts,
