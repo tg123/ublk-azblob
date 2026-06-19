@@ -236,7 +236,13 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 - ✅ CI: fmt + clippy + unit tests + mount e2e pipeline
 
 ### Phase 2 — Performance
-- Read cache (LRU, configurable size)
+- ✅ Read cache (LRU): the local-disk cache supports a configurable byte budget
+  (`--cache-max-bytes`) and evicts least-recently-used **clean** pages (by
+  hole-punching the sparse `.dat` file) once the budget is exceeded; dirty pages
+  are never evicted. The budget is shared across every process using the same
+  `--cache-dir` via a `flock`-coordinated, crash-safe `.cache-budget` file, so a
+  single noisy volume cannot fill a shared CSI node's cache disk. Stage 1 scope:
+  each process evicts only its own clean pages (no cross-process page sharing yet).
 - ✅ Persistent local-disk cache (`FileCacheBackend`), composable into a
   multi-level cache (memory → local disk → blob) with crash-recoverable dirty
   pages that are flushed to the blob on restart

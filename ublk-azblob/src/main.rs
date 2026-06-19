@@ -215,6 +215,17 @@ enum Command {
         #[arg(long, default_value = "1048576", env = "UBLK_CACHE_PAGE_SIZE")]
         cache_page_size: u64,
 
+        /// Maximum total bytes of cached page data on local disk, **shared
+        /// across all processes** using the same `--cache-dir` (0 = unlimited).
+        ///
+        /// When set, processes sharing the cache directory enforce one node-wide
+        /// LRU byte budget: clean (already-flushed) pages are evicted to stay
+        /// within the limit, so a single noisy volume cannot fill the disk.
+        /// Dirty (unflushed) pages are never evicted.  Only used when
+        /// `--cache-dir` is set.
+        #[arg(long, default_value = "0", env = "UBLK_CACHE_MAX_BYTES")]
+        cache_max_bytes: u64,
+
         /// Idle flush timeout in seconds: automatically flush dirty pages after N
         /// seconds of write inactivity.  Set to 0 to disable idle flushing.
         ///
@@ -342,6 +353,7 @@ async fn main() -> anyhow::Result<()> {
             ref lease_holder,
             ref cache_dir,
             cache_page_size,
+            cache_max_bytes,
             idle_flush_secs,
             force_flush_timeout_secs,
             flush_io_timeout_secs,
@@ -392,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
                 info!(
                     cache_dir = %dir.display(),
                     cache_page_size,
+                    cache_max_bytes,
                     "local-disk cache enabled"
                 );
                 let (cache, recovered_dirty) = FileCacheBackend::open(
@@ -403,6 +416,7 @@ async fn main() -> anyhow::Result<()> {
                             cli.blob.as_deref().unwrap_or_default(),
                         ),
                         page_size: cache_page_size,
+                        max_bytes: cache_max_bytes,
                     },
                     actual_size,
                 )

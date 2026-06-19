@@ -146,6 +146,7 @@ All CLI flags have environment-variable equivalents:
 | `--blob` | `AZURE_STORAGE_BLOB` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
+| `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
 | `--nbd` | `NBD_LISTEN` |
 
 ---
@@ -178,6 +179,35 @@ before a page is marked dirty, and the dirty bitmap is `fsync`ed on every change
 so **unflushed dirty data survives a crash or restart**. On startup the cache is
 recovered from disk and any recovered dirty pages are flushed to the blob, so
 in-flight writes are never silently lost.
+
+### Bounding the cache size (shared LRU byte budget)
+
+By default the local-disk cache grows without bound. Set `--cache-max-bytes`
+(or `UBLK_CACHE_MAX_BYTES`) to cap how much disk the cache may consume:
+
+```bash
+  --cache-dir /var/cache/ublk-azblob \
+  --cache-max-bytes 10737418240   # 10 GiB
+```
+
+When the cache exceeds the limit, the least-recently-used **clean** pages are
+evicted by punching holes in the sparse `.dat` file (reclaiming the disk
+blocks); the data is transparently re-fetched from the blob on the next access.
+Dirty (unflushed) pages are never evicted, so no write is ever lost — if every
+resident page is dirty the cache may temporarily exceed the limit until a flush
+makes pages clean again. `0` (the default) means unlimited.
+
+The budget is **shared across every `ublk-azblob` process that points at the
+same `--cache-dir`**, coordinated through a small `.cache-budget` file in that
+directory (locked with `flock`). This makes the cap meaningful in CSI / multi-volume
+scenarios where many per-volume processes share one node's cache disk: a single
+noisy volume cannot fill the disk at the expense of its neighbours. The shared
+total is crash-safe — entries for processes that died are pruned automatically.
+
+> **Scope (stage 1):** each process only ever evicts *its own* clean pages, so it
+> never touches a peer's cache files. The budget therefore bounds the aggregate
+> resident set of the *active* processes; a fully idle peer keeps its pages until
+> it next does I/O or exits. Cross-process page sharing is a future stage.
 
 ---
 

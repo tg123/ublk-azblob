@@ -5,6 +5,7 @@
 
 pub mod azure;
 pub mod buffered;
+pub mod cache_budget;
 pub mod file;
 pub mod mem;
 

@@ -27,12 +27,15 @@
 //! `present` (clean) pages are an optimization only; losing a `present` bit just
 //! forces a re-read from the inner backend, so those updates are not `fsync`ed.
 
+use super::cache_budget::CacheBudget;
 use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd as _;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 use tracing::{info, trace, warn};
@@ -53,6 +56,10 @@ pub struct FileCacheConfig {
     pub name: String,
     /// Size of each cache page in bytes (must be a non-zero multiple of 512).
     pub page_size: u64,
+    /// Maximum total bytes of cached page data on local disk, **shared across
+    /// all processes** using the same `dir` (see [`CacheBudget`]).  `0` means
+    /// unlimited (no eviction), preserving the original grow-only behaviour.
+    pub max_bytes: u64,
 }
 
 impl Default for FileCacheConfig {
@@ -61,7 +68,63 @@ impl Default for FileCacheConfig {
             dir: PathBuf::from("."),
             name: "ublk-azblob-cache".to_string(),
             page_size: 1024 * 1024, // 1 MiB
+            max_bytes: 0,           // unlimited
         }
+    }
+}
+
+/// In-memory LRU bookkeeping for resident (present) cache pages.
+///
+/// Tracks the recency of every present page and which of them are *evictable*
+/// (present **and** clean — dirty pages must be flushed, never dropped).  Only
+/// maintained when a [`CacheBudget`] is active.
+#[derive(Default)]
+struct Lru {
+    /// Monotonic access clock; higher = more recently used.
+    seq: u64,
+    /// Recency stamp of every present page.
+    by_page: HashMap<u64, u64>,
+    /// Evictable (clean, present) pages, ordered by recency stamp so the
+    /// smallest key is the least-recently-used eviction candidate.
+    evictable: BTreeMap<u64, u64>,
+}
+
+impl Lru {
+    /// Whether `page` is currently accounted as present.
+    fn contains(&self, page: u64) -> bool {
+        self.by_page.contains_key(&page)
+    }
+
+    /// Record an access to `page`, (re)classifying it as evictable iff `clean`.
+    fn touch(&mut self, page: u64, clean: bool) {
+        if let Some(old) = self.by_page.get(&page) {
+            self.evictable.remove(old);
+        }
+        self.seq += 1;
+        let s = self.seq;
+        self.by_page.insert(page, s);
+        if clean {
+            self.evictable.insert(s, page);
+        }
+    }
+
+    /// Pop the least-recently-used evictable page, skipping `protect`.
+    fn pop_lru(&mut self, protect: Option<u64>) -> Option<u64> {
+        let key = self
+            .evictable
+            .iter()
+            .find(|(_, &page)| Some(page) != protect)
+            .map(|(&seq, _)| seq)?;
+        let page = self.evictable.remove(&key)?;
+        self.by_page.remove(&page);
+        Some(page)
+    }
+
+    /// Reset to empty (used on create/delete).
+    fn clear(&mut self) {
+        self.seq = 0;
+        self.by_page.clear();
+        self.evictable.clear();
     }
 }
 
@@ -69,6 +132,8 @@ impl Default for FileCacheConfig {
 pub struct FileCacheBackend {
     inner: std::sync::Arc<dyn BlobBackend>,
     page_size: u64,
+    /// Shared cross-process byte budget; `None` when unlimited.
+    budget: Option<CacheBudget>,
     state: Mutex<CacheState>,
 }
 
@@ -85,6 +150,11 @@ struct CacheState {
     present: Vec<u8>,
     /// Bitmap: page is dirty (cached but not yet flushed to the inner backend).
     dirty: Vec<u8>,
+    /// Bytes of resident (present) page data this backend holds on disk.  Only
+    /// meaningful when a budget is active.
+    resident_bytes: u64,
+    /// LRU bookkeeping for eviction.  Only populated when a budget is active.
+    lru: Lru,
 }
 
 #[inline]
@@ -172,6 +242,36 @@ impl FileCacheBackend {
             );
         }
 
+        // Optional shared cross-process byte budget.  When active, seed the LRU
+        // and resident-byte accounting from the pages recovered off disk.
+        let budget = CacheBudget::open(&cfg.dir, &cfg.name, cfg.max_bytes)
+            .context("open shared cache budget")?;
+
+        let mut lru = Lru::default();
+        let mut resident_bytes: u64 = 0;
+        if budget.is_some() {
+            for page_idx in 0..num_pages {
+                if bit_get(&present, page_idx) {
+                    let offset = page_idx * cfg.page_size;
+                    let page_len = cfg.page_size.min(dev_size.saturating_sub(offset));
+                    resident_bytes = resident_bytes.saturating_add(page_len);
+                    // Dirty pages are present but not evictable until flushed.
+                    lru.touch(page_idx, !bit_get(&dirty, page_idx));
+                }
+            }
+            if let Some(b) = &budget {
+                let over = b.reset(resident_bytes).context("seed cache budget")?;
+                if over > 0 {
+                    info!(
+                        over_bytes = over,
+                        max_bytes = cfg.max_bytes,
+                        "local disk cache over shared budget after recovery; \
+                         clean pages will be evicted on demand"
+                    );
+                }
+            }
+        }
+
         let state = CacheState {
             data,
             meta,
@@ -179,12 +279,15 @@ impl FileCacheBackend {
             num_pages,
             present,
             dirty,
+            resident_bytes,
+            lru,
         };
 
         Ok((
             Self {
                 inner,
                 page_size: cfg.page_size,
+                budget,
                 state: Mutex::new(state),
             },
             recovered_dirty,
@@ -208,6 +311,106 @@ impl FileCacheBackend {
             &state.present,
             &state.dirty,
         )?;
+        // All pages were dropped, so reset eviction accounting too.
+        state.resident_bytes = 0;
+        state.lru.clear();
+        if let Some(b) = &self.budget {
+            b.reset(0).context("reset cache budget on reinit")?;
+        }
+        Ok(())
+    }
+
+    /// Valid byte length of `page_idx` (the final page may be short).
+    #[inline]
+    fn page_len(&self, state: &CacheState, page_idx: u64) -> u64 {
+        let offset = page_idx * self.page_size;
+        self.page_size.min(state.dev_size.saturating_sub(offset))
+    }
+
+    /// Account `page_idx` as a present page (updating LRU recency and, for newly
+    /// resident pages, the shared budget) then evict our own clean pages if the
+    /// admission pushed the shared total over its limit.  `clean` says whether
+    /// the page is currently evictable (present and not dirty).
+    ///
+    /// A no-op when no budget is configured.
+    fn account_present(
+        &self,
+        state: &mut CacheState,
+        page_idx: u64,
+        clean: bool,
+    ) -> anyhow::Result<()> {
+        let Some(budget) = &self.budget else {
+            return Ok(());
+        };
+
+        let already = state.lru.contains(page_idx);
+        state.lru.touch(page_idx, clean);
+        if already {
+            // Recency/evictability updated; no new disk bytes admitted.
+            return Ok(());
+        }
+
+        let len = self.page_len(state, page_idx);
+        state.resident_bytes = state.resident_bytes.saturating_add(len);
+        let over = budget.admit(len).context("admit cache budget")?;
+        if over > 0 {
+            // Protect the page we just admitted from being evicted immediately.
+            self.evict_clean(state, over, Some(page_idx))?;
+        }
+        Ok(())
+    }
+
+    /// Drop up to `over` bytes of our least-recently-used *clean* pages, punching
+    /// holes to actually reclaim disk space and clearing their `present` bits.
+    /// Dirty pages are never evicted (they would lose unflushed data).
+    fn evict_clean(
+        &self,
+        state: &mut CacheState,
+        mut over: u64,
+        protect: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let Some(budget) = &self.budget else {
+            return Ok(());
+        };
+
+        let mut evicted = 0u64;
+        while over > 0 {
+            let Some(page_idx) = state.lru.pop_lru(protect) else {
+                break; // nothing else we own is evictable
+            };
+            let offset = page_idx * self.page_size;
+            let len = self.page_len(state, page_idx);
+
+            if len > 0 {
+                punch_hole(&state.data, offset, len)
+                    .with_context(|| format!("punch hole for evicted page {page_idx}"))?;
+            }
+            // Clear the present bit and persist it.  A clean bit needs no fsync:
+            // if the cleared bit is lost on crash the worst case is a redundant
+            // re-read from the inner backend.
+            bit_set(&mut state.present, page_idx, false);
+            let byte = page_idx / 8;
+            let present_off = HEADER_SIZE + byte;
+            if let Err(err) = state
+                .meta
+                .write_all_at(&[state.present[byte as usize]], present_off)
+            {
+                warn!(page_idx, %err, "failed to persist evicted present bit (non-fatal)");
+            }
+
+            state.resident_bytes = state.resident_bytes.saturating_sub(len);
+            budget.release(len).context("release cache budget")?;
+            over = over.saturating_sub(len);
+            evicted += 1;
+        }
+
+        if evicted > 0 {
+            trace!(
+                evicted_pages = evicted,
+                resident_bytes = state.resident_bytes,
+                "evicted clean cache pages to honour shared budget"
+            );
+        }
         Ok(())
     }
 
@@ -273,6 +476,10 @@ impl FileCacheBackend {
             warn!(page_idx, %err, "failed to persist clean present bit (non-fatal)");
         }
 
+        // Account the newly-resident clean page and evict if over budget.  The
+        // page just loaded is protected from immediate eviction.
+        self.account_present(state, page_idx, true)?;
+
         Ok(page_len)
     }
 
@@ -307,6 +514,10 @@ impl FileCacheBackend {
 
         bit_set(&mut state.dirty, page_idx, false);
         Self::persist_meta_bit(state, page_idx)?;
+        // Now clean again: the page becomes an eviction candidate.
+        if self.budget.is_some() {
+            state.lru.touch(page_idx, true);
+        }
         Ok(())
     }
 
@@ -332,6 +543,9 @@ impl FileCacheBackend {
         bit_set(&mut state.present, page_idx, true);
         bit_set(&mut state.dirty, page_idx, true);
         Self::persist_meta_bit(state, page_idx)?;
+        // Account the page as resident but *not* evictable (it is dirty).  For a
+        // page that was already present this just reclassifies it.
+        self.account_present(state, page_idx, false)?;
         Ok(())
     }
 
@@ -343,6 +557,21 @@ impl FileCacheBackend {
             .filter(|&i| bit_get(&state.dirty, i))
             .count() as u64
     }
+
+    /// Count of pages currently marked present (used by tests).
+    #[cfg(test)]
+    async fn present_count(&self) -> u64 {
+        let state = self.state.lock().await;
+        (0..state.num_pages)
+            .filter(|&i| bit_get(&state.present, i))
+            .count() as u64
+    }
+
+    /// This backend's resident byte accounting (used by tests).
+    #[cfg(test)]
+    async fn resident_bytes(&self) -> u64 {
+        self.state.lock().await.resident_bytes
+    }
 }
 
 /// Reject requests whose `[offset, offset+len)` range falls outside the device.
@@ -352,6 +581,24 @@ fn check_in_bounds(op: &str, offset: u64, len: u64, dev_size: u64) -> anyhow::Re
         .ok_or_else(|| anyhow::anyhow!("{op}: offset ({offset}) + len ({len}) overflows u64"))?;
     if end > dev_size {
         bail!("{op} out of bounds: offset={offset} len={len} dev_size={dev_size}");
+    }
+    Ok(())
+}
+
+/// Punch a hole in `file` over `[offset, offset+len)`, deallocating those blocks
+/// so the disk space is actually reclaimed while the file keeps its logical size
+/// (the region reads back as zeros).  Used when evicting a clean cache page.
+fn punch_hole(file: &File, offset: u64, len: u64) -> anyhow::Result<()> {
+    let ret = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error()).context("fallocate punch hole");
     }
     Ok(())
 }
@@ -376,10 +623,11 @@ impl BlobBackend for FileCacheBackend {
             bail!("read: offset ({offset}) and len ({len}) must be 512-byte aligned");
         }
 
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         check_in_bounds("read", offset, len, state.dev_size)?;
 
         let page_size = self.page_size;
+        let track_lru = self.budget.is_some();
         let mut result = BytesMut::zeroed(len as usize);
         let mut pos: u64 = 0;
 
@@ -400,6 +648,12 @@ impl BlobBackend for FileCacheBackend {
                     .with_context(|| {
                         format!("read cache file offset={abs_offset} len={chunk_len}")
                     })?;
+                // A cache hit refreshes the page's LRU recency (keeping its
+                // current clean/dirty evictability classification).
+                if track_lru {
+                    let clean = !bit_get(&state.dirty, page_idx);
+                    state.lru.touch(page_idx, clean);
+                }
             } else {
                 // Cache miss: read straight from the inner backend.  Pure reads do
                 // not populate the cache to avoid evicting/overwriting dirty data
@@ -521,6 +775,12 @@ impl BlobBackend for FileCacheBackend {
         let num_pages = state.num_pages;
         state.present = vec![0u8; bitmap_bytes(num_pages)];
         state.dirty = vec![0u8; bitmap_bytes(num_pages)];
+        // Forget all resident pages for budget/eviction accounting too.
+        state.resident_bytes = 0;
+        state.lru.clear();
+        if let Some(b) = &self.budget {
+            b.reset(0).context("reset cache budget on delete")?;
+        }
         drop(state);
         self.inner.delete().await
     }
@@ -642,12 +902,23 @@ mod tests {
         page_size: u64,
         dev_size: u64,
     ) -> (FileCacheBackend, u64) {
+        open_budgeted(inner, dir, page_size, dev_size, 0)
+    }
+
+    fn open_budgeted(
+        inner: Arc<dyn BlobBackend>,
+        dir: &Path,
+        page_size: u64,
+        dev_size: u64,
+        max_bytes: u64,
+    ) -> (FileCacheBackend, u64) {
         FileCacheBackend::open(
             inner,
             FileCacheConfig {
                 dir: dir.to_path_buf(),
                 name: "test".to_string(),
                 page_size,
+                max_bytes,
             },
             dev_size,
         )
@@ -904,6 +1175,87 @@ mod tests {
         // After reset the page reads back as zero from the fresh inner backend.
         let read = b.read(0, 512).await.unwrap();
         assert!(read.iter().all(|&x| x == 0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn budget_evicts_lru_clean_pages() {
+        // Budget of two 1 KiB pages.  Reading three different pages must keep the
+        // cache at two resident pages, evicting the least-recently-used one.
+        let dir = tmp_dir("evict");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        for (i, byte) in [0x10u8, 0x20, 0x30, 0x40].into_iter().enumerate() {
+            inner
+                .write(i as u64 * 1024, Bytes::from(vec![byte; 1024]))
+                .await
+                .unwrap();
+        }
+        // Populate pages by writing them (full-page writes mark them present).
+        let (b, _) = open_budgeted(inner.clone(), &dir, 1024, 4096, 2048);
+
+        // Make pages clean+resident by writing then flushing each.
+        b.write(0, Bytes::from(vec![0xA0; 1024])).await.unwrap();
+        b.write(1024, Bytes::from(vec![0xA1; 1024])).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 2);
+        assert_eq!(b.resident_bytes().await, 2048);
+
+        // Touch page 0 so page 1 becomes the LRU victim.
+        let _ = b.read(0, 512).await.unwrap();
+
+        // A third clean page must evict exactly one page to stay within budget.
+        b.write(2048, Bytes::from(vec![0xA2; 1024])).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 2);
+        assert_eq!(b.resident_bytes().await, 2048);
+
+        // Page 1 (LRU) was evicted: it now re-reads from the inner backend value.
+        assert_eq!(
+            b.read(1024, 1024).await.unwrap(),
+            Bytes::from(vec![0xA1; 1024])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn budget_never_evicts_dirty_pages() {
+        // Even when way over budget, unflushed (dirty) pages must never be
+        // dropped — that would lose data.
+        let dir = tmp_dir("evictdirty");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        // Tiny budget: one page.
+        let (b, _) = open_budgeted(inner.clone(), &dir, 1024, 4096, 1024);
+
+        // Dirty three pages without flushing.
+        b.write(0, Bytes::from(vec![0xB0; 1024])).await.unwrap();
+        b.write(1024, Bytes::from(vec![0xB1; 1024])).await.unwrap();
+        b.write(2048, Bytes::from(vec![0xB2; 1024])).await.unwrap();
+
+        // All three remain present (dirty, non-evictable) despite the 1-page budget.
+        assert_eq!(b.dirty_count().await, 3);
+        assert_eq!(b.present_count().await, 3);
+
+        // They all flush correctly (no data lost to eviction).
+        b.flush().await.unwrap();
+        assert_eq!(inner.read(0, 1024).await.unwrap(), Bytes::from(vec![0xB0; 1024]));
+        assert_eq!(inner.read(1024, 1024).await.unwrap(), Bytes::from(vec![0xB1; 1024]));
+        assert_eq!(inner.read(2048, 1024).await.unwrap(), Bytes::from(vec![0xB2; 1024]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unlimited_budget_never_evicts() {
+        // max_bytes == 0 preserves the original grow-only behaviour.
+        let dir = tmp_dir("unlimited");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        let (b, _) = open_budgeted(inner.clone(), &dir, 1024, 4096, 0);
+        for i in 0..4u64 {
+            b.write(i * 1024, Bytes::from(vec![0xC0 + i as u8; 1024]))
+                .await
+                .unwrap();
+        }
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
