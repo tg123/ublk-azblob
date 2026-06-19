@@ -173,7 +173,10 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
 /// `stop_server`), so the zombie-process lint does not apply.
 #[allow(clippy::zombie_processes)]
 fn start_server(addr: &str, container: &str, blob: &str, create: bool) -> Child {
-    start_server_opts(addr, container, blob, create, false, false)
+    start_server_opts(
+        addr, container, blob, create, /* read_only */ false,
+        /* disable_auto_flush */ false,
+    )
 }
 
 /// Like [`start_server`] but lets the caller expose the export read-only
@@ -614,7 +617,14 @@ fn nbd_read_only() {
     wait_for_port_release(NBD_ADDR_READ_ONLY);
 
     // ── Phase 2: reopen read-only and assert the export rejects mutations ─────
-    let child = start_server_opts(NBD_ADDR_READ_ONLY, &container, &blob, false, true, false);
+    let child = start_server_opts(
+        NBD_ADDR_READ_ONLY,
+        &container,
+        &blob,
+        /* create */ false,
+        /* read_only */ true,
+        /* disable_auto_flush */ false,
+    );
     let mut client = NbdClient::connect(NBD_ADDR_READ_ONLY);
     assert_eq!(
         client.transmission_flags & NBD_FLAG_READ_ONLY,
@@ -820,7 +830,14 @@ fn nbd_graceful_shutdown_flush() {
 
     // ── Phase 1: provision the blob, write regions, then SIGINT (no FLUSH) ─────
     // Auto-flushing is disabled so only the shutdown flush can persist the data.
-    let child = start_server_opts(NBD_ADDR_SHUTDOWN, &container, &blob, true, false, true);
+    let child = start_server_opts(
+        NBD_ADDR_SHUTDOWN,
+        &container,
+        &blob,
+        /* create */ true,
+        /* read_only */ false,
+        /* disable_auto_flush */ true,
+    );
     let mut client = NbdClient::connect(NBD_ADDR_SHUTDOWN);
 
     log(&format!(

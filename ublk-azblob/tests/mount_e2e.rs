@@ -537,7 +537,7 @@ fn graceful_shutdown_flush() {
     let spec = DeviceSpec {
         // Distinct device id, container and blob so this test never collides
         // with the other mount tests (or the k8s CSI e2e's low auto-assigned ids).
-        dev_id: "43".to_string(),
+        dev_id: "43".to_string(), // distinct from mount_read_only's 42; see above
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-shutdown", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
