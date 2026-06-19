@@ -51,8 +51,8 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 
 # ublk Rust binding — Linux userspace block driver over io_uring.
 # Requires Linux ≥6.0 with ublk_drv loaded and root/CAP_SYS_ADMIN.
-# The ublk target is conditionally compiled; set UBLK_AVAILABLE=1 or use the
-# --features ublk flag.  Without it, the I/O loop is stubbed with TODOs.
+# The ublk target is part of the default `ublk` feature; build with
+# `--no-default-features` to stub out the I/O loop (e.g. on macOS).
 libublk = { version = "0.4.6", optional = true }
 
 # Raw libc bindings — only needed by the ublk I/O loop (errno constants, signals).
@@ -79,18 +79,27 @@ k8s-openapi = { version = "0.24.0", features = ["latest"], optional = true }
 tonic-build = "0.12.3"
 
 [features]
+# The shipped binary is the full node plugin, so `ublk` and `csi` (which pulls
+# in `coordination`) are ON BY DEFAULT: a plain `cargo build` produces the
+# complete binary with no extra flags.  Contributors on macOS / without
+# `protoc` can still build the core with `cargo build --no-default-features`
+# (skips the Linux-only ublk target and the protoc-dependent CSI stack).
+default = ["ublk", "csi"]
+
 # Enable the real ublk target (requires Linux ≥6.0 + ublk_drv loaded).
+# On by default; opt out with `--no-default-features`.
 ublk = ["dep:libublk", "dep:libc"]
 
 # Enable cluster coordination (Kubernetes coordination.k8s.io Lease + Azure blob
 # lease) so that at most one node mounts a given page blob at a time.  The Azure
 # blob-lease half is always compiled; this feature adds the Kubernetes client.
+# Pulled in transitively by the default `csi` feature.
 coordination = ["dep:kube", "dep:k8s-openapi"]
 
-# Enable the Kubernetes CSI driver (`csi` subcommand).  The node side also needs
-# the `ublk` feature to actually attach block devices; enable both together with
-# `--features "ublk csi"` for a fully functional node plugin.  CSI implies
-# `coordination` so node mounts are guarded by the cluster + blob locks.
+# Enable the Kubernetes CSI driver (`csi` subcommand).  On by default (and it
+# implies both `coordination` and, via the default set, `ublk`) so the node
+# side can attach block devices and guard mounts with the cluster + blob locks.
+# Opt out with `--no-default-features`.
 csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "dep:libc", "coordination"]
 
 [dev-dependencies]
