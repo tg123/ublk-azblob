@@ -1,0 +1,73 @@
+name: chart-release
+
+# Packages the Helm chart (deploy/chart) and publishes it to a GitHub Pages
+# based Helm repository so it can be indexed by Artifact Hub (https://artifacthub.io).
+#
+# How it works:
+#   1. helm/chart-releaser-action packages every chart found under `deploy/`
+#      (currently just deploy/chart), creates a matching GitHub Release with the
+#      .tgz attached, and updates index.yaml on the `gh-pages` branch.
+#   2. The Artifact Hub repository metadata file (deploy/artifacthub-repo.yml) is
+#      copied to the root of the `gh-pages` branch, next to index.yaml, so
+#      Artifact Hub can verify repository ownership.
+#
+# Publishing happens only on pushes to `main` (or manual dispatch). A new chart
+# is released whenever `version` in deploy/chart/Chart.yaml changes.
+#
+# One-time setup (outside this workflow):
+#   - Enable GitHub Pages for the repository, serving from the `gh-pages` branch.
+#   - Add the resulting Pages URL (e.g. https://tg123.github.io/ublk-azblob) as a
+#     Helm repository on Artifact Hub.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - deploy/chart/**
+      - deploy/artifacthub-repo.yml
+      - .github/workflows/chart-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: package + publish chart (GitHub Pages)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.7.0
+        with:
+          charts_dir: deploy
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Artifact Hub repository metadata
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages
+          git worktree add gh-pages gh-pages
+          cp deploy/artifacthub-repo.yml gh-pages/artifacthub-repo.yml
+          cd gh-pages
+          if [ -n "$(git status --porcelain artifacthub-repo.yml)" ]; then
+            git add artifacthub-repo.yml
+            git commit -m "Update artifacthub-repo.yml"
+            git push origin gh-pages
+          else
+            echo "artifacthub-repo.yml already up to date"
+          fi

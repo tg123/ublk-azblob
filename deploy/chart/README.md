@@ -17,6 +17,24 @@ A Helm chart for deploying the ublk-azblob CSI driver on Kubernetes. This driver
 
 ## Installation
 
+### From the Helm repository (Artifact Hub)
+
+The chart is published to a GitHub Pages based Helm repository and indexed on
+[Artifact Hub](https://artifacthub.io/packages/search?repo=ublk-azblob-csi).
+
+```bash
+helm repo add ublk-azblob https://tg123.github.io/ublk-azblob
+helm repo update
+helm install ublk-azblob-csi ublk-azblob/ublk-azblob-csi
+```
+
+### From source
+
+```bash
+git clone https://github.com/tg123/ublk-azblob.git
+helm install ublk-azblob-csi ./ublk-azblob/deploy/chart
+```
+
 ### Quick Start (Per-Namespace Mode)
 
 ```bash

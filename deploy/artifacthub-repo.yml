@@ -1,0 +1,13 @@
+# Artifact Hub repository metadata file.
+#
+# This file is published to the root of the Helm chart repository (the same
+# location as index.yaml) so Artifact Hub can verify ownership of the repo and
+# display the configured owners. See:
+# https://artifacthub.io/docs/topics/repositories/#helm-charts-repositories
+#
+# After the repository has been added to Artifact Hub, copy the generated
+# repositoryID below to formally claim ownership.
+repositoryID: ""
+owners:
+  - name: tg123
+    email: tg123@users.noreply.github.com
