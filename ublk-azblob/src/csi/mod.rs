@@ -190,23 +190,28 @@ async fn serve(router: tonic::transport::server::Router, endpoint: &str) -> anyh
     Ok(())
 }
 
-/// Encode a `(container, blob)` pair as a CSI volume id.
+/// Encode an `(account, container, blob)` triple as a CSI volume id.
 ///
-/// Container names cannot contain `/`, so splitting on the first `/` is
-/// unambiguous even though blob names may themselves contain slashes.
-pub fn make_volume_id(container: &str, blob: &str) -> String {
-    format!("{container}/{blob}")
+/// The account is encoded so that `DeleteVolume` — which CSI only hands the
+/// volume id and secrets, never the StorageClass parameters — can recover the
+/// per-volume storage account chosen at create time. Account and container
+/// names cannot contain `/`, so splitting on the first two `/` is unambiguous
+/// even though blob names may themselves contain slashes.
+pub fn make_volume_id(account: &str, container: &str, blob: &str) -> String {
+    format!("{account}/{container}/{blob}")
 }
 
-/// Decode a CSI volume id produced by [`make_volume_id`] into `(container, blob)`.
-pub fn parse_volume_id(volume_id: &str) -> anyhow::Result<(String, String)> {
-    let (container, blob) = volume_id.split_once('/').with_context(|| {
-        format!("malformed volume id '{volume_id}' (expected 'container/blob')")
-    })?;
-    if container.is_empty() || blob.is_empty() {
-        anyhow::bail!("malformed volume id '{volume_id}': empty container or blob");
+/// Decode a CSI volume id produced by [`make_volume_id`] into
+/// `(account, container, blob)`.
+pub fn parse_volume_id(volume_id: &str) -> anyhow::Result<(String, String, String)> {
+    let mut parts = volume_id.splitn(3, '/');
+    let account = parts.next().unwrap_or("");
+    let container = parts.next().unwrap_or("");
+    let blob = parts.next().unwrap_or("");
+    if account.is_empty() || container.is_empty() || blob.is_empty() {
+        anyhow::bail!("malformed volume id '{volume_id}' (expected 'account/container/blob')");
     }
-    Ok((container.to_string(), blob.to_string()))
+    Ok((account.to_string(), container.to_string(), blob.to_string()))
 }
 
 /// Build an Azure Page Blob backend for `container`/`blob` using the driver
@@ -298,9 +303,10 @@ mod tests {
 
     #[test]
     fn volume_id_roundtrip() {
-        let id = make_volume_id("mycontainer", "pvc-abc/data.vhd");
-        assert_eq!(id, "mycontainer/pvc-abc/data.vhd");
-        let (c, b) = parse_volume_id(&id).unwrap();
+        let id = make_volume_id("myaccount", "mycontainer", "pvc-abc/data.vhd");
+        assert_eq!(id, "myaccount/mycontainer/pvc-abc/data.vhd");
+        let (a, c, b) = parse_volume_id(&id).unwrap();
+        assert_eq!(a, "myaccount");
         assert_eq!(c, "mycontainer");
         assert_eq!(b, "pvc-abc/data.vhd");
     }
@@ -308,8 +314,10 @@ mod tests {
     #[test]
     fn volume_id_rejects_malformed() {
         assert!(parse_volume_id("nocontainer").is_err());
-        assert!(parse_volume_id("/blob").is_err());
-        assert!(parse_volume_id("container/").is_err());
+        assert!(parse_volume_id("account/container").is_err());
+        assert!(parse_volume_id("/container/blob").is_err());
+        assert!(parse_volume_id("account//blob").is_err());
+        assert!(parse_volume_id("account/container/").is_err());
     }
 
     #[test]

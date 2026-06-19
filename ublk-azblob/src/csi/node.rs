@@ -144,6 +144,9 @@ impl NodeService {
             if let Some(secs) = get("recoveryTimeoutSecs").filter(|s| !s.is_empty()) {
                 env.push(("UBLK_RECOVERY_TIMEOUT_SECS".to_string(), secs));
             }
+            if let Some(secs) = get("leaseDurationSecs").filter(|s| !s.is_empty()) {
+                env.push(("UBLK_LEASE_DURATION_SECS".to_string(), secs));
+            }
         }
         Ok(env)
     }
@@ -297,6 +300,8 @@ impl Node for NodeService {
                 return Err(e);
             }
 
+            // Keep the long-lived child's pipes drained so it can't block.
+            mount::drain_child_output(&mut child);
             volumes.lock().unwrap().insert(
                 volume_id,
                 Published {

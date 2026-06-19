@@ -35,6 +35,12 @@ const PARAM_CONTAINER: &str = "container";
 const PARAM_BLOB_PATH_TEMPLATE: &str = "blobPathTemplate";
 /// Parameter key selecting the on-disk filesystem the node should create.
 const PARAM_FS_TYPE: &str = "fsType";
+/// Parameter keys for the optional cluster-lease coordination, forwarded to the
+/// node via the volume context (the node's `child_env` reads them).
+const PARAM_COORDINATION: &str = "coordination";
+const PARAM_LEASE_NAMESPACE: &str = "leaseNamespace";
+const PARAM_RECOVERY_TIMEOUT_SECS: &str = "recoveryTimeoutSecs";
+const PARAM_LEASE_DURATION_SECS: &str = "leaseDurationSecs";
 
 /// Default blob path template
 const DEFAULT_BLOB_PATH_TEMPLATE: &str = "ublk-azblob-disk/${pv.name}";
@@ -210,11 +216,25 @@ impl Controller for ControllerService {
         if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
             volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
         }
+        // Forward the coordination opt-in (and its tuning) from the StorageClass
+        // parameters into the volume context, since CSI only hands the node the
+        // volume context the controller returns — not the StorageClass parameters.
+        // The node's `child_env` reads these keys to enable the cluster/blob lease.
+        for key in [
+            PARAM_COORDINATION,
+            PARAM_LEASE_NAMESPACE,
+            PARAM_RECOVERY_TIMEOUT_SECS,
+            PARAM_LEASE_DURATION_SECS,
+        ] {
+            if let Some(v) = req.parameters.get(key) {
+                volume_context.insert(key.to_string(), v.clone());
+            }
+        }
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
                 capacity_bytes: size as i64,
-                volume_id: make_volume_id(&container, &blob),
+                volume_id: make_volume_id(&account, &container, &blob),
                 volume_context,
                 content_source: None,
                 accessible_topology: Vec::new(),
@@ -231,20 +251,15 @@ impl Controller for ControllerService {
         if req.volume_id.is_empty() {
             return Err(Status::invalid_argument("volume id is required"));
         }
-        let (container, blob) = parse_volume_id(&req.volume_id)
+        let (account, container, blob) = parse_volume_id(&req.volume_id)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
 
-        info!(volume_id = %req.volume_id, "DeleteVolume");
+        info!(volume_id = %req.volume_id, account = %account, "DeleteVolume");
 
-        // For delete, get the account from the secret (same key CreateVolume's
-        // `storage_account_for` reads) or fall back to the driver config.
-        let account = req
-            .secrets
-            .get("AZURE_STORAGE_ACCOUNT")
-            .map(|s| s.as_str())
-            .unwrap_or(&self.config.account);
-
-        let backend = build_backend(&self.config, account, &container, &blob, &req.secrets)
+        // The storage account is recovered from the volume id (encoded at create
+        // time), so a per-volume `storageAccount` is targeted correctly rather
+        // than falling back to the secret/config account and orphaning the blob.
+        let backend = build_backend(&self.config, &account, &container, &blob, &req.secrets)
             .map_err(|e| Status::internal(format!("build backend: {e:#}")))?;
         backend.delete().await.map_err(|e| {
             error!(error = %format!("{e:#}"), "delete page blob failed");

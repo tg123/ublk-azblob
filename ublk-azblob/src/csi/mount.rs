@@ -54,6 +54,28 @@ pub fn list_ublk_devices() -> HashSet<String> {
     set
 }
 
+/// Forward a long-lived child's stdout/stderr to the node plugin's own
+/// stdout/stderr in background threads.
+///
+/// `spawn_device` pipes the child's output so the connect phase can capture an
+/// early-exit error message. Once the device is up and the child becomes
+/// long-lived, those pipes must keep being drained — otherwise a chatty child
+/// fills the ~64 KiB pipe buffer and blocks indefinitely on its next write.
+/// Draining here both prevents that deadlock and surfaces the child's logs in
+/// `kubectl logs` of the node pod.
+pub fn drain_child_output(child: &mut Child) {
+    if let Some(mut out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut out, &mut std::io::stdout());
+        });
+    }
+    if let Some(mut err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut err, &mut std::io::stderr());
+        });
+    }
+}
+
 /// Return the set of available (unused) `/dev/nbd*` device nodes for NBD mode.
 pub fn list_available_nbd_devices() -> HashSet<String> {
     let mut set = HashSet::new();
