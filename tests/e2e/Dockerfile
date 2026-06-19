@@ -16,15 +16,15 @@ ARG DOCKER_VERSION=27.5.1
 ARG KUBECTL_VERSION=v1.32.3
 ARG HELM_VERSION=v3.17.3
 
-# - e2fsprogs / util-linux : mkfs.ext4, mount/umount (mount tests + node plugin)
-# - kmod                   : modprobe / lsmod (module is loaded on the host)
+# - e2fsprogs / util-linux : mkfs.ext4, mount/umount (run by mount_e2e directly)
 # - libclang-dev           : bindgen for libublk-rs-sys (ublk feature)
 # - protobuf-compiler + libprotobuf-dev : protoc + well-known types (csi feature)
+# (nbd_e2e uses an in-process TCP client and the node plugin's mkfs/mount/
+#  nbd-client live in the driver image, so neither is needed here.)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         e2fsprogs \
         util-linux \
-        kmod \
         ca-certificates \
         curl \
         libclang-dev \

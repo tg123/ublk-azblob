@@ -8,7 +8,7 @@ on:
 
 jobs:
   e2e:
-    name: e2e (mount + NBD + k8s PVC)
+    name: e2e
     # The ublk_drv kernel module Oopses on the ubuntu-24.04 azure kernel
     # (actions/runner-images#14175); 22.04 ships a stable 6.x kernel.
     runs-on: ubuntu-22.04
@@ -25,11 +25,11 @@ jobs:
           sudo modprobe ublk_drv
           ls -l /dev/ublk-control
 
-      - name: Make /var/lib/kubelet a shared mount (CSI mount propagation)
+      - name: Make a shared mount for CSI mount propagation
         run: |
-          sudo mkdir -p /var/lib/kubelet
-          sudo mount -t tmpfs tmpfs /var/lib/kubelet
-          sudo mount --make-shared /var/lib/kubelet
+          sudo mkdir -p /tmp/ublk-e2e/kubelet
+          sudo mount -t tmpfs tmpfs /tmp/ublk-e2e/kubelet
+          sudo mount --make-shared /tmp/ublk-e2e/kubelet
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -61,6 +61,7 @@ jobs:
 
       - name: Run e2e (compile once, mount + NBD + k8s PVC)
         run: |
+          KUBELET_DIR=/tmp/ublk-e2e/kubelet \
           docker compose -f tests/e2e/docker-compose.yml up \
             --abort-on-container-exit --exit-code-from runner
 

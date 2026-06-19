@@ -90,7 +90,7 @@ Node ServiceAccount name
 Secret name based on deployment mode
 */}}
 {{- define "ublk-azblob-csi.secretName" -}}
-{{- if eq .Values.deploymentMode "global" }}
+{{- if eq .Values.secretSearchMode "global" }}
 {{- .Values.globalSecret.name }}
 {{- else }}
 {{- .Values.perNamespaceSecret.name }}
@@ -101,7 +101,7 @@ Secret name based on deployment mode
 Secret namespace based on deployment mode
 */}}
 {{- define "ublk-azblob-csi.secretNamespace" -}}
-{{- if eq .Values.deploymentMode "global" -}}
+{{- if eq .Values.secretSearchMode "global" -}}
 {{- .Values.namespace -}}
 {{- else -}}
 ${pvc.namespace}

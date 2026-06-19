@@ -1,8 +1,8 @@
 {{- if .Values.storageClass.create -}}
 # StorageClass for ublk-azblob volumes.
 #
-# Deployment mode: {{ .Values.deploymentMode }}
-{{- if eq .Values.deploymentMode "per-namespace" }}
+# Deployment mode: {{ .Values.secretSearchMode }}
+{{- if eq .Values.secretSearchMode "per-namespace" }}
 # Uses per-namespace secrets for credentials, allowing each namespace
 # to manage its own Azure storage account and credentials.
 {{- else }}

@@ -51,7 +51,7 @@ EOF
 ```bash
 # Install with global secret mode
 helm install ublk-azblob-csi ./chart \
-  --set deploymentMode=global \
+  --set secretSearchMode=global \
   --set globalSecret.create=true \
   --set globalSecret.authMethod=service-principal \
   --set globalSecret.servicePrincipal.clientId=<client-id> \
@@ -69,7 +69,7 @@ The following table lists the configurable parameters of the chart and their def
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `deploymentMode` | Deployment mode: `per-namespace` or `global` | `per-namespace` |
+| `secretSearchMode` | Where credentials are sourced: `per-namespace` or `global` | `per-namespace` |
 
 ### Driver Configuration
 
@@ -129,7 +129,7 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.blobPathTemplate` | Blob path template | `${pvc.namespace}/volumes/${pv.name}` |
 | `storageClass.parameters.fsType` | Filesystem type | `ext4` |
 
-### Global Secret Configuration (deploymentMode: global)
+### Global Secret Configuration (secretSearchMode: global)
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -146,7 +146,7 @@ A single image is shared by the controller and node plugins.
 | `globalSecret.storageContainer` | Storage container name | `""` |
 | `globalSecret.endpoint` | Custom endpoint with `%s` account template (Azurite/sovereign clouds), e.g. `http://%s.blob.localhost:10000/` | `""` |
 
-### Per-Namespace Secret Configuration (deploymentMode: per-namespace)
+### Per-Namespace Secret Configuration (secretSearchMode: per-namespace)
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -210,7 +210,7 @@ storageClass:
 
 ```yaml
 # values-per-namespace.yaml
-deploymentMode: per-namespace
+secretSearchMode: per-namespace
 
 storageClass:
   name: azblob-ublk
@@ -228,7 +228,7 @@ helm install ublk-azblob-csi ./chart -f values-per-namespace.yaml
 
 ```yaml
 # values-global.yaml
-deploymentMode: global
+secretSearchMode: global
 
 globalSecret:
   create: true
@@ -274,7 +274,7 @@ helm install ublk-azblob-csi ./chart -f values-global.yaml
 
 ```yaml
 # values-workload-identity.yaml
-deploymentMode: global
+secretSearchMode: global
 
 globalSecret:
   create: true
@@ -302,7 +302,7 @@ helm install ublk-azblob-csi ./chart -f values-workload-identity.yaml
 
 ```yaml
 # values-nbd.yaml
-deploymentMode: per-namespace
+secretSearchMode: per-namespace
 
 # Use NBD instead of ublk
 node:

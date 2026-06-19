@@ -1,6 +1,6 @@
 ublk-azblob CSI Driver has been installed!
 
-Deployment Mode: {{ .Values.deploymentMode }}
+Secret Search Mode: {{ .Values.secretSearchMode }}
 Driver Name: {{ .Values.driver.name }}
 StorageClass: {{ .Values.storageClass.name }}
 {{- if .Values.node.useNbd }}
@@ -9,7 +9,7 @@ Block Device Mode: NBD (Network Block Device)
 Block Device Mode: ublk (requires kernel >= 6.0 with ublk_drv)
 {{- end }}
 
-{{- if eq .Values.deploymentMode "per-namespace" }}
+{{- if eq .Values.secretSearchMode "per-namespace" }}
 
 === Per-Namespace Mode ===
 

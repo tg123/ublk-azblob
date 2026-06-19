@@ -2,10 +2,10 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
-# Deployment mode: "per-namespace" or "global"
+# Secret search mode: where the driver looks up the storage credentials secret.
 # - per-namespace: Each namespace creates its own azblob-csi-secret
 # - global: One secret in kube-system shared by all namespaces
-deploymentMode: per-namespace
+secretSearchMode: per-namespace
 
 # Driver configuration
 driver:
@@ -125,7 +125,7 @@ storageClass:
     fsType: ext4
 
 # Secret configuration for global mode
-# Only used when deploymentMode: global
+# Only used when secretSearchMode: global
 globalSecret:
   # Create the global secret (set to false if you manage it externally)
   create: false
@@ -163,7 +163,7 @@ globalSecret:
   endpoint: ""
 
 # Per-namespace secret configuration
-# Only used when deploymentMode: per-namespace
+# Only used when secretSearchMode: per-namespace
 perNamespaceSecret:
   # Secret name (must be created in each namespace)
   name: azblob-csi-secret
