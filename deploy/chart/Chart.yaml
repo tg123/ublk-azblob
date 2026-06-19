@@ -1,0 +1,18 @@
+apiVersion: v2
+name: ublk-azblob-csi
+description: A CSI driver for mounting Azure Page Blob Storage using ublk kernel devices
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - csi
+  - storage
+  - azure
+  - blob
+  - ublk
+home: https://github.com/tg123/ublk-azblob
+sources:
+  - https://github.com/tg123/ublk-azblob
+maintainers:
+  - name: tg123
+    url: https://github.com/tg123

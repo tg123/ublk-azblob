@@ -1,0 +1,35 @@
+# Writer Job for the PVC e2e: writes random data to the volume, records its
+# SHA-256 next to it, and fsyncs.  Once this Job completes the writer pod is
+# deleted, which triggers NodeUnpublishVolume (tearing down the ublk device and
+# flushing the page blob).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azblob-writer
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: azblob-writer
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "writing random payload to /data"
+              dd if=/dev/urandom of=/data/payload bs=1M count=8
+              sha256sum /data/payload | tee /data/payload.sha256
+              sync
+              echo "writer done"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: azblob-pvc

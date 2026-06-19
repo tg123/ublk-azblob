@@ -92,6 +92,12 @@ impl BlobBackend for MemBackend {
         Ok(())
     }
 
+    async fn delete(&self) -> anyhow::Result<()> {
+        let mut data = self.data.lock().map_err(|e| anyhow!("lock: {e}"))?;
+        *data = Vec::new();
+        Ok(())
+    }
+
     async fn size(&self) -> anyhow::Result<u64> {
         let data = self.data.lock().map_err(|e| anyhow!("lock: {e}"))?;
         Ok(data.len() as u64)

@@ -1,3 +1,9 @@
 [workspace]
 members = ["ublk-azblob"]
 resolver = "2"
+
+# Strip debug symbols from release binaries. This roughly halves the size of
+# the shipped `ublk-azblob` binary (and therefore the published container image)
+# with no runtime cost.
+[profile.release]
+strip = true

@@ -49,6 +49,12 @@ pub trait BlobBackend: Send + Sync {
     /// drains the dirty buffer.
     async fn flush(&self) -> anyhow::Result<()>;
 
+    /// Delete the backing blob entirely.
+    ///
+    /// Used by the CSI controller when a PersistentVolume is removed.  Deleting
+    /// a blob that does not exist is treated as success (idempotent).
+    async fn delete(&self) -> anyhow::Result<()>;
+
     /// Return the current size of the backing store in bytes.
     async fn size(&self) -> anyhow::Result<u64>;
 }

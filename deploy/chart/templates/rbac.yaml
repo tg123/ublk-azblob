@@ -1,0 +1,115 @@
+{{- if .Values.rbac.create -}}
+# RBAC for the ublk-azblob CSI driver.
+#
+# Two service accounts:
+#   * controller — used by the controller Deployment and its
+#     external-provisioner sidecar (needs to watch PVCs and create/delete PVs).
+#   * node       — used by the node DaemonSet and its
+#     node-driver-registrar sidecar (minimal permissions).
+---
+{{- if .Values.serviceAccount.controller.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "ublk-azblob-csi.controller.serviceAccountName" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "ublk-azblob-csi.controller.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.controller.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+---
+{{- if .Values.serviceAccount.node.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "ublk-azblob-csi.node.serviceAccountName" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "ublk-azblob-csi.node.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.node.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+---
+# Permissions required by the external-provisioner sidecar.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ublk-azblob-csi.fullname" . }}-provisioner-role
+  labels:
+    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "ublk-azblob-csi.fullname" . }}-provisioner-binding
+  labels:
+    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ublk-azblob-csi.controller.serviceAccountName" . }}
+    namespace: {{ .Values.namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "ublk-azblob-csi.fullname" . }}-provisioner-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Permissions required by the node plugin's optional cluster-lease coordination:
+# the `ublk-azblob run --coordination` child takes a coordination.k8s.io Lease so
+# at most one node serves a given volume. Only needed when a StorageClass opts in
+# via the `coordination` parameter, but harmless otherwise.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ublk-azblob-csi.fullname" . }}-node-role
+  labels:
+    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "ublk-azblob-csi.fullname" . }}-node-binding
+  labels:
+    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ublk-azblob-csi.node.serviceAccountName" . }}
+    namespace: {{ .Values.namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "ublk-azblob-csi.fullname" . }}-node-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
