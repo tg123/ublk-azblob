@@ -729,19 +729,17 @@ mod tests {
         let page_size = 1024u64;
         let dev_size = PAGES * page_size;
         let inner = Arc::new(MemBackend::new(dev_size).unwrap());
-        let b = Arc::new(
-            BufferedBackend::new(
-                inner.clone(),
-                BufferedConfig {
-                    page_size,
-                    max_dirty_pages: 4,
-                    idle_flush_secs: 0,
-                    force_flush_timeout_secs: 0,
-                    flush_io_timeout_secs: 0,
-                },
-            )
-            .unwrap(),
-        );
+        let b = BufferedBackend::new(
+            inner.clone(),
+            BufferedConfig {
+                page_size,
+                max_dirty_pages: 4,
+                idle_flush_secs: 0,
+                force_flush_timeout_secs: 0,
+                flush_io_timeout_secs: 0,
+            },
+        )
+        .unwrap();
 
         let mut handles = Vec::new();
         for p in 0..PAGES {

@@ -15,6 +15,16 @@
 //!   (older than the *recovery timeout*), take the cluster lease, **break** the
 //!   stale blob lease and acquire it for itself.
 //!
+//! ## Multi-cluster note
+//!
+//! The Kubernetes cluster lease is namespaced/named within one cluster, so it
+//! only coordinates nodes of the *same* cluster. If several clusters share one
+//! storage account, give each cluster a dedicated blob path prefix (a "folder",
+//! e.g. via the StorageClass blob-path template `mycluster/${pvc.namespace}/...`)
+//! so their volumes — and therefore their blob leases — never collide. Two
+//! clusters pointed at the *same* blob would only be mutually excluded by the
+//! Azure blob lease (no cross-cluster liveness signal), which is far weaker.
+//!
 //! ## Startup algorithm ([`Coordinator::acquire`])
 //!
 //! 1. Acquire (or take over) the **cluster lease** for our holder identity.

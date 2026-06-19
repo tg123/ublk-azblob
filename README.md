@@ -357,13 +357,12 @@ ublk-azblob/
 │       └── mount_e2e.rs        # full mount → write → flush → remount → verify
 ├── deploy/
 │   ├── Dockerfile              # CSI driver image (--features "ublk csi")
-│   ├── kubernetes/             # CSIDriver, RBAC, controller, node, StorageClass
+│   ├── chart/                  # Helm chart (CSIDriver, RBAC, controller, node, StorageClass)
 │   └── example/                # sample PVC + pod
 ├── tests/
 │   └── e2e/
-│       ├── docker-compose.yml  # Azurite + test runner for the mount e2e
-│       ├── Dockerfile          # build + test runner image (rust + e2fsprogs)
-│       ├── csi/                # controller gRPC e2e (grpcurl ↔ Azurite)
-│       └── k8s/                # kind-based PVC e2e (provision → write → remount)
+│       ├── docker-compose.yml  # Azurite + k3s + runner for the whole e2e suite
+│       ├── Dockerfile          # e2e runner image (rust + docker/kubectl/helm)
+│       └── k8s/                # k8s manifests for the PVC e2e (helm values, writer/reader jobs)
 └── LICENSE.md                  # MIT license
 ```

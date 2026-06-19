@@ -1,7 +1,7 @@
 //! Kubernetes PVC e2e for the `ublk-azblob` CSI driver, written in Rust.
 //!
 //! It runs against the multi-node k3s cluster provided by the docker-compose
-//! harness (`tests/e2e/k8s/docker-compose.yml`), deploys the CSI driver
+//! harness (`tests/e2e/docker-compose.yml`), deploys the CSI driver
 //! (controller + node) and an in-cluster Azurite, then exercises the full PVC
 //! lifecycle:
 //!
