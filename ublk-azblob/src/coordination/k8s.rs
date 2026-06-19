@@ -184,7 +184,23 @@ impl ClusterLease for K8sClusterLease {
             .await
             .context("get lease for renew")?;
         match lease {
-            Some(lease) => self.replace_owned(&lease).await,
+            Some(lease) => {
+                // Only renew if we are still the holder. If this node stalled
+                // past the recovery timeout, another node may have legitimately
+                // taken over; blindly replacing would silently reclaim a lease
+                // we already lost and leave two nodes believing they hold it.
+                let spec = lease.spec.clone().unwrap_or_default();
+                if !held_by(&spec, &self.holder) {
+                    let holder = spec.holder_identity.clone().unwrap_or_default();
+                    anyhow::bail!(
+                        "cluster lease '{}' is no longer held by us (now held by '{}'); \
+                         this node lost the lease (likely stalled past the recovery timeout)",
+                        self.name,
+                        holder
+                    );
+                }
+                self.replace_owned(&lease).await
+            }
             None => self.create_owned().await,
         }
     }

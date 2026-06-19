@@ -190,11 +190,13 @@ Key decisions:
 2. **No attach stage.** `attachRequired: false`; the node plugin attaches the
    ublk device directly in `NodePublishVolume`, so there is no
    ControllerPublish/VolumeAttachment round-trip.
-3. **Volume identity.** A volume ID is `<container>/<blob>` (container names
-   cannot contain `/`). The blob name is the CSI volume name (`pvc-<uuid>`). The
-   account/endpoint are driver-level config (env); the container is a
-   `StorageClass` parameter. `DeleteVolume` only gets the volume ID, which is why
-   the blob location is fully encoded there.
+3. **Volume identity.** A volume ID is `<account>/<container>/<blob>` (account
+   and container names cannot contain `/`). The blob name comes from the
+   configured blob-path template (default `ublk-azblob-disk/${pv.name}`), not
+   necessarily the raw CSI volume name. The endpoint is driver-level config
+   (env); the account and container are `StorageClass` parameters, and the
+   account is encoded in the ID so `DeleteVolume` — which only gets the volume
+   ID and secrets — can recover a per-volume account.
 4. **Node spawns the existing `run` path.** Rather than re-implementing the
    device loop, the node plugin spawns `ublk-azblob run` as a child per volume,
    discovers the new `/dev/ublkbN` under a publish lock, and tracks the child so

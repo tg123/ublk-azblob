@@ -663,7 +663,7 @@ spec:
 
 /// Best-effort cluster diagnostics on failure (mirrors the bash failure dumps).
 fn dump_diagnostics(app: &str) {
-    log(&format!("=== diagnostics for {app} ==="));
+    log(&format!("diagnostics for {app}"));
     let _ = try_run("kubectl", &["describe", &format!("job/{app}")]);
     let _ = try_run(
         "kubectl",
@@ -671,7 +671,7 @@ fn dump_diagnostics(app: &str) {
     );
 
     // Dump CSI controller logs (both containers)
-    log("=== CSI controller logs (azblob) ===");
+    log("CSI controller logs (azblob)");
     let _ = try_run(
         "kubectl",
         &[
@@ -685,7 +685,7 @@ fn dump_diagnostics(app: &str) {
             "--tail=200",
         ],
     );
-    log("=== CSI controller logs (csi-provisioner) ===");
+    log("CSI controller logs (csi-provisioner)");
     let _ = try_run(
         "kubectl",
         &[
@@ -701,7 +701,7 @@ fn dump_diagnostics(app: &str) {
     );
 
     // Dump CSI node logs
-    log("=== CSI node logs ===");
+    log("CSI node logs");
     let _ = try_run(
         "kubectl",
         &[
@@ -717,7 +717,7 @@ fn dump_diagnostics(app: &str) {
     );
 
     // Dump PVC/PV status
-    log("=== PVC/PV status ===");
+    log("PVC/PV status");
     let _ = try_run("kubectl", &["get", "pvc,pv", "-o", "wide"]);
     let _ = try_run("kubectl", &["describe", "pvc"]);
 }

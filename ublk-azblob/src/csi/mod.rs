@@ -19,9 +19,12 @@
 //! ## Volume model
 //!
 //! One PVC maps to exactly one page blob.  The CSI *volume id* encodes the
-//! container and blob name as `"{container}/{blob}"`, which is all
-//! `DeleteVolume` (which only receives the volume id and secrets) needs to find
-//! the blob again.  The storage account and service endpoint are driver-level
+//! storage account, container and blob name as `"{account}/{container}/{blob}"`.
+//! The account is deliberately encoded so that `DeleteVolume` (which only
+//! receives the volume id and secrets, never the `StorageClass` parameters) can
+//! recover the per-volume account chosen at create time — the account may be
+//! overridden per volume via the `storageAccount` `StorageClass` parameter, not
+//! just the driver-level default.  The service endpoint is driver-level
 //! configuration supplied to every replica via environment variables / flags.
 
 pub mod controller;

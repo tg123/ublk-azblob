@@ -242,9 +242,11 @@ ublk-azblob csi --role node --csi-endpoint unix:///csi/csi.sock
 ```
 
 Driver name: `azblob.ublk.csi.tg123.github.io`. Volume IDs encode the blob
-location as `<container>/<blob>`; the storage account and endpoint come from the
-driver's environment (`AZURE_STORAGE_*`), while the container can be overridden
-per `StorageClass` via the `container` parameter.
+location as `<account>/<container>/<blob>`; the endpoint comes from the driver's
+environment (`AZURE_STORAGE_*`), while the storage account and container can be
+overridden per `StorageClass` via the `storageAccount` and `container`
+parameters (the account is encoded in the volume ID so `DeleteVolume` can recover
+a per-volume account).
 
 ### Deploy
 
