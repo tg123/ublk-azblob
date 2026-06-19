@@ -519,6 +519,12 @@ impl BlobBackend for FileCacheBackend {
         let state = self.state.lock().await;
         Ok(state.dev_size)
     }
+
+    async fn snapshot(&self) -> anyhow::Result<String> {
+        // Flush cached dirty pages so the snapshot reflects the latest data.
+        self.flush().await?;
+        self.inner.snapshot().await
+    }
 }
 
 /// Load the metadata bitmaps from `meta`, validating the header.  If the file is

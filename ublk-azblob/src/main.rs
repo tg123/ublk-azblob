@@ -3,31 +3,30 @@
 //! # Usage
 //!
 //! ```text
-//! ublk-azblob [GLOBAL OPTIONS] --account <ACCOUNT> --container <CONTAINER> --blob <BLOB> \
-//!     <run|test> --size <SIZE>
+//! ublk-azblob [STORAGE/AUTH OPTIONS] <run|test> --size <SIZE>
 //! ```
 //!
 //! `--size` (and other per-command options) belong to the `run`/`test`
 //! subcommands; auth and storage selectors are global options.
 //!
+//! Folder import and snapshot creation are provided by the standalone
+//! `ublk-azblob-import` and `ublk-azblob-snapshot` tools.
+//!
 //! See `--help` and `README.md` for full documentation.
 
-mod auth;
-mod backend;
-mod nbd_target;
-mod ublk_target;
-
 use anyhow::Context as _;
-use auth::{AuthConfig, UserAssignedIdentity};
-use backend::{
-    azure::AzurePageBlobBackend,
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::sync::Arc;
+use ublk_azblob::backend::{
     buffered::{BufferedBackend, BufferedConfig},
     file::{FileCacheBackend, FileCacheConfig},
     BlobBackend,
 };
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
-use std::sync::Arc;
+use ublk_azblob::cli::{init_tracing, StorageArgs};
+use ublk_azblob::{nbd_target, ublk_target};
+
+use bytes::Bytes;
 use tracing::{error, info};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -39,46 +38,8 @@ use tracing::{error, info};
     version
 )]
 struct Cli {
-    /// Azure Storage account name (e.g. `mystorageaccount`).
-    #[arg(long, env = "AZURE_STORAGE_ACCOUNT")]
-    account: String,
-
-    /// Blob container name.
-    #[arg(long, env = "AZURE_STORAGE_CONTAINER")]
-    container: String,
-
-    /// Page blob name (path within the container).
-    #[arg(long, env = "AZURE_STORAGE_BLOB")]
-    blob: String,
-
-    /// Azure Storage service endpoint URL.
-    ///
-    /// Defaults to `https://<account>.blob.core.windows.net/`.
-    /// For Azurite use `http://127.0.0.1:10000/<account>`.
-    #[arg(long, env = "AZURE_STORAGE_ENDPOINT")]
-    endpoint: Option<String>,
-
-    /// Storage account key (base64).  Enables SharedKey auth mode.
-    ///
-    /// Mutually exclusive with --msi / --msi-*.  Use for Azurite and local dev.
-    #[arg(long, env = "AZURE_STORAGE_KEY", conflicts_with_all = ["msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
-    account_key: Option<String>,
-
-    /// Enable system-assigned Managed Identity.
-    #[arg(long, env = "AZURE_USE_MSI")]
-    msi: bool,
-
-    /// User-assigned Managed Identity — client ID.
-    #[arg(long, env = "AZURE_MSI_CLIENT_ID", conflicts_with_all = ["msi_object_id", "msi_resource_id"])]
-    msi_client_id: Option<String>,
-
-    /// User-assigned Managed Identity — object ID.
-    #[arg(long, env = "AZURE_MSI_OBJECT_ID", conflicts_with_all = ["msi_resource_id"])]
-    msi_object_id: Option<String>,
-
-    /// User-assigned Managed Identity — resource ID.
-    #[arg(long, env = "AZURE_MSI_RESOURCE_ID")]
-    msi_resource_id: Option<String>,
+    #[command(flatten)]
+    storage: StorageArgs,
 
     #[command(subcommand)]
     command: Command,
@@ -164,26 +125,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ublk_azblob=info".parse().unwrap()),
-        )
-        .init();
+    init_tracing();
 
     let cli = Cli::parse();
-    let auth = build_auth(&cli)?;
-    let endpoint = cli
-        .endpoint
-        .unwrap_or_else(|| format!("https://{}.blob.core.windows.net/", cli.account));
-
-    let container_client = auth::build_container_client(&endpoint, &cli.container, &auth)
-        .context("build container client")?;
-
-    let backend: Arc<dyn BlobBackend> = Arc::new(AzurePageBlobBackend::new(
-        container_client,
-        cli.blob.clone(),
-    ));
+    let backend: Arc<dyn BlobBackend> = cli.storage.build_backend()?;
 
     match cli.command {
         Command::Run {
@@ -199,12 +144,12 @@ async fn main() -> anyhow::Result<()> {
             nbd,
         } => {
             if create {
-                info!(size, blob = %cli.blob, "creating page blob");
+                info!(size, blob = %cli.storage.blob, "creating page blob");
                 backend.create(size).await.context("create page blob")?;
             }
 
             let actual_size = backend.size().await.context("get blob size")?;
-            info!(size = actual_size, blob = %cli.blob, "blob ready");
+            info!(size = actual_size, blob = %cli.storage.blob, "blob ready");
 
             // Optional local-disk cache layer (memory → local disk → blob).
             let backend: Arc<dyn BlobBackend> = if let Some(dir) = cache_dir {
@@ -217,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
                     backend,
                     FileCacheConfig {
                         dir,
-                        name: cache_file_name(&cli.container, &cli.blob),
+                        name: cache_file_name(&cli.storage.container, &cli.storage.blob),
                         page_size: cache_page_size,
                     },
                     actual_size,
@@ -286,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Auth builder ─────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a filesystem-safe cache file base name from the container and blob.
 ///
@@ -305,40 +250,6 @@ fn cache_file_name(container: &str, blob: &str) -> String {
     name
 }
 
-fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
-    if let Some(key) = &cli.account_key {
-        return Ok(AuthConfig::SharedKey {
-            account_name: cli.account.clone(),
-            account_key: key.clone(),
-        });
-    }
-
-    // Prefer user-assigned identities if given, fall back to system-assigned.
-    let user_assigned = cli
-        .msi_client_id
-        .as_ref()
-        .map(|s| UserAssignedIdentity::ClientId(s.clone()))
-        .or_else(|| {
-            cli.msi_object_id
-                .as_ref()
-                .map(|s| UserAssignedIdentity::ObjectId(s.clone()))
-        })
-        .or_else(|| {
-            cli.msi_resource_id
-                .as_ref()
-                .map(|s| UserAssignedIdentity::ResourceId(s.clone()))
-        });
-
-    if user_assigned.is_some() || cli.msi {
-        return Ok(AuthConfig::Msi(user_assigned));
-    }
-
-    anyhow::bail!(
-        "No auth method specified. Use --account-key for Azurite/dev, \
-         or --msi / --msi-client-id for production (Managed Identity)."
-    );
-}
-
 // ── Smoke test ────────────────────────────────────────────────────────────────
 
 /// Quick write → read-back → clear → read-zero cycle to verify connectivity.
@@ -346,7 +257,7 @@ async fn run_smoke_test(backend: Arc<dyn BlobBackend>, size: u64) -> anyhow::Res
     info!(size, "provisioning test blob");
     backend.create(size).await.context("create")?;
 
-    let pattern = bytes::Bytes::from(vec![0xABu8; 512]);
+    let pattern = Bytes::from(vec![0xABu8; 512]);
     info!("writing pattern to first page");
     backend.write(0, pattern.clone()).await.context("write")?;
 

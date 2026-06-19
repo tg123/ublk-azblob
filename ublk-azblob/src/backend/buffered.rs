@@ -453,6 +453,12 @@ impl BlobBackend for BufferedBackend {
     async fn size(&self) -> anyhow::Result<u64> {
         self.dev_size().await
     }
+
+    async fn snapshot(&self) -> anyhow::Result<String> {
+        // Flush buffered writes so the snapshot reflects the latest data.
+        self.flush().await?;
+        self.inner.snapshot().await
+    }
 }
 
 #[cfg(test)]

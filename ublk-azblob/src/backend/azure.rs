@@ -9,7 +9,10 @@ use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use azure_storage_blob::{
-    models::{BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders, HttpRange},
+    models::{
+        BlobClientCreateSnapshotResultHeaders, BlobClientDownloadOptions,
+        BlobClientGetPropertiesResultHeaders, HttpRange,
+    },
     BlobContainerClient,
 };
 use bytes::Bytes;
@@ -167,5 +170,25 @@ impl BlobBackend for AzurePageBlobBackend {
             )
         })?;
         Ok(len)
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn snapshot(&self) -> anyhow::Result<String> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("creating blob snapshot");
+        let result = blob_client
+            .create_snapshot(None)
+            .await
+            .with_context(|| format!("create_snapshot for blob '{}'", self.blob_name))?;
+        let snapshot = result
+            .snapshot()
+            .with_context(|| format!("read snapshot header for blob '{}'", self.blob_name))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "blob '{}': missing x-ms-snapshot in create_snapshot response",
+                    self.blob_name
+                )
+            })?;
+        Ok(snapshot)
     }
 }
