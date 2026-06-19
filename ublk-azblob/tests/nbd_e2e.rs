@@ -52,10 +52,14 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000/devstoreaccount1";
 const DEFAULT_CONTAINER: &str = "e2etest";
 const DEFAULT_BLOB: &str = "nbdtest";
 
-/// Host:port the in-test NBD server binds to.  Kept distinct from the default
-/// NBD port (10809) to avoid clashing with anything a developer may already be
-/// running locally.
-const NBD_ADDR: &str = "127.0.0.1:11809";
+/// Host:port the `nbd_roundtrip` test's NBD server binds to.  Kept distinct from
+/// the default NBD port (10809) to avoid clashing with anything a developer may
+/// already be running locally.
+const NBD_ADDR_ROUNDTRIP: &str = "127.0.0.1:11809";
+/// Host:port the `nbd_read_only` test's NBD server binds to.  A separate port
+/// from [`NBD_ADDR_ROUNDTRIP`] so the two tests can run in parallel (the default
+/// for `cargo test`) without racing for a single socket.
+const NBD_ADDR_READ_ONLY: &str = "127.0.0.1:11810";
 const BLOB_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 const NUM_REGIONS: usize = 8;
 /// Logical block size advertised by the NBD target (matches `BLOCK_SIZE` in
@@ -147,23 +151,29 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
 }
 
 /// Start the NBD server as a child process and wait until it accepts a TCP
-/// connection on [`NBD_ADDR`].  When `create` is true the page blob is
-/// provisioned first.
+/// connection on `addr`.  When `create` is true the page blob is provisioned
+/// first.
 ///
 /// The returned `Child` is always `wait()`ed on by the caller (via
 /// `stop_server`), so the zombie-process lint does not apply.
 #[allow(clippy::zombie_processes)]
-fn start_server(container: &str, blob: &str, create: bool) -> Child {
-    start_server_opts(container, blob, create, false)
+fn start_server(addr: &str, container: &str, blob: &str, create: bool) -> Child {
+    start_server_opts(addr, container, blob, create, false)
 }
 
 /// Like [`start_server`] but lets the caller expose the export read-only
 /// (`run --read-only`).  `create` and `read_only` are mutually exclusive at the
 /// CLI level, so callers pass `create=false` when `read_only=true`.
 #[allow(clippy::zombie_processes)]
-fn start_server_opts(container: &str, blob: &str, create: bool, read_only: bool) -> Child {
+fn start_server_opts(
+    addr: &str,
+    container: &str,
+    blob: &str,
+    create: bool,
+    read_only: bool,
+) -> Child {
     log(&format!(
-        "starting NBD server on {NBD_ADDR} ({}{})",
+        "starting NBD server on {addr} ({}{})",
         if create { "--create" } else { "reuse blob" },
         if read_only { ", --read-only" } else { "" }
     ));
@@ -173,7 +183,7 @@ fn start_server_opts(container: &str, blob: &str, create: bool, read_only: bool)
         .arg("--size")
         .arg(BLOB_SIZE.to_string())
         .arg("--nbd")
-        .arg(NBD_ADDR);
+        .arg(addr);
     if create {
         cmd.arg("--create");
     }
@@ -186,7 +196,7 @@ fn start_server_opts(container: &str, blob: &str, create: bool, read_only: bool)
 
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        if let Ok(stream) = TcpStream::connect(NBD_ADDR) {
+        if let Ok(stream) = TcpStream::connect(addr) {
             drop(stream);
             log(&format!("NBD server is up (pid {})", child.id()));
             return child;
@@ -198,7 +208,7 @@ fn start_server_opts(container: &str, blob: &str, create: bool, read_only: bool)
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("timed out waiting for the NBD server to listen on {NBD_ADDR}");
+    panic!("timed out waiting for the NBD server to listen on {addr}");
 }
 
 /// Stop the running NBD server: the data was already flushed (`NBD_CMD_FLUSH` +
@@ -240,10 +250,10 @@ struct NbdClient {
 }
 
 impl NbdClient {
-    /// Connect to [`NBD_ADDR`] and complete the fixed-newstyle handshake using
+    /// Connect to `addr` and complete the fixed-newstyle handshake using
     /// `NBD_OPT_GO`, leaving the connection in the transmission phase.
-    fn connect() -> NbdClient {
-        let mut stream = TcpStream::connect(NBD_ADDR).expect("connect NBD server");
+    fn connect(addr: &str) -> NbdClient {
+        let mut stream = TcpStream::connect(addr).expect("connect NBD server");
         stream.set_nodelay(true).ok();
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -420,16 +430,16 @@ fn nbd_roundtrip() {
     // The NBD server child process must exist (e.g. an earlier `/dev/ublkb`
     // device node must not collide); a previous run must have released the port.
     assert!(
-        TcpStream::connect(NBD_ADDR).is_err(),
-        "{NBD_ADDR} is already in use; another NBD server is running"
+        TcpStream::connect(NBD_ADDR_ROUNDTRIP).is_err(),
+        "{NBD_ADDR_ROUNDTRIP} is already in use; another NBD server is running"
     );
 
     let container = env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER);
     let blob = env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB);
 
     // ── Phase 1: provision the blob, write random regions, verify in-session ──
-    let child = start_server(&container, &blob, true);
-    let mut client = NbdClient::connect();
+    let child = start_server(NBD_ADDR_ROUNDTRIP, &container, &blob, true);
+    let mut client = NbdClient::connect(NBD_ADDR_ROUNDTRIP);
 
     log(&format!("writing {NUM_REGIONS} random regions"));
     let mut checksums: Vec<(u64, usize, String)> = Vec::with_capacity(NUM_REGIONS);
@@ -464,11 +474,11 @@ fn nbd_roundtrip() {
     stop_server(child);
 
     // Wait for the port to be released so the second server can bind it.
-    wait_for_port_release();
+    wait_for_port_release(NBD_ADDR_ROUNDTRIP);
 
     // ── Phase 2: restart over the same blob and re-verify ─────────────────────
-    let child = start_server(&container, &blob, false);
-    let mut client = NbdClient::connect();
+    let child = start_server(NBD_ADDR_ROUNDTRIP, &container, &blob, false);
+    let mut client = NbdClient::connect(NBD_ADDR_ROUNDTRIP);
 
     log("verifying regions after restart (data round-tripped through Azure)");
     for (offset, len, expected) in &checksums {
@@ -511,8 +521,8 @@ fn nbd_read_only() {
         return;
     }
     assert!(
-        TcpStream::connect(NBD_ADDR).is_err(),
-        "{NBD_ADDR} is already in use; another NBD server is running"
+        TcpStream::connect(NBD_ADDR_READ_ONLY).is_err(),
+        "{NBD_ADDR_READ_ONLY} is already in use; another NBD server is running"
     );
 
     let container = env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER);
@@ -520,8 +530,8 @@ fn nbd_read_only() {
     let blob = format!("{}-ro", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB));
 
     // ── Phase 1: provision the blob writable and seed known regions ───────────
-    let child = start_server(&container, &blob, true);
-    let mut client = NbdClient::connect();
+    let child = start_server(NBD_ADDR_READ_ONLY, &container, &blob, true);
+    let mut client = NbdClient::connect(NBD_ADDR_READ_ONLY);
     assert_eq!(
         client.transmission_flags & NBD_FLAG_READ_ONLY,
         0,
@@ -543,11 +553,11 @@ fn nbd_read_only() {
     sleep(Duration::from_secs(1));
     stop_server(child);
 
-    wait_for_port_release();
+    wait_for_port_release(NBD_ADDR_READ_ONLY);
 
     // ── Phase 2: reopen read-only and assert the export rejects mutations ─────
-    let child = start_server_opts(&container, &blob, false, true);
-    let mut client = NbdClient::connect();
+    let child = start_server_opts(NBD_ADDR_READ_ONLY, &container, &blob, false, true);
+    let mut client = NbdClient::connect(NBD_ADDR_READ_ONLY);
     assert_eq!(
         client.transmission_flags & NBD_FLAG_READ_ONLY,
         NBD_FLAG_READ_ONLY,
@@ -589,11 +599,11 @@ fn nbd_read_only() {
     sleep(Duration::from_secs(1));
     stop_server(child);
 
-    wait_for_port_release();
+    wait_for_port_release(NBD_ADDR_READ_ONLY);
 
     // ── Phase 3: reopen writable and confirm nothing was mutated ──────────────
-    let child = start_server(&container, &blob, false);
-    let mut client = NbdClient::connect();
+    let child = start_server(NBD_ADDR_READ_ONLY, &container, &blob, false);
+    let mut client = NbdClient::connect(NBD_ADDR_READ_ONLY);
     log("verifying the blob was never modified by the rejected writes");
     for (offset, len, expected) in &checksums {
         let got = client.read_at(*offset, *len as u32);
@@ -610,10 +620,10 @@ fn nbd_read_only() {
     log("nbd read-only e2e PASSED ✓");
 }
 
-/// Wait for [`NBD_ADDR`] to be released so the next server can bind it.
-fn wait_for_port_release() {
+/// Wait for `addr` to be released so the next server can bind it.
+fn wait_for_port_release(addr: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && TcpStream::connect(NBD_ADDR).is_ok() {
+    while Instant::now() < deadline && TcpStream::connect(addr).is_ok() {
         sleep(Duration::from_millis(500));
     }
 }
