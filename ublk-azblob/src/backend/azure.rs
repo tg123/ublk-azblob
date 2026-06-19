@@ -12,11 +12,13 @@ use async_trait::async_trait;
 use azure_storage_blob::{
     models::{
         BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
-        BlobClientGetPropertiesResultHeaders, HttpRange,
+        BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
+        PageBlobClientCreateOptions, PageBlobClientUploadPagesOptions,
     },
     BlobContainerClient,
 };
 use bytes::Bytes;
+use std::sync::RwLock;
 use tracing::{error, instrument, trace};
 
 /// Azure Page Blob backend.
@@ -29,6 +31,15 @@ use tracing::{error, instrument, trace};
 pub struct AzurePageBlobBackend {
     container: BlobContainerClient,
     blob_name: String,
+    /// Blob-lease id (`x-ms-lease-id`) to attach to every mutating request.
+    ///
+    /// When cluster coordination is enabled the holder takes an exclusive lease
+    /// on the page blob; Azure then rejects any Put Page / Clear Pages that does
+    /// not carry the matching lease id with HTTP 412. This is set (via
+    /// [`AzurePageBlobBackend::set_lease_id`]) once the lease has been acquired,
+    /// before any I/O is served. `None` means no lease is held (coordination
+    /// disabled), and requests are sent without a lease condition.
+    lease_id: RwLock<Option<String>>,
 }
 
 impl AzurePageBlobBackend {
@@ -41,7 +52,22 @@ impl AzurePageBlobBackend {
         Self {
             container,
             blob_name: blob_name.into(),
+            lease_id: RwLock::new(None),
         }
+    }
+
+    /// Attach (or clear) the blob-lease id carried on every mutating request.
+    ///
+    /// Call this with `Some(id)` after acquiring the coordination blob lease and
+    /// before serving any I/O, so writes to the now-leased blob carry the
+    /// matching `x-ms-lease-id` instead of being rejected with HTTP 412.
+    pub fn set_lease_id(&self, lease_id: Option<String>) {
+        *self.lease_id.write().unwrap() = lease_id;
+    }
+
+    /// Snapshot the current lease id, if any.
+    fn lease_id(&self) -> Option<String> {
+        self.lease_id.read().unwrap().clone()
     }
 }
 
@@ -92,8 +118,12 @@ impl BlobBackend for AzurePageBlobBackend {
         }
         let page_client = blob_client.page_blob_client();
         trace!(size, "creating page blob");
+        let opts = PageBlobClientCreateOptions {
+            lease_id: self.lease_id(),
+            ..Default::default()
+        };
         page_client
-            .create(size, None)
+            .create(size, Some(opts))
             .await
             .with_context(|| format!("create page blob '{}' size={size}", self.blob_name))?;
         Ok(())
@@ -140,12 +170,16 @@ impl BlobBackend for AzurePageBlobBackend {
         let page_client = blob_client.page_blob_client();
         let range = HttpRange::new(offset, len);
         trace!(offset, len, "uploading pages");
+        let opts = PageBlobClientUploadPagesOptions {
+            lease_id: self.lease_id(),
+            ..Default::default()
+        };
         page_client
             .upload_pages(
                 azure_core::http::RequestContent::from(data.to_vec()),
                 len,
                 range,
-                None,
+                Some(opts),
             )
             .await
             .with_context(|| {
@@ -169,8 +203,12 @@ impl BlobBackend for AzurePageBlobBackend {
         let page_client = blob_client.page_blob_client();
         let range = HttpRange::new(offset, len);
         trace!(offset, len, "clearing pages");
+        let opts = PageBlobClientClearPagesOptions {
+            lease_id: self.lease_id(),
+            ..Default::default()
+        };
         page_client
-            .clear_pages(range, None)
+            .clear_pages(range, Some(opts))
             .await
             .with_context(|| {
                 format!(

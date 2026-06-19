@@ -347,13 +347,16 @@ async fn main() -> anyhow::Result<()> {
             flush_io_timeout_secs,
             ref nbd,
         } => {
-            let backend = build_azure_backend(&cli, &endpoint)?;
+            let azure_backend = build_azure_backend(&cli, &endpoint)?;
             if create {
                 info!(size, "creating page blob");
-                backend.create(size).await.context("create page blob")?;
+                azure_backend
+                    .create(size)
+                    .await
+                    .context("create page blob")?;
             }
 
-            let actual_size = backend.size().await.context("get blob size")?;
+            let actual_size = azure_backend.size().await.context("get blob size")?;
             info!(size = actual_size, "blob ready");
 
             // Acquire cluster + blob coordination locks before mounting (after
@@ -375,6 +378,14 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
+
+            // Once the blob lease is held, every write/clear must carry the
+            // matching `x-ms-lease-id` or Azure rejects it with HTTP 412. Hand
+            // the lease id to the data-path backend before any I/O is served.
+            if let Some(g) = &guard {
+                azure_backend.set_lease_id(Some(g.lease_id().to_string()));
+            }
+            let backend: Arc<dyn BlobBackend> = azure_backend;
 
             // Optional local-disk cache layer (memory → local disk → blob).
             let backend: Arc<dyn BlobBackend> = if let Some(dir) = cache_dir.clone() {
@@ -466,7 +477,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Test { size } => {
-            let backend = build_azure_backend(&cli, &endpoint)?;
+            let backend: Arc<dyn BlobBackend> = build_azure_backend(&cli, &endpoint)?;
             run_smoke_test(backend, size).await?;
         }
 
@@ -517,7 +528,7 @@ async fn main() -> anyhow::Result<()> {
 /// Build an `AzurePageBlobBackend` for the blob selected by the global CLI
 /// options.  Used by the `run` and `test` subcommands (which target a single,
 /// explicitly-named blob).
-fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<dyn BlobBackend>> {
+fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<AzurePageBlobBackend>> {
     let blob = cli
         .blob
         .clone()

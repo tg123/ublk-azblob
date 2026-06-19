@@ -323,6 +323,15 @@ pub struct CoordinationGuard {
 }
 
 impl CoordinationGuard {
+    /// The blob-lease id (`x-ms-lease-id`) held for this mount.
+    ///
+    /// Once coordination is enabled, every mutating request to the leased page
+    /// blob must carry this id or Azure rejects it with HTTP 412; the data-path
+    /// backend is told about it via `AzurePageBlobBackend::set_lease_id`.
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
     /// Stop the renewal loop and release both leases so another node can take
     /// the volume over immediately.
     pub async fn release(mut self) {
