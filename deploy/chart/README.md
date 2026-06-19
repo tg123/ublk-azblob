@@ -106,6 +106,10 @@ A single image is shared by the controller and node plugins.
 |-----------|-------------|---------|
 | `node.useNbd` | Use NBD instead of ublk (for older kernels) | `false` |
 | `node.nbd.portStart` | NBD server port range start | `10809` |
+| `node.cache.enabled` | Enable the shared local-disk cache on each node | `false` |
+| `node.cache.hostPath` | Host directory used as the shared cache | `/var/lib/ublk-azblob/cache` |
+| `node.cache.maxBytes` | Max total cache bytes shared across volumes (0 = unlimited) | `0` |
+| `node.cache.pageSize` | Cache page size in bytes | `1048576` |
 | `node.resources.limits.cpu` | Node CPU limit | `500m` |
 | `node.resources.limits.memory` | Node memory limit | `512Mi` |
 | `node.resources.requests.cpu` | Node CPU request | `100m` |

@@ -124,6 +124,17 @@ spec:
             - name: CSI_NBD_PORT_START
               value: {{ .Values.node.nbd.portStart | quote }}
             {{- end }}
+            {{- if .Values.node.cache.enabled }}
+            # Local-disk cache configuration (shared by all volumes on the node).
+            # The child `run` process inherits these and caches blob pages on the
+            # mounted host directory, with a cross-volume LRU byte budget.
+            - name: UBLK_CACHE_DIR
+              value: {{ .Values.node.cache.hostPath | quote }}
+            - name: UBLK_CACHE_MAX_BYTES
+              value: {{ .Values.node.cache.maxBytes | quote }}
+            - name: UBLK_CACHE_PAGE_SIZE
+              value: {{ .Values.node.cache.pageSize | quote }}
+            {{- end }}
             {{- with .Values.node.env }}
             # Additional environment variables
             {{- toYaml . | nindent 12 }}
@@ -140,6 +151,11 @@ spec:
             - name: modules-dir
               mountPath: /lib/modules
               readOnly: true
+            {{- if .Values.node.cache.enabled }}
+            - name: cache-dir
+              mountPath: {{ .Values.node.cache.hostPath }}
+              mountPropagation: None
+            {{- end }}
             {{- with .Values.node.volumeMounts }}
             # Additional volume mounts
             {{- toYaml . | nindent 12 }}
@@ -169,6 +185,12 @@ spec:
           hostPath:
             path: /lib/modules
             type: DirectoryOrCreate
+        {{- if .Values.node.cache.enabled }}
+        - name: cache-dir
+          hostPath:
+            path: {{ .Values.node.cache.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
         {{- with .Values.node.volumes }}
         # Additional volumes
         {{- toYaml . | nindent 8 }}

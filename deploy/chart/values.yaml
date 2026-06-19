@@ -47,7 +47,27 @@ node:
     # Port range start for NBD servers (each volume gets its own port)
     # Default: 10809
     portStart: 10809
-  
+
+  # Local-disk cache shared by every volume process on the node.
+  # When enabled, a host directory is mounted into the node plugin and each
+  # volume's `run` child caches blob pages there. The byte budget is enforced
+  # across all volumes sharing the directory (LRU eviction of clean pages).
+  cache:
+    # Enable the local-disk cache. When false, no cache directory is wired up
+    # and volumes stream directly to/from the blob.
+    enabled: false
+
+    # Host directory used as the cache, shared by every volume on the node.
+    # Mounted into the node plugin container at the same path.
+    hostPath: /var/lib/ublk-azblob/cache
+
+    # Maximum total cache size in bytes, shared across all volumes using the
+    # directory above. 0 = unlimited (grow-only).
+    maxBytes: 0
+
+    # Cache page size in bytes (the local-disk cache granularity).
+    pageSize: 1048576
+
   resources:
     limits:
       cpu: 500m
