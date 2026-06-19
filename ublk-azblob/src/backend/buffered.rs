@@ -26,7 +26,9 @@ use tracing::{info, trace, warn};
 pub struct BufferedConfig {
     /// Size of each buffer page in bytes (must be a multiple of 512).
     pub page_size: u64,
-    /// Maximum number of dirty pages held in memory before auto-flush.
+    /// Maximum number of dirty (unflushed) pages kept in the in-memory
+    /// write-back buffer. Exceeding it triggers an immediate flush of the
+    /// oldest dirty pages back down to the limit.
     pub max_dirty_pages: usize,
     /// Idle flush timeout in seconds: flush dirty pages after N seconds of write inactivity.
     /// Set to 0 to disable idle flushing. When triggered, resets the force flush timer.
