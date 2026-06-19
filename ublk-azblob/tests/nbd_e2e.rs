@@ -30,6 +30,10 @@
 //! reads succeed, and writes / trims / write-zeroes are rejected with `EPERM`
 //! without mutating the backing blob.
 //!
+//! A third test, [`nbd_template_copy`](fn.nbd_template_copy.html), exercises the
+//! `copy` subcommand: it seeds a source blob, copies it into a fresh target via
+//! a `templateBlobUrl`, and verifies the target round-trips the source data.
+//!
 //! Run it (with Azurite up) via:
 //!
 //! ```text

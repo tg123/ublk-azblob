@@ -401,9 +401,9 @@ fn mount_read_only() {
     }
 
     let spec = DeviceSpec {
-        // Distinct device id and blob so this test never collides with the
-        // other mount tests.
-        dev_id: "2".to_string(),
+        // Distinct, high device id and blob so this test never collides with
+        // the other mount tests or the low ids the k8s CSI e2e auto-assigns.
+        dev_id: "42".to_string(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-ro", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,

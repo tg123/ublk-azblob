@@ -515,4 +515,75 @@ mod tests {
         std::fs::remove_file(&token_path).ok();
         assert!(ok, "workload identity client failed: {err:?}");
     }
+
+    #[tokio::test]
+    async fn sas_policy_merges_query_and_preserves_existing() {
+        use super::SasPolicy;
+        use azure_core::error::{Error, ErrorKind};
+        use azure_core::http::policies::{Policy, PolicyResult};
+        use azure_core::http::{Context, Method, Request, Url};
+        use std::sync::{Arc, Mutex};
+
+        // Terminal policy that captures the final request URL after `SasPolicy`
+        // has merged the SAS query in, then short-circuits the pipeline.
+        #[derive(Debug)]
+        struct Capture(Arc<Mutex<Option<Url>>>);
+
+        #[async_trait::async_trait]
+        impl Policy for Capture {
+            async fn send(
+                &self,
+                _ctx: &Context,
+                request: &mut Request,
+                _next: &[Arc<dyn Policy>],
+            ) -> PolicyResult {
+                *self.0.lock().unwrap() = Some(request.url().clone());
+                Err(Error::with_message(ErrorKind::Other, "terminal"))
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let terminal: Arc<dyn Policy> = Arc::new(Capture(captured.clone()));
+
+        let sas =
+            SasPolicy::new("?sv=2021-08-06&ss=b&sig=abc%2Bdef%3D&se=2030-01-01T00%3A00%3A00Z");
+
+        // The request URL already carries `comp`/`snapshot` (as the SDK would add
+        // for a Put Page against a snapshot); those must survive the merge.
+        let url = Url::parse(
+            "https://acct.blob.core.windows.net/container/blob\
+             ?comp=page&snapshot=2020-01-01T00%3A00%3A00Z",
+        )
+        .unwrap();
+        let mut request = Request::new(url, Method::Put);
+
+        let _ = sas
+            .send(
+                &Context::new(),
+                &mut request,
+                std::slice::from_ref(&terminal),
+            )
+            .await;
+
+        let final_url = captured.lock().unwrap().clone().expect("url captured");
+        let pairs: std::collections::HashMap<String, String> = final_url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        // Pre-existing keys are preserved with their original values.
+        assert_eq!(pairs.get("comp").map(String::as_str), Some("page"));
+        assert_eq!(
+            pairs.get("snapshot").map(String::as_str),
+            Some("2020-01-01T00:00:00Z")
+        );
+        // SAS pairs are merged in.
+        assert_eq!(pairs.get("sv").map(String::as_str), Some("2021-08-06"));
+        assert_eq!(pairs.get("ss").map(String::as_str), Some("b"));
+        assert_eq!(pairs.get("sig").map(String::as_str), Some("abc+def="));
+        assert_eq!(
+            pairs.get("se").map(String::as_str),
+            Some("2030-01-01T00:00:00Z")
+        );
+    }
 }

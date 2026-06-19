@@ -655,7 +655,14 @@ async fn run_template_copy(
             },
         )
     } else {
-        (endpoint.to_string(), build_auth(cli)?)
+        // Derive the source service URL from the template URL's own host so a
+        // non-SAS template that lives in a different account/host than the
+        // configured `--endpoint`/`--account` is read from the right place
+        // (mirrors `csi::build_template_backend`).
+        (
+            format!("{}/", tmpl.service_url.trim_end_matches('/')),
+            build_auth(cli)?,
+        )
     };
     let src_container = auth::build_container_client(&src_service_url, &tmpl.container, &src_auth)
         .context("build template container client")?;
