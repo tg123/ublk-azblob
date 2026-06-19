@@ -1,0 +1,175 @@
+# Node plug-in: attaches the ublk device and mounts the filesystem on each node.
+#
+# Runs on every node as a DaemonSet alongside the upstream
+# node-driver-registrar sidecar.  The plug-in is privileged and shares the host
+# /dev (to create and see /dev/ublkbN) and /var/lib/kubelet with Bidirectional
+# mount propagation (so the filesystem it mounts is visible to the kubelet and
+# can be bind-mounted into application pods).
+#
+# The ublk_drv kernel module must already be loaded on the host
+# (`sudo modprobe ublk_drv`); a container cannot load it.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "ublk-azblob-csi.fullname" . }}-node
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "ublk-azblob-csi.node.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "ublk-azblob-csi.fullname" . }}-node
+  template:
+    metadata:
+      labels:
+        app: {{ include "ublk-azblob-csi.fullname" . }}-node
+        {{- include "ublk-azblob-csi.node.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "ublk-azblob-csi.node.serviceAccountName" . }}
+      hostPID: true
+      {{- with .Values.node.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if not .Values.node.useNbd }}
+      # Init container for ublk mode: load ublk_drv module
+      initContainers:
+        - name: load-ublk-module
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              # Try to load ublk_drv kernel module using nsenter to access host namespace
+              nsenter --mount=/proc/1/ns/mnt -- modprobe ublk_drv || true
+              # Verify module is loaded
+              if nsenter --mount=/proc/1/ns/mnt -- lsmod | grep -q ublk_drv; then
+                echo "ublk_drv module loaded successfully"
+              else
+                echo "Warning: ublk_drv module not loaded - device may not work"
+              fi
+          securityContext:
+            privileged: true
+      {{- else }}
+      # Init container for NBD mode: load nbd module
+      initContainers:
+        - name: load-nbd-module
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              # Try to load nbd kernel module using nsenter to access host namespace
+              nsenter --mount=/proc/1/ns/mnt -- modprobe nbd max_part=8 || true
+              # Verify module is loaded
+              if nsenter --mount=/proc/1/ns/mnt -- lsmod | grep -q '^nbd '; then
+                echo "nbd module loaded successfully"
+                nsenter --mount=/proc/1/ns/mnt -- ls -la /dev/nbd* 2>&1 | head -5
+              else
+                echo "Warning: nbd module not loaded - device may not work"
+              fi
+          securityContext:
+            privileged: true
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: {{ .Values.sidecars.registrar.image.repository }}:{{ .Values.sidecars.registrar.image.tag }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/{{ .Values.driver.name }}/csi.sock"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          {{- with .Values.sidecars.registrar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+        - name: azblob
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          args:
+            - "csi"
+            - "--role=node"
+            - "--csi-endpoint=unix:///csi/csi.sock"
+          env:
+            - name: CSI_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- if .Values.node.useNbd }}
+            # NBD mode configuration
+            - name: CSI_USE_NBD
+              value: "true"
+            - name: CSI_NBD_HOST
+              value: "127.0.0.1"
+            - name: CSI_NBD_PORT_START
+              value: {{ .Values.node.nbd.portStart | quote }}
+            {{- end }}
+            {{- with .Values.node.env }}
+            # Additional environment variables
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # No hardcoded credentials - come from per-namespace or global secrets at mount time
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: dev-dir
+              mountPath: /dev
+            - name: modules-dir
+              mountPath: /lib/modules
+              readOnly: true
+            {{- with .Values.node.volumeMounts }}
+            # Additional volume mounts
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/{{ .Values.driver.name }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: modules-dir
+          hostPath:
+            path: /lib/modules
+            type: DirectoryOrCreate
+        {{- with .Values.node.volumes }}
+        # Additional volumes
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

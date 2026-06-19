@@ -6,14 +6,20 @@
 //! type crosses the `BlobBackend` boundary into the rest of the crate.
 
 use super::BlobBackend;
+use crate::coordination::{BlobLock, LockError};
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use azure_storage_blob::{
-    models::{BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders, HttpRange},
+    models::{
+        BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
+        BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
+        PageBlobClientCreateOptions, PageBlobClientUploadPagesOptions,
+    },
     BlobClient, BlobContainerClient,
 };
 use bytes::Bytes;
-use tracing::{instrument, trace};
+use std::sync::RwLock;
+use tracing::{error, instrument, trace};
 
 /// Azure Page Blob backend.
 ///
@@ -29,6 +35,15 @@ pub struct AzurePageBlobBackend {
     /// operation targets the immutable snapshot rather than the live blob, so
     /// the backend is effectively read-only.
     snapshot: Option<String>,
+    /// Blob-lease id (`x-ms-lease-id`) to attach to every mutating request.
+    ///
+    /// When cluster coordination is enabled the holder takes an exclusive lease
+    /// on the page blob; Azure then rejects any Put Page / Clear Pages that does
+    /// not carry the matching lease id with HTTP 412. This is set (via
+    /// [`AzurePageBlobBackend::set_lease_id`]) once the lease has been acquired,
+    /// before any I/O is served. `None` means no lease is held (coordination
+    /// disabled), and requests are sent without a lease condition.
+    lease_id: RwLock<Option<String>>,
 }
 
 impl AzurePageBlobBackend {
@@ -42,6 +57,7 @@ impl AzurePageBlobBackend {
             container,
             blob_name: blob_name.into(),
             snapshot: None,
+            lease_id: RwLock::new(None),
         }
     }
 
@@ -66,6 +82,20 @@ impl AzurePageBlobBackend {
             None => Ok(client),
         }
     }
+
+    /// Attach (or clear) the blob-lease id carried on every mutating request.
+    ///
+    /// Call this with `Some(id)` after acquiring the coordination blob lease and
+    /// before serving any I/O, so writes to the now-leased blob carry the
+    /// matching `x-ms-lease-id` instead of being rejected with HTTP 412.
+    pub fn set_lease_id(&self, lease_id: Option<String>) {
+        *self.lease_id.write().unwrap() = lease_id;
+    }
+
+    /// Snapshot the current lease id, if any.
+    fn lease_id(&self) -> Option<String> {
+        self.lease_id.read().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -82,14 +112,48 @@ impl BlobBackend for AzurePageBlobBackend {
         // A 409 Conflict means it already exists, which is fine.
         if let Err(err) = self.container.create(None).await {
             if err.http_status() != Some(azure_core::http::StatusCode::Conflict) {
+                error!(
+                    "create container failed: status={:?}, error={:?}",
+                    err.http_status(),
+                    err
+                );
                 return Err(err).context("create container");
             }
         }
         let blob_client = self.container.blob_client(&self.blob_name);
+        // Idempotency (CSI requires CreateVolume not to mutate an existing
+        // volume): a plain Put Page Blob would overwrite and zero an existing
+        // blob, so if the blob already exists, return success when the size
+        // matches and fail when it differs, instead of recreating it.
+        match blob_client.get_properties(None).await {
+            Ok(props) => {
+                let existing = props.content_length()?.unwrap_or(0);
+                if existing == size {
+                    trace!(size, "page blob already exists with the requested size");
+                    return Ok(());
+                }
+                bail!(
+                    "blob '{}' already exists with size {existing}, requested {size}",
+                    self.blob_name
+                );
+            }
+            Err(err) if err.http_status() == Some(azure_core::http::StatusCode::NotFound) => {
+                // Does not exist yet — provision it below.
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("check existing blob '{}' before create", self.blob_name)
+                });
+            }
+        }
         let page_client = blob_client.page_blob_client();
         trace!(size, "creating page blob");
+        let opts = PageBlobClientCreateOptions {
+            lease_id: self.lease_id(),
+            ..Default::default()
+        };
         page_client
-            .create(size, None)
+            .create(size, Some(opts))
             .await
             .with_context(|| format!("create page blob '{}' size={size}", self.blob_name))?;
         Ok(())
@@ -139,12 +203,16 @@ impl BlobBackend for AzurePageBlobBackend {
         let page_client = blob_client.page_blob_client();
         let range = HttpRange::new(offset, len);
         trace!(offset, len, "uploading pages");
+        let opts = PageBlobClientUploadPagesOptions {
+            lease_id: self.lease_id(),
+            ..Default::default()
+        };
         page_client
             .upload_pages(
                 azure_core::http::RequestContent::from(data.to_vec()),
                 len,
                 range,
-                None,
+                Some(opts),
             )
             .await
             .with_context(|| {
@@ -171,8 +239,12 @@ impl BlobBackend for AzurePageBlobBackend {
         let page_client = blob_client.page_blob_client();
         let range = HttpRange::new(offset, len);
         trace!(offset, len, "clearing pages");
+        let opts = PageBlobClientClearPagesOptions {
+            lease_id: self.lease_id(),
+            ..Default::default()
+        };
         page_client
-            .clear_pages(range, None)
+            .clear_pages(range, Some(opts))
             .await
             .with_context(|| {
                 format!(
@@ -190,6 +262,19 @@ impl BlobBackend for AzurePageBlobBackend {
     }
 
     #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn delete(&self) -> anyhow::Result<()> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("deleting blob");
+        if let Err(err) = blob_client.delete(None).await {
+            // A 404 means the blob is already gone — treat delete as idempotent.
+            if err.http_status() != Some(azure_core::http::StatusCode::NotFound) {
+                return Err(err).with_context(|| format!("delete blob '{}'", self.blob_name));
+            }
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
     async fn size(&self) -> anyhow::Result<u64> {
         let blob_client = self.blob_client()?;
         let props = blob_client
@@ -203,5 +288,110 @@ impl BlobBackend for AzurePageBlobBackend {
             )
         })?;
         Ok(len)
+    }
+}
+
+// ── Blob lease (cluster coordination "blob lock") ─────────────────────────────
+
+/// Azure blob-lease implementation of [`BlobLock`].
+///
+/// Holds its own `BlobContainerClient` (with the auth pipeline wired in) and the
+/// target blob name.  Kept next to [`AzurePageBlobBackend`] so all Azure SDK
+/// types stay inside this module.
+///
+/// The lease is intentionally **finite**: Azure caps an explicit lease duration
+/// at 60s, and the coordination layer ([`crate::coordination`]) keeps it alive
+/// with a renewal loop (renewing roughly every `lease_duration / 3`). This is
+/// deliberate — an infinite lease would never expire if the holder node died,
+/// permanently blocking takeover. With a finite lease, a dead holder's lease
+/// lapses within ≤60s, after which another node can break/acquire it (gated by
+/// the cluster-lease recovery timeout). A clean shutdown releases it immediately.
+#[cfg_attr(not(feature = "coordination"), allow(dead_code))]
+pub struct AzureBlobLock {
+    container: BlobContainerClient,
+    blob_name: String,
+}
+
+#[cfg_attr(not(feature = "coordination"), allow(dead_code))]
+impl AzureBlobLock {
+    /// Construct a blob lock for `blob_name` from an already-configured
+    /// `BlobContainerClient`.
+    pub fn new(container: BlobContainerClient, blob_name: impl Into<String>) -> Self {
+        Self {
+            container,
+            blob_name: blob_name.into(),
+        }
+    }
+
+    /// Map an Azure SDK error to a [`LockError`], classifying lease conflicts
+    /// (HTTP 409 Conflict / 412 Precondition Failed) as [`LockError::Held`].
+    fn classify(err: azure_core::Error, what: &str) -> LockError {
+        match err.http_status() {
+            Some(azure_core::http::StatusCode::Conflict)
+            | Some(azure_core::http::StatusCode::PreconditionFailed) => LockError::Held,
+            _ => LockError::Other(anyhow::Error::new(err).context(what.to_string())),
+        }
+    }
+}
+
+#[async_trait]
+impl BlobLock for AzureBlobLock {
+    #[instrument(skip(self), fields(blob = %self.blob_name, duration_secs))]
+    async fn acquire(&self, duration_secs: i32) -> Result<String, LockError> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!(duration_secs, "acquiring blob lease");
+        let result = blob_client
+            .acquire_lease(duration_secs, None)
+            .await
+            .map_err(|e| Self::classify(e, "acquire blob lease"))?;
+        let lease_id = result
+            .lease_id()
+            .map_err(|e| LockError::Other(anyhow::Error::new(e).context("read lease id")))?
+            .ok_or_else(|| {
+                LockError::Other(anyhow::anyhow!(
+                    "acquire lease response missing x-ms-lease-id header"
+                ))
+            })?;
+        Ok(lease_id)
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn renew(&self, lease_id: &str) -> anyhow::Result<()> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("renewing blob lease");
+        blob_client
+            .renew_lease(lease_id.to_string(), None)
+            .await
+            .with_context(|| format!("renew blob lease '{}'", self.blob_name))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn release(&self, lease_id: &str) -> anyhow::Result<()> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("releasing blob lease");
+        blob_client
+            .release_lease(lease_id.to_string(), None)
+            .await
+            .with_context(|| format!("release blob lease '{}'", self.blob_name))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn break_lock(&self) -> anyhow::Result<()> {
+        let blob_client = self.container.blob_client(&self.blob_name);
+        trace!("breaking blob lease");
+        // No options ⇒ default break period (the lease breaks at the end of its
+        // remaining period).  We pass a 0 break period so the lease becomes
+        // available immediately for take-over.
+        let opts = azure_storage_blob::models::BlobClientBreakLeaseOptions {
+            break_period: Some(0),
+            ..Default::default()
+        };
+        blob_client
+            .break_lease(Some(opts))
+            .await
+            .with_context(|| format!("break blob lease '{}'", self.blob_name))?;
+        Ok(())
     }
 }

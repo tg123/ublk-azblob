@@ -167,8 +167,11 @@ fn start_server_opts(container: &str, blob: &str, create: bool, read_only: bool)
         if create { "--create" } else { "reuse blob" },
         if read_only { ", --read-only" } else { "" }
     ));
-    let bin = env!("CARGO_BIN_EXE_ublk-azblob");
-    let mut cmd = Command::new(bin);
+    // Prefer an externally-provided binary (the e2e runs the actual image built
+    // from deploy/Dockerfile); fall back to the cargo-built binary for local runs.
+    let bin = std::env::var("UBLK_AZBLOB_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
+    let mut cmd = Command::new(&bin);
     cmd.arg("run")
         .arg("--size")
         .arg(BLOB_SIZE.to_string())

@@ -1,0 +1,223 @@
+# Default values for ublk-azblob-csi.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Secret search mode: where the driver looks up the storage credentials secret.
+# - per-namespace: Each namespace creates its own azblob-csi-secret
+# - global: One secret in kube-system shared by all namespaces
+secretSearchMode: per-namespace
+
+# Driver configuration
+driver:
+  name: azblob.ublk.csi.tg123.github.io
+
+# Container image for both the controller and node plugins.
+image:
+  repository: docker.io/farmer1992/ublk-azblob
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Controller deployment configuration
+controller:
+  replicas: 1
+
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Node DaemonSet configuration
+node:
+  # Use NBD (Network Block Device) instead of ublk (for older kernels)
+  # When enabled, uses NBD protocol instead of ublk_drv kernel module
+  # - Requires nbd kernel module (available in most kernels)
+  # - Does not require ublk_drv (Linux >= 6.0)
+  # - Slightly lower performance than ublk
+  useNbd: false
+  
+  # NBD configuration (only used when useNbd: true)
+  nbd:
+    # Port range start for NBD servers (each volume gets its own port)
+    # Default: 10809
+    portStart: 10809
+  
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  affinity: {}
+
+# CSI sidecar images (external-provisioner, node-driver-registrar)
+sidecars:
+  provisioner:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-provisioner
+      tag: v5.1.0
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+  
+  registrar:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+      tag: v2.12.0
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+# StorageClass configuration
+storageClass:
+  # Create StorageClass (set to false if you want to create your own)
+  create: true
+  
+  # StorageClass name
+  name: azblob-ublk
+  
+  # Default StorageClass
+  isDefault: false
+  
+  # Reclaim policy: Delete or Retain
+  reclaimPolicy: Delete
+  
+  # Volume binding mode: WaitForFirstConsumer or Immediate
+  volumeBindingMode: WaitForFirstConsumer
+  
+  # Allow volume expansion
+  allowVolumeExpansion: false
+  
+  # Parameters (all support variable expansion: ${pvc.namespace}, ${pvc.name}, ${pv.name})
+  parameters:
+    # Storage account (optional - uses secret value if omitted)
+    # Use single quotes to avoid any shell/YAML interpretation
+    # storageAccount: '${pvc.namespace}storage'
+    
+    # Container name (optional - uses secret value if omitted)
+    container: "ublk-azblob-volumes"
+    
+    # Blob path template within container
+    # Default: "ublk-azblob-disk/${pv.name}"
+    # Use single quotes to preserve ${...} variables literally
+    blobPathTemplate: '${pvc.namespace}/volumes/${pv.name}'
+    
+    # Filesystem type: ext4, xfs, btrfs, etc.
+    fsType: ext4
+
+    # Target an immutable blob snapshot (the x-ms-snapshot timestamp). When set,
+    # the volume is exposed read-only and all writes/discards are rejected.
+    # The blob (snapshot) must already contain a filesystem.
+    # snapshot: '2024-01-01T00:00:00.0000000Z'
+
+    # Expose the volume read-only ("true"/"false"). The device rejects every
+    # write/discard and is mounted read-only; the blob must already be
+    # formatted. Implied when 'snapshot' is set.
+    # readOnly: "true"
+
+# Secret configuration for global mode
+# Only used when secretSearchMode: global
+globalSecret:
+  # Create the global secret (set to false if you manage it externally)
+  create: false
+  
+  # Secret name in kube-system namespace
+  name: csi-ublk-azblob-secret
+  
+  # Authentication method: "service-principal", "workload-identity", or "shared-key"
+  authMethod: service-principal
+  
+  # Service Principal credentials (authMethod: service-principal)
+  servicePrincipal:
+    clientId: ""
+    tenantId: ""
+    clientSecret: ""
+  
+  # Workload Identity (authMethod: workload-identity)
+  workloadIdentity:
+    clientId: ""
+    tenantId: ""
+  
+  # SharedKey credentials (authMethod: shared-key)
+  sharedKey:
+    accountKey: ""
+  
+  # Storage account configuration
+  storageAccount: ""
+  storageContainer: ""
+  
+  # Optional: Custom endpoint (for Azurite or sovereign clouds).
+  # Use the `%s` template for the account name, e.g.
+  #   http://%s.blob.localhost:10000/   or   https://%s.blob.core.usgovcloudapi.net/
+  # `%s` is replaced with the storage account so it becomes the host's first DNS
+  # label (subdomain-style). Leave empty for standard Azure public cloud.
+  endpoint: ""
+
+# Per-namespace secret configuration
+# Only used when secretSearchMode: per-namespace
+perNamespaceSecret:
+  # Secret name (must be created in each namespace)
+  name: azblob-csi-secret
+
+# RBAC configuration
+rbac:
+  # Create RBAC resources
+  create: true
+
+# ServiceAccount configuration
+serviceAccount:
+  controller:
+    create: true
+    name: csi-ublk-azblob-controller
+    annotations: {}
+  
+  node:
+    create: true
+    name: csi-ublk-azblob-node
+    annotations: {}
+
+# Additional StorageClasses
+# Example: Create multiple StorageClasses for different use cases
+additionalStorageClasses: []
+  # - name: azblob-xfs
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   volumeBindingMode: WaitForFirstConsumer
+  #   allowVolumeExpansion: false
+  #   parameters:
+  #     container: "database-volumes"
+  #     blobPathTemplate: '${pvc.namespace}/db/${pv.name}'
+  #     fsType: xfs
+  # 
+  # - name: azblob-per-tenant
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   volumeBindingMode: WaitForFirstConsumer
+  #   allowVolumeExpansion: false
+  #   parameters:
+  #     storageAccount: '${pvc.namespace}storage'
+  #     container: '${pvc.namespace}'
+  #     blobPathTemplate: 'volumes/${pv.name}'
+  #     fsType: ext4
+
+# Namespace where CSI driver components are deployed
+namespace: kube-system

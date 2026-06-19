@@ -1,37 +1,41 @@
-# docker-compose for the ublk-azblob e2e test.
+# Unified docker-compose for the entire ublk-azblob e2e suite.
 #
-# This brings up the whole mount e2e:
+# A single `runner` compiles the crate once (`--features "ublk csi"`) and then:
+#   1. runs the mount/NBD e2e against the compose `azurite`,
+#   2. packages that same binary into a thin `ublk-azblob:e2e` image, and
+#   3. runs the Kubernetes PVC e2e on the in-compose k3s cluster (which deploys
+#      its own Azurite inside the cluster).
 #
-#   * `azurite`  — a local Azure Storage emulator (the one external service the
-#     test talks to).
-#   * `runner`   — builds `ublk-azblob` (`--features ublk`) and runs the Rust
-#     mount e2e (`tests/mount_e2e.rs`, including the read-only mount test) and
-#     NBD e2e (`tests/nbd_e2e.rs`, including the read-only export test) against
-#     Azurite.
+# Requirements on the **host**:
+#   - Docker daemon at /var/run/docker.sock
+#   - ublk_drv loaded: `sudo modprobe ublk_drv`
+#   - A shared mount for CSI mount propagation (CI: /var/lib/kubelet; local: /tmp).
 #
-# The `runner` shares the host kernel: it is `privileged` and bind-mounts
-# `/dev` and `/lib/modules`, so the ublk device it creates (plus `mkfs.ext4` and
-# `mount`) work inside the container.  The `ublk_drv` kernel module must already
-# be loaded on the *host* (`sudo modprobe ublk_drv`) — a container cannot load
-# kernel modules into a kernel that lacks them.
+# The Rust mount e2e (`tests/mount_e2e.rs`) includes the read-only mount test and
+# the NBD e2e (`tests/nbd_e2e.rs`) includes the read-only export test.
 #
-# Usage (after `sudo modprobe ublk_drv` on the host):
-#   docker compose -f tests/e2e/docker-compose.yml up --build \
-#     --abort-on-container-exit --exit-code-from runner
-#   docker compose -f tests/e2e/docker-compose.yml down -v
+# Usage (local):
+#   sudo modprobe ublk_drv
+#   KUBELET_DIR=/tmp/kubelet-test
+#   sudo mkdir -p "$KUBELET_DIR" && sudo mount -t tmpfs tmpfs "$KUBELET_DIR" \
+#     && sudo mount --make-shared "$KUBELET_DIR"
+#   KUBELET_DIR=$KUBELET_DIR docker compose -f tests/e2e/docker-compose.yml up \
+#     --build --abort-on-container-exit --exit-code-from runner
+#   docker compose -f tests/e2e/docker-compose.yml down -v && sudo umount "$KUBELET_DIR"
 
 services:
+  # Azurite for the mount/NBD e2e (the k8s e2e deploys its own Azurite in-cluster).
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:3.34.0
-    # --skipApiVersionCheck lets Azurite accept the (newer) API version emitted
-    # by the pinned azure_storage_blob SDK; --loose relaxes header validation.
     command: azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
-    ports:
-      - "10000:10000"
+    networks:
+      k3s:
+        # Fixed IP so the k8s CSI pods can reach this single Azurite via
+        # hostAliases (subdomain-style URL) — see tests/e2e/k8s/e2e.values.yaml.
+        ipv4_address: 172.30.0.10
     healthcheck:
-      # Azurite is node-based (alpine, no curl).  Use node to confirm the blob
-      # port is accepting connections on IPv4 (avoids the BusyBox localhost→IPv6
-      # pitfall).
+      # Azurite is node-based (alpine, no curl); use node to confirm the blob
+      # port accepts IPv4 connections (avoids the BusyBox localhost->IPv6 pitfall).
       test:
         - CMD
         - node
@@ -41,11 +45,60 @@ services:
       timeout: 5s
       retries: 30
 
+  # K3s server - control plane node.
+  k3s-server:
+    image: rancher/k3s:v1.31.4-k3s1
+    container_name: ublk-e2e-k3s-server
+    privileged: true
+    ports:
+      - "6443:6443"
+    volumes:
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+      - k3s-data:/var/lib/rancher/k3s
+      - kubeconfig:/output
+      - ${KUBELET_DIR:-/var/lib/kubelet}:/var/lib/kubelet:rshared
+    environment:
+      K3S_TOKEN: "e2e-test-token"
+      K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
+      K3S_KUBECONFIG_MODE: "644"
+    command:
+      - server
+      - --disable=traefik,metrics-server,local-storage
+      - --tls-san=k3s-server
+    networks:
+      - k3s
+    healthcheck:
+      test: ["CMD", "kubectl", "get", "--raw", "/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # K3s agent - worker node for pod migration testing.
+  k3s-agent:
+    image: rancher/k3s:v1.31.4-k3s1
+    container_name: ublk-e2e-k3s-agent
+    privileged: true
+    depends_on:
+      k3s-server:
+        condition: service_healthy
+    volumes:
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+      - ${KUBELET_DIR:-/var/lib/kubelet}:/var/lib/kubelet:rshared
+    environment:
+      K3S_TOKEN: "e2e-test-token"
+      K3S_URL: "https://k3s-server:6443"
+    networks:
+      - k3s
+    healthcheck:
+      test: ["CMD", "test", "-f", "/var/lib/rancher/k3s/agent/kubelet.kubeconfig"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Single runner: compile once, then run mount/NBD + k8s PVC e2e.
   runner:
-    # A fixed tag so CI can pre-build this image with BuildKit + the GitHub
-    # Actions cache (`docker buildx ... --cache-from/--cache-to type=gha`) and
-    # have `compose up` reuse it without `--build`.  Locally `compose up
-    # --build` still rebuilds it under this tag.
     image: ublk-azblob-e2e-runner:local
     build:
       context: ../..
@@ -53,32 +106,62 @@ services:
     depends_on:
       azurite:
         condition: service_healthy
-    # Needs a real kernel with ublk_drv (loaded on the host) plus the ability to
-    # create the ublk device, mkfs.ext4 and mount — hence privileged + host /dev.
     privileged: true
     volumes:
       - ../..:/workspace
       - /dev:/dev
       - /lib/modules:/lib/modules:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - kubeconfig:/kubeconfig
     working_dir: /workspace
+    networks:
+      - k3s
     environment:
-      # Reach Azurite over the compose network rather than via localhost.
-      AZURE_STORAGE_ENDPOINT: "http://azurite:10000/devstoreaccount1"
       CARGO_TERM_COLOR: "always"
-      # Persist the cargo registry/git cache on a host path (under the
-      # bind-mounted workspace) so it survives the container and can be picked
-      # up by `actions/cache` in CI.  `target/` already lands in the
-      # bind-mounted /workspace/target, so it is cached the same way.
+      # Reach the compose Azurite (mount/NBD e2e) over the network, path-style.
+      AZURE_STORAGE_ENDPOINT: "http://azurite:10000/devstoreaccount1"
+      # Persist cargo cache + target under the bind-mounted workspace so CI's
+      # actions/cache can save them.
       CARGO_HOME: "/workspace/.cargo-home"
+      DOCKER_BUILDKIT: "1"
+      K8S_E2E_REQUIRE: "1"
+      # mount/NBD tests run the binary extracted from the shipped image (below);
+      # the k8s test reuses the same image instead of rebuilding it.
+      UBLK_AZBLOB_BIN: "/workspace/target/ublk-azblob-shipped"
+      E2E_IMAGE: "ublk-azblob:e2e"
+      K8S_E2E_SKIP_IMAGE_BUILD: "1"
+    # The crate is compiled exactly once — by building the shipped image from
+    # deploy/Dockerfile. Every e2e then exercises that one binary: mount/NBD run
+    # the extracted binary against the compose Azurite, and the k8s PVC e2e
+    # deploys the same image to the in-compose k3s cluster.
     command:
       - bash
-      - -c
+      - -ec
       - |
-        set -euo pipefail
-        cargo build --release --features ublk -p ublk-azblob
-        cargo test --release --features ublk -p ublk-azblob \
-          --test mount_e2e -- --nocapture --test-threads=1
-        # NBD compatibility e2e: pure TCP, no kernel module or ublk feature
-        # required, but reuse the same Azurite-backed runner.
-        cargo test --release --features ublk -p ublk-azblob \
-          --test nbd_e2e -- --nocapture --test-threads=1
+        docker build -f deploy/Dockerfile -t ublk-azblob:e2e .
+        mkdir -p target
+        cid=$$(docker create ublk-azblob:e2e)
+        docker cp "$$cid:/usr/local/bin/ublk-azblob" target/ublk-azblob-shipped
+        docker rm "$$cid" >/dev/null
+        for i in $$(seq 1 60); do
+          [ -f /kubeconfig/kubeconfig.yaml ] && break
+          echo "waiting for kubeconfig... ($$i/60)"; sleep 1
+        done
+        cp /kubeconfig/kubeconfig.yaml /tmp/kubeconfig.yaml
+        sed -i 's|https://127.0.0.1:6443|https://k3s-server:6443|g' /tmp/kubeconfig.yaml
+        export KUBECONFIG=/tmp/kubeconfig.yaml
+        kubectl wait --for=condition=Ready nodes --all --timeout=120s
+        cargo test --release --features "ublk csi" -p ublk-azblob \
+          --test mount_e2e --test nbd_e2e --test k8s_pvc_e2e \
+          -- --nocapture --test-threads=1
+
+volumes:
+  k3s-data:
+  kubeconfig:
+
+networks:
+  k3s:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

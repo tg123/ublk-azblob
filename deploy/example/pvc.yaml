@@ -1,0 +1,12 @@
+# Example PersistentVolumeClaim backed by a ublk Azure Page Blob.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azblob-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: azblob-ublk
+  resources:
+    requests:
+      storage: 256Mi
