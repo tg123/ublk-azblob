@@ -5,16 +5,16 @@
 //! dispatched to the appropriate `BlobBackend` method.
 //!
 //! ## Feature flag
-//! The real ublk loop is gated behind the `ublk` Cargo feature because it
-//! requires:
+//! The real ublk loop is gated behind the `ublk` Cargo feature, which is **on
+//! by default**.  It requires:
 //! - Linux kernel ≥ 6.0 with `ublk_drv` loaded
 //! - Root / `CAP_SYS_ADMIN`
 //! - The `libublk` crate
 //!
-//! Without the feature flag the module exposes a stub that prints a clear
-//! error and exits.  All `BlobBackend` logic (read/write/clear) can still be
-//! exercised through unit tests and the `test` subcommand without the kernel
-//! driver.
+//! Building with `--no-default-features` (e.g. on macOS or without the kernel
+//! driver) compiles a stub that prints a clear error and exits.  All
+//! `BlobBackend` logic (read/write/clear) can still be exercised through unit
+//! tests and the `test` subcommand without the kernel driver.
 //!
 //! ## Signals (feature = "ublk")
 //! Once the device is up the process installs handlers for:
@@ -74,8 +74,10 @@ pub async fn run_ublk_target(backend: Arc<dyn BlobBackend>, cfg: UblkConfig) -> 
     {
         let _ = (backend, cfg);
         anyhow::bail!(
-            "ublk kernel target is not compiled in.\n\
-             Rebuild with `--features ublk` on a Linux host with ublk_drv loaded.\n\
+            "ublk kernel target is not compiled in (built with \
+             `--no-default-features`).\n\
+             Rebuild without `--no-default-features` (or with `--features ublk`) \
+             on a Linux host with ublk_drv loaded.\n\
              To exercise the BlobBackend without a kernel, use the `test` \
              subcommand (write → read → clear → verify smoke test)."
         );

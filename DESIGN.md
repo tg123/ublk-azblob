@@ -165,7 +165,7 @@ the filesystem or application.  The device does **not** silently eat errors.
 ## Kubernetes CSI Driver
 
 The same binary doubles as a Kubernetes **Container Storage Interface (CSI)**
-driver (built with `--features "ublk csi"`, run via the `csi` subcommand). It
+driver (ublk + CSI are on by default, run via the `csi` subcommand). It
 reuses the ublk + Page Blob stack unchanged: each PVC maps to one page blob,
 attached as a ublk device and mounted as ext4.
 
@@ -231,7 +231,7 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 ### Phase 1 — MVP *(this PR)*
 - ✅ `BlobBackend` trait + `AzurePageBlobBackend` + `MemBackend`
 - ✅ SharedKey auth (Azurite) + MSI auth wiring
-- ✅ ublk target (real impl gated behind `--features ublk`; stub otherwise)
+- ✅ ublk target (real impl is the default `ublk` feature; `--no-default-features` stub otherwise)
 - ✅ Full mount-based e2e test against Azurite (ext4 on `/dev/ublkbN`)
 - ✅ CI: fmt + clippy + unit tests + mount e2e pipeline
 
@@ -261,10 +261,10 @@ GitHub-hosted runners do **not** load `ublk_drv` by default, but the module
 ships in `linux-modules-extra-$(uname -r)` and can be loaded with `modprobe`.
 The CI workflow therefore:
 
-1. **Always runs** `cargo fmt --check`, `cargo clippy` (with and without
-   `--features ublk`), and `cargo test` (unit tests against `MemBackend`).
+1. **Always runs** `cargo fmt --check`, `cargo clippy`, and `cargo test` (unit
+   tests against `MemBackend`).
 2. **Runs the full mount e2e** on `ubuntu-22.04`: it loads `ublk_drv`, starts
-   Azurite, builds with `--features ublk`, then mounts an ext4 filesystem on
+   Azurite, builds the default (ublk) binary, then mounts an ext4 filesystem on
    `/dev/ublkbN`, writes random files, forces a flush via `SIGUSR1`, unmounts,
    tears the device down, remounts over the same page blob, and verifies every
    file's SHA-256 checksum.

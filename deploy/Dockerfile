@@ -1,9 +1,10 @@
 # Container image for the ublk-azblob CSI driver.
 #
 # Builds the binary with both the `ublk` (real block device) and `csi`
-# (Kubernetes Container Storage Interface) features, and ships it on a slim
-# Debian runtime that carries the userspace tools the node plugin shells out to
-# (`mkfs.ext4`, `mount`/`umount`, `blkid`).
+# (Kubernetes Container Storage Interface) features.  These are on by default,
+# so a plain `cargo build --release` produces the full node plugin.  It ships on
+# a slim Debian runtime that carries the userspace tools the node plugin shells
+# out to (`mkfs.ext4`, `mount`/`umount`, `blkid`).
 #
 # Multi-arch (linux/amd64 + linux/arm64) is built by *cross-compiling* on the
 # native build platform rather than emulating the target under QEMU, which is
@@ -93,7 +94,7 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     --mount=type=cache,target=/build/target \
     . /cross-env.sh && \
     cd /src && \
-    CARGO_TARGET_DIR=/build/target cargo build --release --features "ublk csi" -p ublk-azblob && \
+    CARGO_TARGET_DIR=/build/target cargo build --release -p ublk-azblob && \
     cp "/build/target/${TARGET_TRIPLE}/release/ublk-azblob" /ublk-azblob
 
 # ── Runtime ───────────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 # Unified docker-compose for the entire ublk-azblob e2e suite.
 #
-# A single `runner` compiles the crate once (`--features "ublk csi"`) and then:
+# A single `runner` compiles the crate once (full default feature set:
+# ublk + csi) and then:
 #   1. runs the mount/NBD e2e against the compose `azurite`,
 #   2. packages that same binary into a thin `ublk-azblob:e2e` image, and
 #   3. runs the Kubernetes PVC e2e on the in-compose k3s cluster (which deploys
@@ -148,7 +149,7 @@ services:
         sed -i 's|https://127.0.0.1:6443|https://k3s-server:6443|g' /tmp/kubeconfig.yaml
         export KUBECONFIG=/tmp/kubeconfig.yaml
         kubectl wait --for=condition=Ready nodes --all --timeout=120s
-        cargo test --release --features "ublk csi" -p ublk-azblob \
+        cargo test --release -p ublk-azblob \
           --test mount_e2e --test nbd_e2e --test k8s_pvc_e2e \
           -- --nocapture --test-threads=1
 
