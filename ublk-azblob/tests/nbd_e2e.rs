@@ -189,8 +189,10 @@ fn start_server_opts(container: &str, blob: &str, create: bool, disable_auto_flu
     panic!("timed out waiting for the NBD server to listen on {NBD_ADDR}");
 }
 
-/// Stop the running NBD server: the data was already flushed (`NBD_CMD_FLUSH` +
-/// `NBD_CMD_DISC`) before this is called, so the process is simply killed.
+/// Forcefully stop the running NBD server with `SIGKILL` (no graceful flush).
+/// Callers use this only after the data was already flushed (`NBD_CMD_FLUSH` +
+/// `NBD_CMD_DISC`); see [`stop_server_graceful`] for the SIGINT path that relies
+/// on the shutdown flush.
 fn stop_server(mut child: Child) {
     log(&format!("stopping NBD server (pid {})", child.id()));
     let _ = child.kill();
