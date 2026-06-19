@@ -67,6 +67,10 @@ sidecars:
     image:
       repository: registry.k8s.io/sig-storage/csi-provisioner
       tag: v5.1.0
+    # CreateVolume/DeleteVolume RPC timeout. Raise this when provisioning large
+    # read-write `templateBlobUrl` volumes, since the controller copies the whole
+    # template synchronously within CreateVolume.
+    timeout: 60s
     resources:
       limits:
         cpu: 100m
