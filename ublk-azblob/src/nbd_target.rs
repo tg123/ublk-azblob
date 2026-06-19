@@ -119,20 +119,53 @@ pub async fn run_nbd_target(
         port = local.port(),
     );
 
+    // Set up signal handling for graceful shutdown
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("install SIGINT handler")?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+
     loop {
-        let (stream, peer) = listener.accept().await.context("accept NBD connection")?;
-        let backend = backend.clone();
-        info!(peer = %peer, "NBD client connected");
-        tokio::spawn(async move {
-            if let Err(e) = serve_connection(stream, backend, dev_size).await {
-                // A client disconnecting mid-stream is normal; log at warn so it
-                // is visible without being alarming.
-                warn!(peer = %peer, err = %e, "NBD connection ended");
-            } else {
-                info!(peer = %peer, "NBD client disconnected");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        // Transient accept errors (e.g. ECONNABORTED) shouldn't
+                        // tear down the server; log and keep listening.
+                        warn!(err = %e, "NBD accept failed");
+                        continue;
+                    }
+                };
+                let backend = backend.clone();
+                info!(peer = %peer, "NBD client connected");
+                tokio::spawn(async move {
+                    if let Err(e) = serve_connection(stream, backend, dev_size).await {
+                        // A client disconnecting mid-stream is normal; log at warn so it
+                        // is visible without being alarming.
+                        warn!(peer = %peer, err = %e, "NBD connection ended");
+                    } else {
+                        info!(peer = %peer, "NBD client disconnected");
+                    }
+                });
             }
-        });
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down gracefully");
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down gracefully");
+                break;
+            }
+        }
     }
+
+    // Flush all dirty data before exiting
+    info!("flushing all dirty data to blob storage before exit");
+    backend.flush().await.context("flush on shutdown")?;
+    info!("graceful shutdown complete, all data flushed");
+
+    Ok(())
 }
 
 // ── Connection handling ────────────────────────────────────────────────────────

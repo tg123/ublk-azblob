@@ -25,13 +25,49 @@ jobs:
           sudo modprobe ublk_drv
           ls -l /dev/ublk-control
 
-      - name: Run e2e (build + test in docker compose runner)
-        # The `runner` service builds with --features ublk and runs both the
-        # ublk mount/remount/checksum test and the NBD roundtrip test; Azurite
-        # is brought up as its dependency.
+      - name: Make a shared mount for CSI mount propagation
         run: |
+          sudo mkdir -p /tmp/ublk-e2e/kubelet
+          sudo mount -t tmpfs tmpfs /tmp/ublk-e2e/kubelet
+          sudo mount --make-shared /tmp/ublk-e2e/kubelet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build e2e runner image (BuildKit + GHA cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/e2e/Dockerfile
+          tags: ublk-azblob-e2e-runner:local
+          load: true
+          cache-from: type=gha,scope=e2e-runner
+          cache-to: type=gha,mode=max,scope=e2e-runner
+
+      - name: Cache cargo registry and target
+        # The compile happens inside the runner container, which writes
+        # CARGO_HOME to /workspace/.cargo-home and target/ to /workspace/target
+        # (both on the bind-mounted checkout).
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry/index
+            .cargo-home/registry/cache
+            .cargo-home/git/db
+            target
+          key: e2e-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            e2e-cargo-${{ runner.os }}-
+
+      - name: Run e2e (compile once, mount + NBD + k8s PVC)
+        run: |
+          KUBELET_DIR=/tmp/ublk-e2e/kubelet \
           docker compose -f tests/e2e/docker-compose.yml up \
-            --build --abort-on-container-exit --exit-code-from runner
+            --abort-on-container-exit --exit-code-from runner
+
+      - name: Normalize cache ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .cargo-home target || true
 
       - name: Compose logs on failure
         if: failure()

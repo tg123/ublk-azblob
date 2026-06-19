@@ -515,6 +515,16 @@ impl BlobBackend for FileCacheBackend {
         self.inner.flush().await
     }
 
+    async fn delete(&self) -> anyhow::Result<()> {
+        // Drop all cached/dirty state and delegate to the inner backend.
+        let mut state = self.state.lock().await;
+        let num_pages = state.num_pages;
+        state.present = vec![0u8; bitmap_bytes(num_pages)];
+        state.dirty = vec![0u8; bitmap_bytes(num_pages)];
+        drop(state);
+        self.inner.delete().await
+    }
+
     async fn size(&self) -> anyhow::Result<u64> {
         let state = self.state.lock().await;
         Ok(state.dev_size)

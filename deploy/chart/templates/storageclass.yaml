@@ -1,0 +1,86 @@
+{{- if .Values.storageClass.create -}}
+# StorageClass for ublk-azblob volumes.
+#
+# Deployment mode: {{ .Values.secretSearchMode }}
+{{- if eq .Values.secretSearchMode "per-namespace" }}
+# Uses per-namespace secrets for credentials, allowing each namespace
+# to manage its own Azure storage account and credentials.
+{{- else }}
+# Uses a global secret in {{ .Values.namespace }} shared by all namespaces.
+{{- end }}
+#
+# All parameters support variable expansion:
+#   ${pvc.namespace} - PVC namespace
+#   ${pvc.name}      - PVC name
+#   ${pv.name}       - PV name (auto-generated: pvc-<uuid>)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name }}
+  labels:
+    {{- include "ublk-azblob-csi.labels" . | nindent 4 }}
+  {{- if .Values.storageClass.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ .Values.driver.name }}
+parameters:
+  csi.storage.k8s.io/provisioner-secret-name: {{ include "ublk-azblob-csi.secretName" . | quote }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ include "ublk-azblob-csi.secretNamespace" . | quote }}
+  csi.storage.k8s.io/node-publish-secret-name: {{ include "ublk-azblob-csi.secretName" . | quote }}
+  csi.storage.k8s.io/node-publish-secret-namespace: {{ include "ublk-azblob-csi.secretNamespace" . | quote }}
+  {{- with .Values.storageClass.parameters }}
+  {{- if .storageAccount }}
+  storageAccount: {{ .storageAccount | quote }}
+  {{- end }}
+  {{- if .container }}
+  container: {{ .container | quote }}
+  {{- end }}
+  {{- if .blobPathTemplate }}
+  blobPathTemplate: {{ .blobPathTemplate | quote }}
+  {{- end }}
+  {{- if .fsType }}
+  fsType: {{ .fsType }}
+  {{- end }}
+  {{- end }}
+reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
+{{- end }}
+{{- range .Values.additionalStorageClasses }}
+---
+# Additional StorageClass: {{ .name }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "ublk-azblob-csi.labels" $ | nindent 4 }}
+  {{- if .isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ $.Values.driver.name }}
+parameters:
+  csi.storage.k8s.io/provisioner-secret-name: {{ include "ublk-azblob-csi.secretName" $ }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ include "ublk-azblob-csi.secretNamespace" $ }}
+  csi.storage.k8s.io/node-publish-secret-name: {{ include "ublk-azblob-csi.secretName" $ }}
+  csi.storage.k8s.io/node-publish-secret-namespace: {{ include "ublk-azblob-csi.secretNamespace" $ }}
+  {{- with .parameters }}
+  {{- if .storageAccount }}
+  storageAccount: {{ .storageAccount | quote }}
+  {{- end }}
+  {{- if .container }}
+  container: {{ .container | quote }}
+  {{- end }}
+  {{- if .blobPathTemplate }}
+  blobPathTemplate: {{ .blobPathTemplate | quote }}
+  {{- end }}
+  {{- if .fsType }}
+  fsType: {{ .fsType }}
+  {{- end }}
+  {{- end }}
+reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
+volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
+allowVolumeExpansion: {{ .allowVolumeExpansion | default false }}
+{{- end }}
