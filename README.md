@@ -258,16 +258,17 @@ The `ublk_drv` kernel module must be loaded on every node
 #    locally instead:
 docker build -f deploy/Dockerfile -t ghcr.io/tg123/ublk-azblob:latest .
 
-# 2. Provide storage credentials + endpoint to the driver
-kubectl -n kube-system create secret generic csi-ublk-azblob-secret \
-  --from-literal=account=<storage-account> \
-  --from-literal=accountKey=<storage-key>           # omit when using Managed Identity
-kubectl -n kube-system create configmap csi-ublk-azblob-config \
-  --from-literal=endpoint=https://<account>.blob.core.windows.net \
-  --from-literal=container=pvc
+# 2. Install the Helm chart (CSIDriver, RBAC, controller, node, StorageClass).
+#    See deploy/chart/README.md for all values (auth, NBD mode, secrets, ...).
+helm install csi-ublk-azblob deploy/chart \
+  --namespace kube-system \
+  --set image.repository=ghcr.io/tg123/ublk-azblob --set image.tag=latest
 
-# 3. Deploy the driver (CSIDriver, RBAC, controller, node, StorageClass)
-kubectl apply -f deploy/kubernetes/
+# 3. Provide storage credentials to the namespace that will use the driver
+#    (per-namespace mode, the default). For SharedKey auth:
+kubectl -n <your-namespace> create secret generic azblob-csi-secret \
+  --from-literal=AZURE_STORAGE_ACCOUNT=<storage-account> \
+  --from-literal=accountKey=<storage-key>   # omit when using Managed Identity
 
 # 4. Create a PVC + pod
 kubectl apply -f deploy/example/pvc.yaml
@@ -280,28 +281,22 @@ containers instead.
 
 ### Kubernetes e2e
 
-Two e2e tests cover the CSI driver:
+The **PVC lifecycle** e2e ([tests/k8s_pvc_e2e.rs](ublk-azblob/tests/k8s_pvc_e2e.rs))
+runs against a multi-node `k3s` cluster started by
+[tests/e2e/docker-compose.yml](tests/e2e/docker-compose.yml): it deploys the
+driver via Helm, provisions a PVC, writes random data, tears the pod down, and
+remounts the same PVC (including across nodes) to verify the data survived the
+round-trip through the page blob. The whole suite — mount, NBD and PVC — shares
+one compile of the shipped image and runs together:
 
-* **Controller** ([tests/csi_controller_e2e.rs](ublk-azblob/tests/csi_controller_e2e.rs)) —
-  drives the controller gRPC service (`CreateVolume`/`DeleteVolume`) against
-  Azurite. Needs no kernel, so it runs anywhere:
-
-  ```bash
-  docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
-    azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
-  cargo test --features csi --test csi_controller_e2e -- --nocapture
-  ```
-
-* **PVC lifecycle** ([tests/k8s_pvc_e2e.rs](ublk-azblob/tests/k8s_pvc_e2e.rs)) — spins up a
-  `kind` cluster, deploys the driver + Azurite, then provisions a PVC, writes
-  random data, tears the pod down, and remounts the same PVC on a fresh ublk
-  device to verify the data survived the round-trip through the page blob. It
-  requires root + `ublk_drv` + Docker + `kind`, and skips gracefully otherwise:
-
-  ```bash
-  sudo modprobe ublk_drv
-  sudo -E env "PATH=$PATH" cargo test --features csi --test k8s_pvc_e2e -- --nocapture
-  ```
+```bash
+sudo modprobe ublk_drv
+sudo mkdir -p /var/lib/kubelet && sudo mount -t tmpfs tmpfs /var/lib/kubelet \
+  && sudo mount --make-shared /var/lib/kubelet
+docker compose -f tests/e2e/docker-compose.yml up \
+  --build --abort-on-container-exit --exit-code-from runner
+docker compose -f tests/e2e/docker-compose.yml down -v
+```
 
 ---
 
@@ -319,10 +314,11 @@ Unit tests run against `MemBackend` — no network, no kernel required.
 
 GitHub Actions runs on every push to `main` and every pull request:
 - `cargo fmt --check`
-- `cargo clippy -- -D warnings` (default, `--features ublk`, `--features csi`, and `--features "ublk csi"`)
-- `cargo test` (unit tests, `MemBackend`, with and without `--features csi`)
-- the full mount-based e2e (`/dev/ublkbN` + ext4 ↔ Azurite)
-- the CSI controller e2e (gRPC ↔ Azurite) and the kind-based PVC e2e (`k8s-e2e` workflow)
+- `cargo clippy --all-features -- -D warnings`
+- `cargo test --all-features` (unit tests, `MemBackend`)
+- the `e2e` workflow: one job that builds the shipped image once and runs the
+  mount (`/dev/ublkbN` + ext4 ↔ Azurite), NBD, and Kubernetes PVC e2e against a
+  k3s cluster from `tests/e2e/docker-compose.yml`.
 
 The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
 `linux-modules-extra`, and runs the mount/remount/checksum cycle as root.

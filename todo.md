@@ -40,6 +40,13 @@ deferred to follow-up PRs to keep the diff reviewable.
       read, so a chatty `ublk-azblob run` child can fill the 64 KiB pipe buffer
       and block on write, hanging the device. Either inherit the streams (so they
       flow to the node plugin's logs) or drain them on a background thread.
+- [ ] **DeleteVolume can't recover a per-volume `storageAccount`**
+      (`csi/controller.rs` ~245). `CreateVolume` lets the account be chosen per
+      volume via the StorageClass `storageAccount` parameter (with `${pvc.*}`
+      expansion), but CSI `DeleteVolume` only receives the volume id + secrets —
+      no parameters — so it falls back to the secret/config account and may target
+      the wrong account. Encode the account in the volume id (or volume context)
+      so delete can recover it.
 
 ## CI
 

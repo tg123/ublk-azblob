@@ -77,14 +77,21 @@ The following table lists the configurable parameters of the chart and their def
 |-----------|-------------|---------|
 | `driver.name` | CSI driver name | `azblob.ublk.csi.tg123.github.io` |
 
+### Image Configuration
+
+A single image is shared by the controller and node plugins.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `image.repository` | Driver image repository | `docker.io/farmer1992/ublk-azblob` |
+| `image.tag` | Driver image tag | `latest` |
+| `image.pullPolicy` | Driver image pull policy | `IfNotPresent` |
+
 ### Controller Configuration
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `controller.replicas` | Number of controller replicas | `1` |
-| `controller.image.repository` | Controller image repository | `docker.io/farmer1992/ublk-azblob` |
-| `controller.image.tag` | Controller image tag | `latest` |
-| `controller.image.pullPolicy` | Controller image pull policy | `IfNotPresent` |
 | `controller.resources.limits.cpu` | Controller CPU limit | `200m` |
 | `controller.resources.limits.memory` | Controller memory limit | `256Mi` |
 | `controller.resources.requests.cpu` | Controller CPU request | `100m` |
@@ -97,9 +104,6 @@ The following table lists the configurable parameters of the chart and their def
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `node.image.repository` | Node image repository | `docker.io/farmer1992/ublk-azblob` |
-| `node.image.tag` | Node image tag | `latest` |
-| `node.image.pullPolicy` | Node image pull policy | `IfNotPresent` |
 | `node.useNbd` | Use NBD instead of ublk (for older kernels) | `false` |
 | `node.nbd.portStart` | NBD server port range start | `10809` |
 | `node.resources.limits.cpu` | Node CPU limit | `500m` |

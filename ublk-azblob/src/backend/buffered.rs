@@ -179,8 +179,6 @@ impl BufferedBackend {
                         );
                         if let Err(e) = backend_clone.flush().await {
                             warn!("idle flush failed: {:#}", e);
-                        } else {
-                            // Update last_flush timestamp (already done in flush())
                         }
                     } else if should_force_flush {
                         info!(

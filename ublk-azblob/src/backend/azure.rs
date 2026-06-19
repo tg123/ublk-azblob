@@ -65,6 +65,31 @@ impl BlobBackend for AzurePageBlobBackend {
             }
         }
         let blob_client = self.container.blob_client(&self.blob_name);
+        // Idempotency (CSI requires CreateVolume not to mutate an existing
+        // volume): a plain Put Page Blob would overwrite and zero an existing
+        // blob, so if the blob already exists, return success when the size
+        // matches and fail when it differs, instead of recreating it.
+        match blob_client.get_properties(None).await {
+            Ok(props) => {
+                let existing = props.content_length()?.unwrap_or(0);
+                if existing == size {
+                    trace!(size, "page blob already exists with the requested size");
+                    return Ok(());
+                }
+                bail!(
+                    "blob '{}' already exists with size {existing}, requested {size}",
+                    self.blob_name
+                );
+            }
+            Err(err) if err.http_status() == Some(azure_core::http::StatusCode::NotFound) => {
+                // Does not exist yet — provision it below.
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("check existing blob '{}' before create", self.blob_name)
+                });
+            }
+        }
         let page_client = blob_client.page_blob_client();
         trace!(size, "creating page blob");
         page_client
