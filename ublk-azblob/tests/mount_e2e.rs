@@ -111,8 +111,11 @@ fn run(cmd: &str, args: &[&str]) {
 fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
     let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
     let blob_url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), container, blob);
-    cmd.env("AZURE_STORAGE_KEY", env_or("AZURE_STORAGE_KEY", DEFAULT_KEY))
-        .env("AZURE_STORAGE_BLOB_URL", blob_url);
+    cmd.env(
+        "AZURE_STORAGE_KEY",
+        env_or("AZURE_STORAGE_KEY", DEFAULT_KEY),
+    )
+    .env("AZURE_STORAGE_BLOB_URL", blob_url);
 }
 
 /// Start the ublk device as a child process and wait for `/dev/ublkbN` to

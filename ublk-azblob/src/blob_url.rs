@@ -39,8 +39,8 @@ pub struct TemplateBlobRef {
 /// is split out; the remaining query (when it carries a `sig=`) is returned as
 /// the SAS token.
 pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
-    let parsed = azure_core::http::Url::parse(url)
-        .with_context(|| format!("parse blob url: {url}"))?;
+    let parsed =
+        azure_core::http::Url::parse(url).with_context(|| format!("parse blob url: {url}"))?;
     let scheme = parsed.scheme();
     let host = parsed
         .host_str()

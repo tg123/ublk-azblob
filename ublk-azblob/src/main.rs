@@ -660,7 +660,10 @@ impl Cli {
 /// Build an `AzurePageBlobBackend` for the blob selected by `--blob-url`.  Used
 /// by the `run` and `test` subcommands (which target a single, explicitly-named
 /// blob).
-fn build_azure_backend(loc: &Location, auth: &AuthConfig) -> anyhow::Result<Arc<AzurePageBlobBackend>> {
+fn build_azure_backend(
+    loc: &Location,
+    auth: &AuthConfig,
+) -> anyhow::Result<Arc<AzurePageBlobBackend>> {
     let container_client = auth::build_container_client(&loc.endpoint, &loc.container, auth)
         .context("build container client")?;
     let backend = AzurePageBlobBackend::new(container_client, loc.blob.clone());
