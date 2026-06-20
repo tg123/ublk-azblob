@@ -197,7 +197,10 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
         cmd.arg("--create");
     }
     if let Some(s) = snapshot {
-        cmd.arg("--snapshot").arg(s);
+        // `--snapshot` is a top-level option (parsed before the subcommand), so
+        // pass it via its env var — like account/container/blob — rather than as
+        // a `run` argument, where clap would reject it.
+        cmd.env("AZURE_STORAGE_SNAPSHOT", s);
     }
     if let Some(dir) = &spec.cache_dir {
         cmd.arg("--cache-dir").arg(dir);

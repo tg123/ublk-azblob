@@ -36,7 +36,6 @@ use bytes::{Bytes, BytesMut};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
@@ -756,7 +755,11 @@ fn check_in_bounds(op: &str, offset: u64, len: u64, dev_size: u64) -> anyhow::Re
 /// Punch a hole in `file` over `[offset, offset+len)`, deallocating those blocks
 /// so the disk space is actually reclaimed while the file keeps its logical size
 /// (the region reads back as zeros).  Used when evicting a clean cache page.
+///
+/// `FALLOC_FL_PUNCH_HOLE` is a Linux-only syscall, so this is the Linux impl.
+#[cfg(target_os = "linux")]
 fn punch_hole(file: &File, offset: u64, len: u64) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
     let ret = unsafe {
         libc::fallocate(
             file.as_raw_fd(),
@@ -769,6 +772,16 @@ fn punch_hole(file: &File, offset: u64, len: u64) -> anyhow::Result<()> {
         return Err(std::io::Error::last_os_error()).context("fallocate punch hole");
     }
     Ok(())
+}
+
+/// Non-Linux fallback: hole punching (`FALLOC_FL_PUNCH_HOLE`) is a Linux-only
+/// syscall. Report it as unsupported so [`probe_punch_hole`] returns `false` and
+/// the cache degrades to grow-only (no eviction), exactly like a filesystem that
+/// doesn't support hole punching. Keeps the portable core build compiling on
+/// non-Linux targets.
+#[cfg(not(target_os = "linux"))]
+fn punch_hole(_file: &File, _offset: u64, _len: u64) -> anyhow::Result<()> {
+    anyhow::bail!("hole punching (FALLOC_FL_PUNCH_HOLE) is only supported on Linux")
 }
 
 /// Probe whether `dir`'s filesystem supports `FALLOC_FL_PUNCH_HOLE` by punching a

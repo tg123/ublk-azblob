@@ -241,7 +241,10 @@ fn start_server_opts(
         cmd.arg("--create");
     }
     if let Some(s) = snapshot {
-        cmd.arg("--snapshot").arg(s);
+        // `--snapshot` is a top-level option (parsed before the subcommand), so
+        // pass it via its env var — like account/container/blob — rather than as
+        // a `run` argument, where clap would reject it.
+        cmd.env("AZURE_STORAGE_SNAPSHOT", s);
     }
     if disable_auto_flush {
         cmd.arg("--idle-flush-secs")
