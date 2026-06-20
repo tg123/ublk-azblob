@@ -135,8 +135,7 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.container` | Container name (supports variables) | `ublk-azblob-volumes` |
 | `storageClass.parameters.blobPathTemplate` | Blob path template | `${pvc.namespace}/volumes/${pv.name}` |
 | `storageClass.parameters.fsType` | Filesystem type | `ext4` |
-| `storageClass.parameters.readOnly` | Expose the volume read-only (`"true"`/`"false"`) | `""` |
-| `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS and/or `?snapshot=`). Read-only (or a snapshot URL) ⇒ mount directly (no copy, no lock/lease); read-write ⇒ copy into the per-PVC blob and skip format | `""` |
+| `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS; `?snapshot=` ⇒ mount the immutable snapshot directly read-only, no copy/lock/lease; non-snapshot ⇒ copy into the per-PVC blob read-write and skip format) | `""` |
 
 ### Global Secret Configuration (secretSearchMode: global)
 

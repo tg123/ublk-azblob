@@ -42,9 +42,6 @@ parameters:
   {{- if .fsType }}
   fsType: {{ .fsType }}
   {{- end }}
-  {{- if .readOnly }}
-  readOnly: {{ .readOnly | quote }}
-  {{- end }}
   {{- if .templateBlobUrl }}
   templateBlobUrl: {{ .templateBlobUrl | quote }}
   {{- end }}
@@ -84,9 +81,6 @@ parameters:
   {{- end }}
   {{- if .fsType }}
   fsType: {{ .fsType }}
-  {{- end }}
-  {{- if .readOnly }}
-  readOnly: {{ .readOnly | quote }}
   {{- end }}
   {{- if .templateBlobUrl }}
   templateBlobUrl: {{ .templateBlobUrl | quote }}

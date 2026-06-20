@@ -29,7 +29,7 @@
 //! ```
 //!
 //! A second test, [`mount_read_only`](fn.mount_read_only.html), exercises
-//! `run --read-only`: it asserts the kernel marks `/dev/ublkbN` read-only,
+//! `run --snapshot`: it snapshots the blob, asserts the kernel marks `/dev/ublkbN` read-only,
 //! verifies the data is still readable, and confirms a write to the read-only
 //! mount fails without mutating the backing blob.
 #![cfg(feature = "ublk")]
@@ -133,14 +133,39 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
 /// `stop_device`), so the zombie-process lint does not apply.
 #[allow(clippy::zombie_processes)]
 fn start_device(spec: &DeviceSpec, create: bool) -> Child {
-    start_device_opts(spec, create, false)
+    start_device_opts(spec, create, None)
 }
 
-/// Like [`start_device`] but lets the caller expose the device read-only
-/// (`run --read-only`).  `create` and `read_only` are mutually exclusive at the
-/// CLI level, so callers pass `create=false` when `read_only=true`.
+/// Create a snapshot of the test blob via the `snapshot` subcommand and return
+/// its `x-ms-snapshot` id (used to bring the device back up read-only, since a
+/// snapshot is the only way a device is exposed read-only).
+fn create_snapshot(spec: &DeviceSpec) -> String {
+    let bin = std::env::var("UBLK_AZBLOB_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
+    let mut cmd = Command::new(&bin);
+    cmd.arg("snapshot");
+    azure_env(&mut cmd, &spec.container, &spec.blob);
+    log(&format!("creating snapshot of blob {}", spec.blob));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn `snapshot`: {e}"));
+    assert!(
+        out.status.success(),
+        "snapshot subcommand failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!id.is_empty(), "snapshot subcommand printed no id");
+    log(&format!("created snapshot {id}"));
+    id
+}
+
+/// Like [`start_device`] but lets the caller bring the device up against a blob
+/// `snapshot` (`run --snapshot <id>`), which exposes it read-only.  `create` and
+/// a snapshot are mutually exclusive (a snapshot is immutable), so callers pass
+/// `create=false` when supplying a snapshot.
 #[allow(clippy::zombie_processes)]
-fn start_device_opts(spec: &DeviceSpec, create: bool, read_only: bool) -> Child {
+fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) -> Child {
     let dev = spec.dev_path();
     log(&format!(
         "starting ublk device {dev} ({}{}{})",
@@ -149,7 +174,10 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, read_only: bool) -> Child 
         } else {
             "reuse existing blob"
         },
-        if read_only { ", --read-only" } else { "" },
+        match snapshot {
+            Some(s) => format!(", --snapshot {s}"),
+            None => String::new(),
+        },
         match &spec.cache_dir {
             Some(d) => format!(", cache_dir={}", d.display()),
             None => String::new(),
@@ -168,8 +196,8 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, read_only: bool) -> Child 
     if create {
         cmd.arg("--create");
     }
-    if read_only {
-        cmd.arg("--read-only");
+    if let Some(s) = snapshot {
+        cmd.arg("--snapshot").arg(s);
     }
     if let Some(dir) = &spec.cache_dir {
         cmd.arg("--cache-dir").arg(dir);
@@ -437,12 +465,12 @@ fn run_mount_roundtrip(spec: DeviceSpec) {
     log("mount e2e PASSED ✓");
 }
 
-/// e2e for read-only mode (`run --read-only`) over the kernel ublk path.
+/// e2e for read-only mode (`run --snapshot`) over the kernel ublk path.
 ///
 /// Cycle:
 ///   1. provision the device writable, make an ext4 filesystem, write random
 ///      files, record their checksums, flush and tear the device down
-///   2. bring the device back up over the *same* blob with `--read-only` and
+///   2. snapshot the blob and bring the device back up against that snapshot, then
 ///      assert:
 ///      * the kernel marks `/dev/ublkbN` read-only
 ///        (`/sys/block/ublkbN/ro == 1`, courtesy of `UBLK_ATTR_READ_ONLY`)
@@ -496,8 +524,10 @@ fn mount_read_only() {
     run("umount", &[mnt.to_str().unwrap()]);
     stop_device(&dev, child);
 
-    // ── Phase 2: reopen read-only and assert the device rejects writes ────────
-    let child = start_device_opts(&spec, false, true);
+    // ── Phase 2: snapshot the blob, then reopen that snapshot (read-only) ─────
+    // A snapshot is the only way the device is exposed read-only.
+    let snapshot = create_snapshot(&spec);
+    let child = start_device_opts(&spec, false, Some(&snapshot));
 
     // The kernel exposes the read-only attribute via /sys/block/<dev>/ro.
     let ro_attr = format!("/sys/block/ublkb{}/ro", spec.dev_id);

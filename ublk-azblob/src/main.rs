@@ -14,6 +14,7 @@
 
 mod auth;
 mod backend;
+mod bloburl;
 #[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 mod coordination;
 #[cfg(feature = "csi")]
@@ -63,11 +64,21 @@ struct Cli {
 
     /// Target a specific blob *snapshot* (the `x-ms-snapshot` timestamp).
     ///
-    /// A snapshot is an immutable, point-in-time view of the blob.  Selecting a
-    /// snapshot implies read-only mode: the device is exposed read-only and all
-    /// write/discard operations are rejected.
+    /// A snapshot is an immutable, point-in-time view of the blob.  Because a
+    /// snapshot can never change, selecting one is what makes the device
+    /// **read-only** (all write/discard operations are rejected) *and* makes the
+    /// local cache safe to reuse: there is no separate `--read-only` flag.
     #[arg(long, env = "AZURE_STORAGE_SNAPSHOT")]
     snapshot: Option<String>,
+
+    /// Load the blob target from a full blob URL in this file (testing).
+    ///
+    /// The file's first line is parsed as an Azure blob URL; its account,
+    /// container, blob, `?snapshot=` and SAS override the corresponding flags.
+    /// Convenient for pointing `run`/`test` at a golden-image snapshot URL, e.g.
+    /// `--blob-url-file /tmp/s`.
+    #[arg(long, env = "AZURE_BLOB_URL_FILE")]
+    blob_url_file: Option<String>,
 
     /// Azure Storage service endpoint URL.
     ///
@@ -154,21 +165,6 @@ enum Command {
         /// Create (or overwrite) the page blob before starting the device.
         #[arg(long)]
         create: bool,
-
-        /// Expose the device read-only.
-        ///
-        /// The ublk device / NBD export is advertised read-only and every
-        /// write, discard, and write-zeroes request is rejected.  Implied when
-        /// `--snapshot` is set.
-        #[arg(
-            long,
-            env = "UBLK_READ_ONLY",
-            num_args = 0..=1,
-            default_value_t = false,
-            default_missing_value = "true",
-            value_parser = clap::builder::BoolishValueParser::new(),
-        )]
-        read_only: bool,
 
         /// Number of io_uring queues.
         #[arg(long, default_value = "1")]
@@ -364,6 +360,13 @@ enum Command {
         size: u64,
     },
 
+    /// Create a snapshot of the target blob (`--container` / `--blob`) and print
+    /// its `x-ms-snapshot` timestamp to stdout, then exit.
+    ///
+    /// The printed id can be passed back as `--snapshot` (or
+    /// `AZURE_STORAGE_SNAPSHOT`) to mount that immutable, read-only view.
+    Snapshot {},
+
     /// Copy a golden-image *template* blob into the configured target blob
     /// (`--container` / `--blob`), then exit.
     ///
@@ -428,7 +431,38 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Testing convenience: load the full blob target from a URL file (e.g.
+    // `/tmp/s` holding a golden-image snapshot URL). Its components override the
+    // individual flags before anything else is derived from them.
+    if let Some(path) = cli.blob_url_file.clone() {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("read --blob-url-file {path}"))?;
+        let url = raw.lines().next().unwrap_or("").trim().to_string();
+        if url.is_empty() {
+            anyhow::bail!("--blob-url-file {path} is empty");
+        }
+        let r = bloburl::parse_blob_url(&url).context("parse --blob-url-file URL")?;
+        cli.account = r.account;
+        cli.container = r.container;
+        cli.blob = Some(r.blob);
+        cli.endpoint = Some(format!("{}/", r.service_url.trim_end_matches('/')));
+        if r.snapshot.is_some() {
+            cli.snapshot = r.snapshot;
+        }
+        if r.sas.is_some() {
+            cli.sas_token = r.sas;
+        }
+        info!(
+            file = %path,
+            account = %cli.account,
+            container = %cli.container,
+            snapshot = ?cli.snapshot,
+            "loaded blob target from --blob-url-file"
+        );
+    }
+
     // The endpoint *template* may contain a `%s` placeholder for the account
     // (subdomain-style, e.g. `http://%s.blob.localhost:10000/`). The CSI driver
     // keeps the template verbatim and substitutes `%s` per volume in
@@ -454,7 +488,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             size,
             create,
-            read_only,
             nr_queues,
             queue_depth,
             id,
@@ -479,17 +512,17 @@ async fn main() -> anyhow::Result<()> {
             flush_io_timeout_secs,
             ref nbd,
         } => {
-            // A snapshot is immutable, so selecting one forces read-only mode.
-            let read_only = read_only || cli.snapshot.is_some();
+            // Read-only is derived solely from selecting a snapshot: a snapshot
+            // is immutable, so the device is exposed read-only and its cache is
+            // safe to reuse. There is no separate read-only flag.
+            let read_only = cli.snapshot.is_some();
             if read_only {
-                info!("read-only mode: writes, discards, and creation are disabled");
+                info!("snapshot selected: read-only mode (writes, discards, creation disabled)");
             }
             let azure_backend = build_azure_backend(&cli, &endpoint)?;
             if create {
                 if read_only {
-                    anyhow::bail!(
-                        "--create cannot be used in read-only mode (--read-only/--snapshot)"
-                    );
+                    anyhow::bail!("--create cannot be used against a snapshot (read-only)");
                 }
                 info!(size, "creating page blob");
                 azure_backend
@@ -532,8 +565,7 @@ async fn main() -> anyhow::Result<()> {
             // Optional local-disk cache layer (memory → local disk → blob).
             let backend: Arc<dyn BlobBackend> = if let Some(dir) = cache_dir.clone() {
                 // Default the blob identity and per-instance name to the
-                // container/blob; either may be overridden so peers caching the
-                // same logical blob can share clean pages across processes.
+                // container/blob.
                 let default_name =
                     cache_file_name(&cli.container, cli.blob.as_deref().unwrap_or_default());
                 let blob_identity = cache_blob_identity
@@ -544,19 +576,22 @@ async fn main() -> anyhow::Result<()> {
                     .clone()
                     .map(|s| sanitize_cache_component(&s))
                     .unwrap_or_else(|| default_name.clone());
-                if cache_share_pages && cache_instance.is_none() {
-                    anyhow::bail!(
-                        "--cache-share-pages requires --cache-instance (or \
-                         UBLK_CACHE_INSTANCE): peers sharing this --cache-dir for the \
-                         same blob must each own a distinct data file, otherwise they \
-                         collide on one `.dat` and corrupt each other"
+                // Cross-process page sharing is forced OFF for now: a snapshot
+                // read cache and a pre-upload write cache are both single-owner,
+                // so the cache never publishes to or reads from peers. The
+                // `--cache-share-pages` flag is accepted but ignored until the
+                // write-aware sharing path lands in a later iteration.
+                if cache_share_pages {
+                    warn!(
+                        "--cache-share-pages is currently disabled (single-process cache only); ignoring"
                     );
                 }
+                let share_pages = false;
                 info!(
                     cache_dir = %dir.display(),
                     cache_page_size,
                     cache_max_bytes,
-                    cache_share_pages,
+                    cache_share_pages = share_pages,
                     blob_identity = %blob_identity,
                     name = %name,
                     "local-disk cache enabled"
@@ -569,7 +604,7 @@ async fn main() -> anyhow::Result<()> {
                         page_size: cache_page_size,
                         max_bytes: cache_max_bytes,
                         blob_identity,
-                        share_pages: cache_share_pages,
+                        share_pages,
                     },
                     actual_size,
                 )
@@ -677,6 +712,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Test { size } => {
             let backend: Arc<dyn BlobBackend> = build_azure_backend(&cli, &endpoint)?;
             run_smoke_test(backend, size).await?;
+        }
+
+        Command::Snapshot {} => {
+            let backend = build_azure_backend(&cli, &endpoint)?;
+            let snapshot = backend
+                .create_snapshot()
+                .await
+                .context("create blob snapshot")?;
+            info!(%snapshot, "created blob snapshot");
+            // Print the bare id to stdout so callers can capture it.
+            println!("{snapshot}");
         }
 
         #[cfg(feature = "csi")]

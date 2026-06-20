@@ -26,7 +26,7 @@
 //! plain `cargo test` run) it skips cleanly instead of failing.
 //!
 //! A second test, [`nbd_read_only`](fn.nbd_read_only.html), exercises
-//! `run --read-only`: it asserts the export advertises `NBD_FLAG_READ_ONLY`,
+//! `run --snapshot`: it snapshots the blob, asserts the export advertises `NBD_FLAG_READ_ONLY`,
 //! reads succeed, and writes / trims / write-zeroes are rejected with `EPERM`
 //! without mutating the backing blob.
 //!
@@ -174,31 +174,58 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
 #[allow(clippy::zombie_processes)]
 fn start_server(addr: &str, container: &str, blob: &str, create: bool) -> Child {
     start_server_opts(
-        addr, container, blob, create, /* read_only */ false,
+        addr, container, blob, create, /* snapshot */ None,
         /* disable_auto_flush */ false,
     )
 }
 
-/// Like [`start_server`] but lets the caller expose the export read-only
-/// (`run --read-only`) and/or disable automatic flushing.  `create` and
-/// `read_only` are mutually exclusive at the CLI level, so callers pass
-/// `create=false` when `read_only=true`.  When `disable_auto_flush` is set the
-/// server runs with `--idle-flush-secs 0 --force-flush-timeout-secs 0` so the
-/// only thing that can persist a buffered write is an explicit `NBD_CMD_FLUSH`
-/// or the flush-on-shutdown path.
+/// Create a snapshot of the test blob via the `snapshot` subcommand and return
+/// its `x-ms-snapshot` id (the only way to expose the export read-only).
+fn create_snapshot(container: &str, blob: &str) -> String {
+    let bin = std::env::var("UBLK_AZBLOB_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
+    let mut cmd = Command::new(&bin);
+    cmd.arg("snapshot");
+    azure_env(&mut cmd, container, blob);
+    log(&format!("creating snapshot of blob {blob}"));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn `snapshot`: {e}"));
+    assert!(
+        out.status.success(),
+        "snapshot subcommand failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!id.is_empty(), "snapshot subcommand printed no id");
+    log(&format!("created snapshot {id}"));
+    id
+}
+
+/// Like [`start_server`] but lets the caller bring the export up against a blob
+/// `snapshot` (`run --snapshot <id>`), which exposes it read-only, and/or
+/// disable automatic flushing.  `create` and a snapshot are mutually exclusive
+/// (a snapshot is immutable), so callers pass `create=false` when supplying a
+/// snapshot.  When `disable_auto_flush` is set the server runs with
+/// `--idle-flush-secs 0 --force-flush-timeout-secs 0` so the only thing that can
+/// persist a buffered write is an explicit `NBD_CMD_FLUSH` or the
+/// flush-on-shutdown path.
 #[allow(clippy::zombie_processes)]
 fn start_server_opts(
     addr: &str,
     container: &str,
     blob: &str,
     create: bool,
-    read_only: bool,
+    snapshot: Option<&str>,
     disable_auto_flush: bool,
 ) -> Child {
     log(&format!(
         "starting NBD server on {addr} ({}{})",
         if create { "--create" } else { "reuse blob" },
-        if read_only { ", --read-only" } else { "" }
+        match snapshot {
+            Some(s) => format!(", --snapshot {s}"),
+            None => String::new(),
+        }
     ));
     // Prefer an externally-provided binary (the e2e runs the actual image built
     // from deploy/Dockerfile); fall back to the cargo-built binary for local runs.
@@ -213,8 +240,8 @@ fn start_server_opts(
     if create {
         cmd.arg("--create");
     }
-    if read_only {
-        cmd.arg("--read-only");
+    if let Some(s) = snapshot {
+        cmd.arg("--snapshot").arg(s);
     }
     if disable_auto_flush {
         cmd.arg("--idle-flush-secs")
@@ -561,11 +588,11 @@ fn nbd_roundtrip() {
     log("nbd e2e PASSED ✓");
 }
 
-/// e2e for read-only mode (`run --read-only`) over the NBD path.
+/// e2e for read-only mode (`run --snapshot`) over the NBD path.
 ///
 /// Cycle:
 ///   1. provision the blob writable, write a few random regions, flush, stop
-///   2. restart the server with `--read-only` over the *same* blob and assert:
+///   2. snapshot the blob and restart the server against that snapshot, then assert:
 ///      * the export advertises `NBD_FLAG_READ_ONLY`
 ///      * reads return the data written in phase 1 (it round-tripped through
 ///        Azure and is served read-only)
@@ -618,13 +645,14 @@ fn nbd_read_only() {
 
     wait_for_port_release(NBD_ADDR_READ_ONLY);
 
-    // ── Phase 2: reopen read-only and assert the export rejects mutations ─────
+    // ── Phase 2: snapshot the blob, then reopen that snapshot (read-only) ─────
+    let snapshot = create_snapshot(&container, &blob);
     let child = start_server_opts(
         NBD_ADDR_READ_ONLY,
         &container,
         &blob,
         /* create */ false,
-        /* read_only */ true,
+        /* snapshot */ Some(&snapshot),
         /* disable_auto_flush */ false,
     );
     let mut client = NbdClient::connect(NBD_ADDR_READ_ONLY);
@@ -837,7 +865,7 @@ fn nbd_graceful_shutdown_flush() {
         &container,
         &blob,
         /* create */ true,
-        /* read_only */ false,
+        /* snapshot */ None,
         /* disable_auto_flush */ true,
     );
     let mut client = NbdClient::connect(NBD_ADDR_SHUTDOWN);
