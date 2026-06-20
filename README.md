@@ -51,11 +51,8 @@ docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
 
 # Run the built-in smoke test (create → write → read-back → clear → zero-verify)
 cargo run -p ublk-azblob -- \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob \
   test --size 4096
 ```
 
@@ -64,27 +61,20 @@ cargo run -p ublk-azblob -- \
 ```bash
 # System-assigned Managed Identity (recommended on Azure VMs / AKS)
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240
 
 # User-assigned Managed Identity by client ID
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi-client-id 00000000-0000-0000-0000-000000000000 \
   run --size 10737418240
 
 # Account key (local dev / Azurite)
 sudo ./target/release/ublk-azblob \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob.vhd \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob.vhd \
   run --size 4194304
 ```
 
@@ -107,24 +97,21 @@ modified through the device.
 ```bash
 # Mount the live blob read-only
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240 --read-only
 ```
 
 To mount an immutable **point-in-time snapshot** of the blob, pass
 `--snapshot <SNAPSHOT>` (the `x-ms-snapshot` timestamp returned when the
-snapshot was created). Selecting a snapshot **implies `--read-only`** — the
-snapshot is immutable, so writes are always rejected:
+snapshot was created) — or append `?snapshot=<SNAPSHOT>` to `--blob-url`.
+Selecting a snapshot **implies `--read-only`** — the snapshot is immutable, so
+writes are always rejected:
 
 ```bash
 # Mount a specific blob snapshot (read-only is implied)
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --snapshot 2024-01-31T12:00:00.0000000Z \
   --msi \
   run --size 10737418240
@@ -147,11 +134,8 @@ NBD client — and does **not** require the `ublk` Cargo feature.
 ```bash
 # Start the NBD server (works on any kernel; no ublk device needed)
 ./target/release/ublk-azblob \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob.vhd \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob.vhd \
   run --size 4194304 --nbd 0.0.0.0:10809
 
 # In another shell, attach it as /dev/nbd0
@@ -175,11 +159,8 @@ All CLI flags have environment-variable equivalents:
 
 | Flag | Env var |
 |------|---------|
-| `--account` | `AZURE_STORAGE_ACCOUNT` |
-| `--endpoint` | `AZURE_STORAGE_ENDPOINT` |
+| `--blob-url` | `AZURE_STORAGE_BLOB_URL` |
 | `--account-key` | `AZURE_STORAGE_KEY` |
-| `--container` | `AZURE_STORAGE_CONTAINER` |
-| `--blob` | `AZURE_STORAGE_BLOB` |
 | `--snapshot` | `AZURE_STORAGE_SNAPSHOT` |
 | `--read-only` | `UBLK_READ_ONLY` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
@@ -201,9 +182,7 @@ Enable it by pointing `--cache-dir` at a directory on a local disk:
 
 ```bash
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240 \
   --cache-dir /var/cache/ublk-azblob \

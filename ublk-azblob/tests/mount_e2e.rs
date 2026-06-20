@@ -41,8 +41,6 @@ use std::process::{Child, Command};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-/// Azurite well-known development account name.
-const DEFAULT_ACCOUNT: &str = "devstoreaccount1";
 /// Azurite well-known development account key.
 const DEFAULT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
@@ -106,21 +104,15 @@ fn run(cmd: &str, args: &[&str]) {
 }
 
 /// Common Azure environment passed to the `ublk-azblob` child process.
+///
+/// The account, container and blob are collapsed into a single
+/// `AZURE_STORAGE_BLOB_URL` (Azurite path-style, so the URL host already
+/// carries the account); only the SharedKey is passed separately.
 fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
-    cmd.env(
-        "AZURE_STORAGE_ACCOUNT",
-        env_or("AZURE_STORAGE_ACCOUNT", DEFAULT_ACCOUNT),
-    )
-    .env(
-        "AZURE_STORAGE_KEY",
-        env_or("AZURE_STORAGE_KEY", DEFAULT_KEY),
-    )
-    .env(
-        "AZURE_STORAGE_ENDPOINT",
-        env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT),
-    )
-    .env("AZURE_STORAGE_CONTAINER", container)
-    .env("AZURE_STORAGE_BLOB", blob);
+    let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
+    let blob_url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), container, blob);
+    cmd.env("AZURE_STORAGE_KEY", env_or("AZURE_STORAGE_KEY", DEFAULT_KEY))
+        .env("AZURE_STORAGE_BLOB_URL", blob_url);
 }
 
 /// Start the ublk device as a child process and wait for `/dev/ublkbN` to
