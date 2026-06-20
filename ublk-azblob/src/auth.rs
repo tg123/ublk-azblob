@@ -31,7 +31,7 @@
 //! this file.
 
 use anyhow::Context as _;
-use azure_core::credentials::Secret;
+use azure_core::credentials::{Secret, TokenCredential};
 use azure_core::http::{
     policies::{Policy, PolicyResult},
     Context, Request,
@@ -217,6 +217,72 @@ pub fn build_container_client(
                 .context("create BlobContainerClient (SAS)")
         }
     }
+}
+
+/// Build an Entra (Microsoft Entra ID) token credential for `auth`, or `None`
+/// for SharedKey/SAS auth (which don't yield an OAuth token).
+fn build_token_credential(auth: &AuthConfig) -> anyhow::Result<Option<Arc<dyn TokenCredential>>> {
+    let cred: Arc<dyn TokenCredential> = match auth {
+        AuthConfig::Msi(user_assigned) => {
+            let opts = user_assigned.as_ref().map(|id| {
+                let uid = match id {
+                    UserAssignedIdentity::ClientId(s) => UserAssignedId::ClientId(s.clone()),
+                    UserAssignedIdentity::ObjectId(s) => UserAssignedId::ObjectId(s.clone()),
+                    UserAssignedIdentity::ResourceId(s) => UserAssignedId::ResourceId(s.clone()),
+                };
+                ManagedIdentityCredentialOptions {
+                    user_assigned_id: Some(uid),
+                    ..Default::default()
+                }
+            });
+            ManagedIdentityCredential::new(opts).context("create ManagedIdentityCredential")?
+        }
+        AuthConfig::WorkloadIdentity {
+            client_id,
+            tenant_id,
+            token_file,
+        } => {
+            let opts = WorkloadIdentityCredentialOptions {
+                client_id: client_id.clone(),
+                tenant_id: tenant_id.clone(),
+                token_file_path: token_file.clone().map(PathBuf::from),
+                ..Default::default()
+            };
+            WorkloadIdentityCredential::new(Some(opts))
+                .context("create WorkloadIdentityCredential")?
+        }
+        AuthConfig::ServicePrincipal {
+            tenant_id,
+            client_id,
+            client_secret,
+        } => ClientSecretCredential::new(
+            tenant_id,
+            client_id.clone(),
+            Secret::from(client_secret.clone()),
+            None,
+        )
+        .context("create ClientSecretCredential")?,
+        AuthConfig::SharedKey { .. } | AuthConfig::Sas { .. } => return Ok(None),
+    };
+    Ok(Some(cred))
+}
+
+/// Mint a `Bearer <token>` storage authorization header value for `auth`, or
+/// `None` for SharedKey/SAS.
+///
+/// Used as the `x-ms-copy-source-authorization` header on a server-side
+/// `Put Page From URL` copy so the storage service can read a source blob in a
+/// *different* account (cross-account golden-image template) under the driver's
+/// own Entra identity.
+pub async fn storage_bearer_token(auth: &AuthConfig) -> anyhow::Result<Option<String>> {
+    let Some(cred) = build_token_credential(auth)? else {
+        return Ok(None);
+    };
+    let token = cred
+        .get_token(&["https://storage.azure.com/.default"], None)
+        .await
+        .context("acquire storage OAuth token for copy-source-authorization")?;
+    Ok(Some(format!("Bearer {}", token.token.secret())))
 }
 
 // ── SharedKeyPolicy ───────────────────────────────────────────────────────────

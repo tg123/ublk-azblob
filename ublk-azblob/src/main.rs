@@ -631,8 +631,8 @@ fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<AzurePag
 }
 
 /// Copy a `templateBlobUrl` golden image into the configured target blob
-/// (`--container` / `--blob`) using the shared streamed copy. Mirrors what the
-/// CSI controller does when provisioning a read-write volume from a template.
+/// (`--container` / `--blob`) using a server-side copy. Mirrors what the CSI
+/// controller does when provisioning a read-write volume from a template.
 #[cfg(feature = "csi")]
 async fn run_template_copy(
     cli: &Cli,
@@ -641,12 +641,14 @@ async fn run_template_copy(
     min_size: u64,
 ) -> anyhow::Result<()> {
     use backend::azure::AzurePageBlobBackend;
-    use csi::{copy_blob, parse_blob_url, round_up_512};
+    use csi::{copy_template, parse_blob_url, round_up_512};
 
     let tmpl = parse_blob_url(template_url).context("parse --template-url")?;
 
     // Authenticate the source with its own SAS when present; otherwise reuse the
-    // CLI credentials (the template must then be reachable with them).
+    // CLI credentials (the template must then be reachable with them). The source
+    // service URL is taken from the template URL's own host so a non-SAS template
+    // in a different account/host than `--endpoint` is read from the right place.
     let (src_service_url, src_auth) = if let Some(sas) = &tmpl.sas {
         (
             format!("{}/", tmpl.service_url.trim_end_matches('/')),
@@ -655,10 +657,6 @@ async fn run_template_copy(
             },
         )
     } else {
-        // Derive the source service URL from the template URL's own host so a
-        // non-SAS template that lives in a different account/host than the
-        // configured `--endpoint`/`--account` is read from the right place
-        // (mirrors `csi::build_template_backend`).
         (
             format!("{}/", tmpl.service_url.trim_end_matches('/')),
             build_auth(cli)?,
@@ -674,14 +672,22 @@ async fn run_template_copy(
     let size = round_up_512(source_size.max(min_size));
 
     let dest = build_azure_backend(cli, endpoint)?;
+    let dest_auth = build_auth(cli)?;
     info!(
         template = %template_url, source_size, target_size = size,
-        container = %cli.container, "copying template into target blob"
+        container = %cli.container, "server-side copy of template into target blob"
     );
     dest.create(size).await.context("create target blob")?;
-    copy_blob(&source, dest.as_ref(), source_size)
-        .await
-        .context("copy template blob")?;
+    copy_template(
+        dest.as_ref(),
+        &source,
+        template_url,
+        tmpl.sas.is_some(),
+        &dest_auth,
+        source_size,
+    )
+    .await
+    .context("copy template blob")?;
     info!("template copy complete");
     Ok(())
 }

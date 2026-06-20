@@ -13,11 +13,13 @@ use azure_storage_blob::{
     models::{
         BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
         BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
-        PageBlobClientCreateOptions, PageBlobClientUploadPagesOptions,
+        PageBlobClientCreateOptions, PageBlobClientUploadPagesFromUrlOptions,
+        PageBlobClientUploadPagesOptions,
     },
     BlobClient, BlobContainerClient,
 };
 use bytes::Bytes;
+use futures::stream::{StreamExt as _, TryStreamExt as _};
 use std::sync::RwLock;
 use tracing::{error, instrument, trace};
 
@@ -95,6 +97,66 @@ impl AzurePageBlobBackend {
     /// Snapshot the current lease id, if any.
     fn lease_id(&self) -> Option<String> {
         self.lease_id.read().unwrap().clone()
+    }
+
+    /// Server-side copy `total_size` bytes from `source_url` into this page blob
+    /// using concurrent `Put Page From URL` requests.
+    ///
+    /// This is a true server-to-server copy: the storage service fetches each
+    /// 4 MiB range directly from `source_url` — no bytes flow through this
+    /// process. The destination blob must already exist (call [`BlobBackend::create`]
+    /// first) and be at least `total_size`.
+    ///
+    /// `copy_source_authorization` (an `Authorization` header value such as
+    /// `"Bearer <token>"`) lets the service read a source in a *different*
+    /// storage account; pass `None` when the source carries its own SAS or lives
+    /// in the same account. Ranges are 512-aligned; sparse source ranges copy as
+    /// zeros.
+    pub async fn copy_pages_from_url(
+        &self,
+        source_url: &str,
+        total_size: u64,
+        copy_source_authorization: Option<String>,
+    ) -> anyhow::Result<()> {
+        if !total_size.is_multiple_of(512) {
+            bail!("copy size {total_size} is not 512-byte aligned");
+        }
+        /// `Put Page From URL` allows at most 4 MiB per request.
+        const CHUNK: u64 = 4 * 1024 * 1024;
+        /// Concurrent in-flight copy requests.
+        const CONCURRENCY: usize = 16;
+
+        let blob_client = self.container.blob_client(&self.blob_name);
+        let page_client = blob_client.page_blob_client();
+        let lease_id = self.lease_id();
+
+        let n_chunks = total_size.div_ceil(CHUNK);
+        let copies = (0..n_chunks).map(|i| {
+            let offset = i * CHUNK;
+            let len = CHUNK.min(total_size - offset);
+            let src_range = HttpRange::new(offset, len);
+            let dst_range = HttpRange::new(offset, len);
+            let opts = PageBlobClientUploadPagesFromUrlOptions {
+                lease_id: lease_id.clone(),
+                copy_source_authorization: copy_source_authorization.clone(),
+                ..Default::default()
+            };
+            let page_client = &page_client;
+            let source_url = source_url.to_string();
+            async move {
+                page_client
+                    .upload_pages_from_url(source_url, src_range, len, dst_range, Some(opts))
+                    .await
+                    .with_context(|| format!("put page from url offset={offset} len={len}"))?;
+                Ok::<(), anyhow::Error>(())
+            }
+        });
+
+        futures::stream::iter(copies)
+            .buffer_unordered(CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
+        Ok(())
     }
 }
 

@@ -26,9 +26,10 @@ use super::proto::{
     ValidateVolumeCapabilitiesRequest, ValidateVolumeCapabilitiesResponse, Volume,
 };
 use super::{
-    build_backend, build_template_backend, copy_blob, make_volume_id, make_volume_id_ro,
-    parse_blob_url, parse_volume_id, round_up_512, DriverConfig,
+    build_backend, build_backend_concrete, build_template_backend, copy_template, make_volume_id,
+    make_volume_id_ro, parse_blob_url, parse_volume_id, round_up_512, DriverConfig,
 };
+use crate::backend::BlobBackend;
 
 /// Parameter key (StorageClass `parameters`) for storage account.
 const PARAM_STORAGE_ACCOUNT: &str = "storageAccount";
@@ -277,16 +278,24 @@ impl Controller for ControllerService {
             size = round_up_512(source_size.max(size));
             info!(
                 template = %template_url, source_size, size,
-                "CreateVolume: copying template into per-PVC blob"
+                "CreateVolume: server-side copy of template into per-PVC blob"
             );
-            let dest = build_backend(&self.config, &account, &container, &blob, &req.secrets)
-                .map_err(|e| Status::internal(format!("build backend: {e:#}")))?;
+            let (dest, dest_auth) =
+                build_backend_concrete(&self.config, &account, &container, &blob, &req.secrets)
+                    .map_err(|e| Status::internal(format!("build backend: {e:#}")))?;
             dest.create(size)
                 .await
                 .map_err(|e| Status::internal(format!("create page blob: {e:#}")))?;
-            copy_blob(source.as_ref(), dest.as_ref(), source_size)
-                .await
-                .map_err(|e| Status::internal(format!("copy template blob: {e:#}")))?;
+            copy_template(
+                &dest,
+                source.as_ref(),
+                template_url,
+                tmpl.sas.is_some(),
+                &dest_auth,
+                source_size,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("copy template blob: {e:#}")))?;
             already_created = true;
             from_template = true;
         }

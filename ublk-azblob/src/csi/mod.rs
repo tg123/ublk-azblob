@@ -355,13 +355,73 @@ pub fn build_template_backend(
     Ok(Arc::new(backend))
 }
 
-/// Streamed, chunked copy of `total_size` bytes from `source` into `dest`.
+/// Like [`build_backend`] but returns the concrete [`AzurePageBlobBackend`] and
+/// the [`AuthConfig`] used, so the caller can issue server-side operations
+/// (e.g. [`copy_template`]) that need both.
+pub fn build_backend_concrete(
+    config: &DriverConfig,
+    account: &str,
+    container: &str,
+    blob: &str,
+    secrets: &HashMap<String, String>,
+) -> anyhow::Result<(AzurePageBlobBackend, AuthConfig)> {
+    let auth = select_driver_auth(config, account, secrets)?;
+    let endpoint = account_endpoint(config, account);
+    let container_client = auth::build_container_client(&endpoint, container, &auth)
+        .context("build container client")?;
+    Ok((
+        AzurePageBlobBackend::new(container_client, blob.to_string()),
+        auth,
+    ))
+}
+
+/// Copy a `templateBlobUrl` golden image into `dest`, preferring a true
+/// server-side copy.
 ///
-/// Used to clone a `templateBlobUrl` golden image into a fresh per-PVC blob.
-/// Copies in 4 MiB page-aligned chunks; sparse/never-written source ranges read
-/// back as zeros, so the whole logical size is materialised on the destination.
-/// `dest` must already exist (call `create` first) and be at least `total_size`.
-pub async fn copy_blob(
+/// - When the source carries a SAS, or the driver uses Entra auth (so a
+///   copy-source bearer token can be minted), the copy is done with
+///   `Put Page From URL` — the storage service fetches each range directly from
+///   the source, so **no bytes flow through this process** and it scales to any
+///   size (incl. cross-account sources).
+/// - Otherwise (SharedKey / account-key auth with no source SAS) the storage
+///   service can't authenticate the source read, so the copy falls back to a
+///   streamed copy through `source` (download → upload).
+///
+/// `source_url` is the raw `templateBlobUrl` (already carrying any `snapshot=` /
+/// SAS query). `dest` must already exist and be at least `total_size`.
+pub async fn copy_template(
+    dest: &AzurePageBlobBackend,
+    source: &dyn BlobBackend,
+    source_url: &str,
+    source_has_sas: bool,
+    dest_auth: &AuthConfig,
+    total_size: u64,
+) -> anyhow::Result<()> {
+    let copy_source_authorization = if source_has_sas {
+        None
+    } else {
+        auth::storage_bearer_token(dest_auth)
+            .await
+            .context("mint copy-source authorization token")?
+    };
+    if source_has_sas || copy_source_authorization.is_some() {
+        info!(total_size, "server-side copy (Put Page From URL)");
+        dest.copy_pages_from_url(source_url, total_size, copy_source_authorization)
+            .await
+    } else {
+        info!(
+            total_size,
+            "no copy-source authorization (SharedKey, no SAS); streaming the copy"
+        );
+        copy_blob_streamed(source, dest, total_size).await
+    }
+}
+
+/// Streamed, chunked copy of `total_size` bytes from `source` into `dest` (the
+/// fallback used by [`copy_template`] when a server-side copy isn't possible).
+///
+/// Copies in 4 MiB page-aligned chunks; sparse source ranges read back as zeros.
+async fn copy_blob_streamed(
     source: &dyn BlobBackend,
     dest: &dyn BlobBackend,
     total_size: u64,
