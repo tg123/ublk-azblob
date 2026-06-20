@@ -148,6 +148,27 @@ impl NodeService {
                 env.push(("UBLK_LEASE_DURATION_SECS".to_string(), secs));
             }
         }
+
+        // Read-only / snapshot: when the volume targets a blob snapshot (only
+        // via a `templateBlobUrl` with `?snapshot=<timestamp>`) or opts the
+        // volume read-only (`readOnly: "true"`), the child `run` process exposes
+        // the device read-only and rejects every write/discard. A snapshot is
+        // immutable and therefore always implies read-only.
+        if let Some(snapshot) = get("snapshot").filter(|s| !s.is_empty()) {
+            env.push(("AZURE_STORAGE_SNAPSHOT".to_string(), snapshot));
+        }
+        let read_only = get("readOnly")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        if read_only {
+            env.push(("UBLK_READ_ONLY".to_string(), "1".to_string()));
+        }
+        // SAS token from a `templateBlobUrl` that carries its own signature; the
+        // child `run` process authenticates the (possibly cross-account) template
+        // blob with it instead of the driver credentials.
+        if let Some(sas) = get("sasToken").filter(|s| !s.is_empty()) {
+            env.push(("AZURE_STORAGE_SAS".to_string(), sas));
+        }
         Ok(env)
     }
 }
@@ -214,7 +235,27 @@ impl Node for NodeService {
 
         let volume_id = req.volume_id.clone();
         let target = req.target_path.clone();
-        let readonly = req.readonly;
+        // The device is read-only when the CSI request asks for it, or when the
+        // StorageClass selects a snapshot / opts the volume read-only.  Mounting
+        // read-write over a read-only block device would fail on first write, so
+        // force a read-only mount (and skip mkfs) in that case.
+        let device_read_only = req
+            .volume_context
+            .get("readOnly")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false)
+            || req
+                .volume_context
+                .get("snapshot")
+                .is_some_and(|s| !s.is_empty());
+        let readonly = req.readonly || device_read_only;
+        // A volume copied from a `templateBlobUrl` already carries a filesystem;
+        // never reformat it (the copy is the user's golden image).
+        let from_template = req
+            .volume_context
+            .get("fromTemplate")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
         let volumes = self.volumes.clone();
         let publish_lock = self.publish_lock.clone();
         let use_nbd = self.config.use_nbd;
@@ -286,6 +327,17 @@ impl Node for NodeService {
             let outcome = (|| -> anyhow::Result<()> {
                 if mount::has_filesystem(&device) {
                     info!(device = %device, "existing filesystem detected; skipping mkfs");
+                } else if from_template {
+                    // The blob was copied from a golden-image template, which is
+                    // already formatted; never reformat it.
+                    info!(device = %device, "volume copied from template; skipping mkfs");
+                } else if readonly {
+                    // A read-only device has no filesystem we can create; the
+                    // blob must already contain one.
+                    anyhow::bail!(
+                        "device {device} is read-only and has no filesystem; \
+                         a read-only/snapshot volume must already be formatted"
+                    );
                 } else {
                     mount::mkfs(&device, &fs_type)?;
                 }

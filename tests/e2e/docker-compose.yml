@@ -12,6 +12,9 @@
 #   - ublk_drv loaded: `sudo modprobe ublk_drv`
 #   - A shared mount for CSI mount propagation (CI: /var/lib/kubelet; local: /tmp).
 #
+# The Rust mount e2e (`tests/mount_e2e.rs`) includes the read-only mount test and
+# the NBD e2e (`tests/nbd_e2e.rs`) includes the read-only export test.
+#
 # Usage (local):
 #   sudo modprobe ublk_drv
 #   KUBELET_DIR=/tmp/kubelet-test
