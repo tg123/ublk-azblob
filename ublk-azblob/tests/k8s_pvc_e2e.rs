@@ -339,6 +339,9 @@ stringData:
     // ── Test 2: Pod migration between nodes ────────────────────────────────────
     test_pod_migration(&here);
 
+    // ── Test 3: Two disks mounted on the same node, no conflict ────────────────
+    test_multi_disk_same_node(&here);
+
     log("k8s PVC e2e PASSED ✓");
 }
 
@@ -656,6 +659,220 @@ spec:
             "delete",
             "deployment",
             "azblob-migration-test",
+            "--wait=true",
+        ],
+    );
+}
+
+/// Test 3: two volumes mounted simultaneously on the *same* node must not
+/// conflict.
+///
+/// Provisions two independent PVCs and mounts both in a single pod pinned to one
+/// node, so two ublk/NBD devices are live on the same node at the same time. Each
+/// volume gets its own distinct random payload + SHA-256; the test then verifies
+/// each checksum independently. A device-id collision, NBD-port collision, or any
+/// cross-wiring between the two volumes would surface as a mount failure or a
+/// checksum mismatch (data from one disk bleeding into the other).
+fn test_multi_disk_same_node(_here: &Path) {
+    log("TEST 3: two disks on the same node (no conflict)");
+
+    // Pin both volumes to a single node so the two devices are guaranteed to be
+    // co-located. Use the first node reported by the cluster.
+    let nodes_out = Command::new("kubectl")
+        .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+        .output()
+        .expect("get nodes");
+    let nodes_str = String::from_utf8_lossy(&nodes_out.stdout);
+    let node = match nodes_str.split_whitespace().next() {
+        Some(n) => n.to_string(),
+        None => {
+            panic!("multi-disk test: no nodes found");
+        }
+    };
+    log(&format!("pinning both volumes to node {node}"));
+
+    // Two independent PVCs → two distinct page blobs → two distinct devices.
+    let pvcs = r#"apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azblob-pvc-multi-a
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: azblob-ublk
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azblob-pvc-multi-b
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: azblob-ublk
+  resources:
+    requests:
+      storage: 256Mi
+"#;
+    log("creating two PVCs (azblob-pvc-multi-a, azblob-pvc-multi-b)");
+    kubectl_apply_stdin(pvcs);
+
+    // A single pod that mounts BOTH PVCs, writes distinct data to each, and
+    // records a SHA-256 next to each payload. Co-locating both mounts in one pod
+    // on one node forces the two devices to be live simultaneously on that node.
+    let pod_yaml = format!(
+        r#"apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azblob-multi-writer
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: azblob-multi-writer
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: {node}
+      containers:
+        - name: writer
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "writing distinct payloads to /data-a and /data-b on $(hostname)"
+              dd if=/dev/urandom of=/data-a/payload bs=1M count=8
+              dd if=/dev/urandom of=/data-b/payload bs=1M count=8
+              sha256sum /data-a/payload | sed 's# .*# /data-a/payload#' > /data-a/payload.sha256
+              sha256sum /data-b/payload | sed 's# .*# /data-b/payload#' > /data-b/payload.sha256
+              # The two devices must hold different data — a conflict would make
+              # these checksums match (one device shadowing the other).
+              a=$(sha256sum /data-a/payload | cut -d' ' -f1)
+              b=$(sha256sum /data-b/payload | cut -d' ' -f1)
+              if [ "$a" = "$b" ]; then
+                echo "CONFLICT: both volumes hold identical data"
+                exit 1
+              fi
+              sync
+              echo "multi-writer done"
+          volumeMounts:
+            - name: data-a
+              mountPath: /data-a
+            - name: data-b
+              mountPath: /data-b
+      volumes:
+        - name: data-a
+          persistentVolumeClaim:
+            claimName: azblob-pvc-multi-a
+        - name: data-b
+          persistentVolumeClaim:
+            claimName: azblob-pvc-multi-b
+"#
+    );
+
+    log("running multi-disk writer Job (mounts both PVCs on one node)");
+    kubectl_apply_stdin(&pod_yaml);
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=complete",
+            "job/azblob-multi-writer",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-multi-writer");
+        panic!("multi-disk writer Job did not complete — two disks conflicted on the same node");
+    }
+    let _ = try_run(
+        "kubectl",
+        &["logs", "-l", "app=azblob-multi-writer", "--tail=50"],
+    );
+
+    log("deleting multi-disk writer (tears down both devices, flushes both blobs)");
+    run(
+        "kubectl",
+        &["delete", "job", "azblob-multi-writer", "--wait=true"],
+    );
+
+    // Remount both PVCs again on the same node and verify each payload survived
+    // independently — proving the two co-located volumes never crossed wires.
+    let reader_yaml = format!(
+        r#"apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azblob-multi-reader
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: azblob-multi-reader
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: {node}
+      containers:
+        - name: reader
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "verifying both payloads on $(hostname)"
+              sha256sum -c /data-a/payload.sha256
+              sha256sum -c /data-b/payload.sha256
+              echo "multi-reader verified OK"
+          volumeMounts:
+            - name: data-a
+              mountPath: /data-a
+            - name: data-b
+              mountPath: /data-b
+      volumes:
+        - name: data-a
+          persistentVolumeClaim:
+            claimName: azblob-pvc-multi-a
+        - name: data-b
+          persistentVolumeClaim:
+            claimName: azblob-pvc-multi-b
+"#
+    );
+
+    log("running multi-disk reader Job (remounts both PVCs, verifies both checksums)");
+    kubectl_apply_stdin(&reader_yaml);
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=complete",
+            "job/azblob-multi-reader",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-multi-reader");
+        panic!("multi-disk reader Job did not complete — data did not survive two-disk remount");
+    }
+    let _ = try_run(
+        "kubectl",
+        &["logs", "-l", "app=azblob-multi-reader", "--tail=50"],
+    );
+
+    log("✓ Multi-disk same-node test PASSED: two co-located volumes, no conflict");
+
+    // Cleanup
+    run(
+        "kubectl",
+        &["delete", "job", "azblob-multi-reader", "--wait=true"],
+    );
+    run(
+        "kubectl",
+        &[
+            "delete",
+            "pvc",
+            "azblob-pvc-multi-a",
+            "azblob-pvc-multi-b",
             "--wait=true",
         ],
     );
