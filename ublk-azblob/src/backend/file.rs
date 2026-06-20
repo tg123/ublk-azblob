@@ -1836,4 +1836,98 @@ mod tests {
         assert!(!lru.contains(1));
         assert_eq!(lru.pop_lru(None), None);
     }
+
+    #[test]
+    fn lru_empty_has_nothing() {
+        let mut lru = Lru::default();
+        assert!(!lru.contains(0));
+        assert!(!lru.contains(u64::MAX));
+        assert_eq!(lru.pop_lru(None), None);
+        assert_eq!(lru.pop_lru(Some(0)), None);
+    }
+
+    #[test]
+    fn lru_pop_removes_from_contains() {
+        // Popping a page must drop it from the resident set, not just the
+        // evictable index (otherwise byte accounting would double-count).
+        let mut lru = Lru::default();
+        lru.touch(7, true);
+        assert!(lru.contains(7));
+        assert_eq!(lru.pop_lru(None), Some(7));
+        assert!(!lru.contains(7));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_clean_page_is_popped_exactly_once() {
+        // Repeated touches of the same clean page collapse to a single resident,
+        // single-evictable entry.
+        let mut lru = Lru::default();
+        lru.touch(3, true);
+        lru.touch(3, true);
+        lru.touch(3, true);
+        assert_eq!(lru.pop_lru(None), Some(3));
+        assert_eq!(lru.pop_lru(None), None);
+        assert!(!lru.contains(3));
+    }
+
+    #[test]
+    fn lru_dirty_retouch_stays_non_evictable() {
+        // Re-touching a dirty page (e.g. a second write before flush) updates its
+        // recency but it must never become an eviction candidate.
+        let mut lru = Lru::default();
+        lru.touch(0, false);
+        lru.touch(0, false);
+        assert!(lru.contains(0));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_protecting_dirty_page_still_evicts_clean() {
+        // Protecting a page that isn't evictable anyway is a no-op; the clean LRU
+        // page is still chosen.
+        let mut lru = Lru::default();
+        lru.touch(0, false); // dirty
+        lru.touch(1, true); // clean
+        assert_eq!(lru.pop_lru(Some(0)), Some(1));
+        assert_eq!(lru.pop_lru(None), None);
+        assert!(lru.contains(0));
+    }
+
+    #[test]
+    fn lru_clear_allows_fresh_reuse() {
+        // After clear, the recency clock restarts and ordering is correct again.
+        let mut lru = Lru::default();
+        lru.touch(5, true);
+        lru.touch(6, true);
+        lru.clear();
+        lru.touch(2, true);
+        lru.touch(1, true);
+        // Insertion order after clear: 2 then 1 → 2 is least-recently-used.
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), Some(1));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_mixed_workload_order() {
+        // Comprehensive interleaving: clean inserts, a dirty page, a flush
+        // (dirty→clean), a re-touch, and a protected pop.
+        let mut lru = Lru::default();
+        lru.touch(0, true); // clean, oldest
+        lru.touch(1, false); // dirty (pinned)
+        lru.touch(2, true); // clean
+        lru.touch(3, true); // clean
+        lru.touch(0, true); // re-touch 0 → now newest clean
+        lru.touch(1, true); // flush page 1 → becomes evictable (newest)
+
+        // Evictable clean pages by recency: 2, 3, 0, 1.
+        assert_eq!(lru.pop_lru(Some(2)), Some(3)); // 2 protected → next LRU is 3
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), Some(0));
+        assert_eq!(lru.pop_lru(None), Some(1));
+        assert_eq!(lru.pop_lru(None), None);
+        assert!(!lru.contains(0));
+        assert!(!lru.contains(1));
+    }
 }
