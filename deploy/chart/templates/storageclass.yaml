@@ -45,6 +45,9 @@ parameters:
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}
   {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
+  {{- end }}
   {{- if .templateBlobUrl }}
   templateBlobUrl: {{ .templateBlobUrl | quote }}
   {{- end }}
@@ -87,6 +90,9 @@ parameters:
   {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}
+  {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
   {{- end }}
   {{- if .templateBlobUrl }}
   templateBlobUrl: {{ .templateBlobUrl | quote }}
