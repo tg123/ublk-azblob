@@ -185,6 +185,9 @@ All CLI flags have environment-variable equivalents:
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
 | `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
+| `--cache-share-pages` | `UBLK_CACHE_SHARE_PAGES` |
+| `--cache-warmup` | `UBLK_CACHE_WARMUP` |
+| `--cache-warmup-bytes` | `UBLK_CACHE_WARMUP_BYTES` |
 | `--nbd` | `NBD_LISTEN` |
 
 ---
@@ -271,6 +274,24 @@ and losing the index only forgoes sharing — correctness falls back to the blob
 In CSI deployments enable this through the Helm chart's `node.cache.sharePages`;
 the node plugin assigns each volume a unique cache instance so concurrent mounts
 of the same blob transparently share clean pages.
+
+### Cache warm-up (`--cache-warmup`)
+
+By default the cache is **lazy** — a page is fetched from the blob only when it
+is first read. With `--cache-warmup` (or `UBLK_CACHE_WARMUP=1`) the process
+instead **prefetches the blob into the cache on start**, sequentially, in the
+**background** (the device comes online immediately). Warm-up is **sharing-aware**:
+it goes through the normal read path, so a page a live peer already caches is
+copied from the peer rather than re-fetched from Azure.
+
+Prefetch stops after `--cache-warmup-bytes` (or `UBLK_CACHE_WARMUP_BYTES`); `0`
+(the default) means auto — the cache byte budget (`--cache-max-bytes`) when set,
+otherwise the whole device. Warm-up is best for **read-only / read-mostly
+datasets that fit the cache budget** (e.g. a shared golden image): combine it
+with `--cache-share-pages` so the first volume warms the shared cache and every
+peer then serves locally. For large, write-heavy, or sparsely-accessed blobs,
+leave it off — lazy caching only fetches what's actually used. In CSI deployments
+toggle it via the Helm chart's `node.cache.warmup`.
 
 ---
 

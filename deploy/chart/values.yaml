@@ -77,6 +77,16 @@ node:
     # unique, stable cache instance (its volume id) automatically.
     sharePages: false
 
+    # Background cache warm-up: each volume prefetches its blob into the cache on
+    # start (in the background; the device comes online immediately). Best for
+    # read-only / read-mostly datasets that fit the cache budget — combined with
+    # sharePages, the first volume warms the shared cache and peers serve from it.
+    warmup: false
+
+    # Cap in bytes for warm-up. 0 = auto (the cache byte budget when set, else the
+    # whole device).
+    warmupBytes: 0
+
   resources:
     limits:
       cpu: 500m

@@ -141,6 +141,17 @@ spec:
             - name: UBLK_CACHE_SHARE_PAGES
               value: "1"
             {{- end }}
+            {{- if .Values.node.cache.warmup }}
+            # Background cache warm-up: each volume prefetches its blob into the
+            # cache on start (sharing-aware). Best for read-only / read-mostly
+            # datasets that fit the cache budget.
+            - name: UBLK_CACHE_WARMUP
+              value: "1"
+            {{- if .Values.node.cache.warmupBytes }}
+            - name: UBLK_CACHE_WARMUP_BYTES
+              value: {{ .Values.node.cache.warmupBytes | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             {{- with .Values.node.env }}
             # Additional environment variables

@@ -32,7 +32,7 @@ use backend::{
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -292,6 +292,20 @@ enum Command {
         #[arg(long, env = "UBLK_CACHE_INSTANCE")]
         cache_instance: Option<String>,
 
+        /// Warm the local-disk cache on start by sequentially prefetching the
+        /// blob into it. Runs in the background (does not delay the device coming
+        /// online) and is sharing-aware (pages a live peer already caches are
+        /// fetched from the peer, not Azure). Only used when `--cache-dir` is set;
+        /// best for read-only / read-mostly datasets that fit the cache budget.
+        #[arg(long, default_value = "false", env = "UBLK_CACHE_WARMUP")]
+        cache_warmup: bool,
+
+        /// Cap in bytes for `--cache-warmup`. `0` = auto: the cache byte budget
+        /// (`--cache-max-bytes`) when set, otherwise the whole device. Prefetch
+        /// stops once this many bytes from offset 0 have been scanned.
+        #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_BYTES")]
+        cache_warmup_bytes: u64,
+
         /// Idle flush timeout in seconds: automatically flush dirty pages after N
         /// seconds of write inactivity.  Set to 0 to disable idle flushing.
         ///
@@ -444,6 +458,8 @@ async fn main() -> anyhow::Result<()> {
             cache_share_pages,
             ref cache_blob_identity,
             ref cache_instance,
+            cache_warmup,
+            cache_warmup_bytes,
             idle_flush_secs,
             force_flush_timeout_secs,
             flush_io_timeout_secs,
@@ -557,8 +573,33 @@ async fn main() -> anyhow::Result<()> {
                         .await
                         .context("flush recovered dirty cache pages")?;
                 }
+                // Optional background cache warm-up: sequentially prefetch the
+                // blob into the cache so reads are served locally. Spawned
+                // detached so the device comes online immediately; reads go
+                // through the cache (peer-first), so it's sharing-aware.
+                if cache_warmup {
+                    let limit = if cache_warmup_bytes > 0 {
+                        cache_warmup_bytes
+                    } else if cache_max_bytes > 0 {
+                        cache_max_bytes
+                    } else {
+                        actual_size
+                    }
+                    .min(actual_size);
+                    let warm_backend = cache.clone();
+                    info!(
+                        warmup_limit_bytes = limit,
+                        "cache warm-up started (background)"
+                    );
+                    tokio::spawn(async move {
+                        warmup_cache(warm_backend, actual_size, cache_page_size, limit).await;
+                    });
+                }
                 cache
             } else {
+                if cache_warmup {
+                    warn!("--cache-warmup ignored: requires --cache-dir");
+                }
                 backend
             };
 
@@ -865,6 +906,40 @@ fn cache_file_name(container: &str, blob: &str) -> String {
     sanitize_cache_component(&format!("{container}-{blob}"))
 }
 
+/// Background cache warm-up: sequentially read `[0, limit_bytes)` of the device
+/// through `backend` (the cache layer) so those pages become resident locally —
+/// served from a peer when one already holds them, else fetched from the blob.
+///
+/// Best-effort: a read error stops the warm-up (the device keeps serving on
+/// demand). Yields between pages so it doesn't starve live I/O.
+async fn warmup_cache(
+    backend: Arc<dyn BlobBackend>,
+    dev_size: u64,
+    page_size: u64,
+    limit_bytes: u64,
+) {
+    let limit = limit_bytes.min(dev_size);
+    let mut offset = 0u64;
+    let mut warmed = 0u64;
+    while offset < limit {
+        let len = page_size.min(dev_size - offset);
+        match backend.read(offset, len).await {
+            Ok(_) => warmed += len,
+            Err(err) => {
+                warn!(offset, %err, "cache warm-up read failed; stopping early");
+                break;
+            }
+        }
+        offset += len;
+        tokio::task::yield_now().await;
+    }
+    info!(
+        warmed_bytes = warmed,
+        limit_bytes = limit,
+        "cache warm-up complete"
+    );
+}
+
 /// Sanitize a single string to the cache file-name alphabet (alphanumerics plus
 /// `-` and `_`), so an operator-supplied `--cache-instance` / blob identity
 /// stays inside `--cache-dir` and cannot traverse paths.
@@ -970,4 +1045,78 @@ async fn run_smoke_test(backend: Arc<dyn BlobBackend>, size: u64) -> anyhow::Res
 
     info!("smoke test PASSED ✓");
     Ok(())
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::sync::Mutex;
+
+    /// Records every `read(offset, len)` so a test can assert the warm-up's
+    /// access pattern.
+    #[derive(Default)]
+    struct RecordingBackend {
+        size: u64,
+        reads: Mutex<Vec<(u64, u64)>>,
+    }
+
+    #[async_trait]
+    impl BlobBackend for RecordingBackend {
+        async fn create(&self, _size: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.lock().unwrap().push((offset, len));
+            Ok(Bytes::from(vec![0u8; len as usize]))
+        }
+        async fn write(&self, _offset: u64, _data: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn clear(&self, _offset: u64, _len: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            Ok(self.size)
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_scans_whole_device_in_page_chunks() {
+        let b = Arc::new(RecordingBackend {
+            size: 8192,
+            ..Default::default()
+        });
+        warmup_cache(b.clone(), 8192, 4096, 8192).await;
+        assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (4096, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_stops_at_limit() {
+        let b = Arc::new(RecordingBackend {
+            size: 8192,
+            ..Default::default()
+        });
+        // limit = one page
+        warmup_cache(b.clone(), 8192, 4096, 4096).await;
+        assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_last_chunk_is_clamped_to_device() {
+        let b = Arc::new(RecordingBackend {
+            size: 6144,
+            ..Default::default()
+        });
+        // limit > dev_size is clamped; last chunk is the partial tail.
+        warmup_cache(b.clone(), 6144, 4096, u64::MAX).await;
+        assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (4096, 2048)]);
+    }
 }
