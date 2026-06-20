@@ -906,6 +906,10 @@ fn nbd_graceful_shutdown_flush() {
 ///
 /// stderr is drained on a helper thread so a chatty child can never fill the
 /// pipe buffer and deadlock before it exits.
+///
+/// The child is always reaped: the success path observes its exit via
+/// `try_wait()`, and every early-return panic path `kill()`s then `wait()`s it,
+/// so the `zombie_processes` lint does not apply.
 #[allow(clippy::zombie_processes)]
 fn expect_blob_lock_conflict(addr: &str, container: &str, blob: &str) -> String {
     log(&format!(
