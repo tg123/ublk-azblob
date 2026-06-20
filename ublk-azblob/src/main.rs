@@ -32,7 +32,7 @@ use backend::{
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -264,6 +264,34 @@ enum Command {
         #[arg(long, default_value = "0", env = "UBLK_CACHE_MAX_BYTES")]
         cache_max_bytes: u64,
 
+        /// Enable cross-process clean-page sharing in the local-disk cache.
+        ///
+        /// When set, processes that cache the **same blob** (same
+        /// `--cache-blob-identity`) in a shared `--cache-dir` can serve each
+        /// other's already-fetched *clean* pages directly off local disk via a
+        /// `flock`-coordinated `.cache-index`, avoiding a redundant blob read.
+        /// Each cache still writes only its own data file (copy-on-write on a
+        /// dirtying write), so the single-writer-per-file invariant holds.
+        /// Requires a per-instance `--cache-instance` so peers have distinct
+        /// data files.  Only used when `--cache-dir` is set.
+        #[arg(long, default_value = "false", env = "UBLK_CACHE_SHARE_PAGES")]
+        cache_share_pages: bool,
+
+        /// Shared identity of the blob this cache mirrors, used to match peers
+        /// for `--cache-share-pages`.  Defaults to the container/blob.  Set it to
+        /// a common value (e.g. a golden-image id) across volumes that should
+        /// share pages.  Only used when `--cache-dir` is set.
+        #[arg(long, env = "UBLK_CACHE_BLOB_IDENTITY")]
+        cache_blob_identity: Option<String>,
+
+        /// Per-instance cache file base name, making each cache's data file
+        /// unique within a shared `--cache-dir`.  Defaults to the container/blob.
+        /// Must be stable across restarts of the same volume (so dirty pages are
+        /// recovered) and unique per volume when `--cache-share-pages` is set.
+        /// Only used when `--cache-dir` is set.
+        #[arg(long, env = "UBLK_CACHE_INSTANCE")]
+        cache_instance: Option<String>,
+
         /// Idle flush timeout in seconds: automatically flush dirty pages after N
         /// seconds of write inactivity.  Set to 0 to disable idle flushing.
         ///
@@ -413,6 +441,9 @@ async fn main() -> anyhow::Result<()> {
             ref cache_dir,
             cache_page_size,
             cache_max_bytes,
+            cache_share_pages,
+            ref cache_blob_identity,
+            ref cache_instance,
             idle_flush_secs,
             force_flush_timeout_secs,
             flush_io_timeout_secs,
@@ -470,22 +501,43 @@ async fn main() -> anyhow::Result<()> {
 
             // Optional local-disk cache layer (memory → local disk → blob).
             let backend: Arc<dyn BlobBackend> = if let Some(dir) = cache_dir.clone() {
+                // Default the blob identity and per-instance name to the
+                // container/blob; either may be overridden so peers caching the
+                // same logical blob can share clean pages across processes.
+                let default_name =
+                    cache_file_name(&cli.container, cli.blob.as_deref().unwrap_or_default());
+                let blob_identity = cache_blob_identity
+                    .clone()
+                    .map(|s| sanitize_cache_component(&s))
+                    .unwrap_or_else(|| default_name.clone());
+                let name = cache_instance
+                    .clone()
+                    .map(|s| sanitize_cache_component(&s))
+                    .unwrap_or_else(|| default_name.clone());
+                if cache_share_pages && cache_instance.is_none() {
+                    warn!(
+                        "--cache-share-pages set without --cache-instance: peers sharing \
+                         this --cache-dir for the same blob will collide on one data file"
+                    );
+                }
                 info!(
                     cache_dir = %dir.display(),
                     cache_page_size,
                     cache_max_bytes,
+                    cache_share_pages,
+                    blob_identity = %blob_identity,
+                    name = %name,
                     "local-disk cache enabled"
                 );
                 let (cache, recovered_dirty) = FileCacheBackend::open(
                     backend,
                     FileCacheConfig {
                         dir,
-                        name: cache_file_name(
-                            &cli.container,
-                            cli.blob.as_deref().unwrap_or_default(),
-                        ),
+                        name,
                         page_size: cache_page_size,
                         max_bytes: cache_max_bytes,
+                        blob_identity,
+                        share_pages: cache_share_pages,
                     },
                     actual_size,
                 )
@@ -808,15 +860,22 @@ async fn acquire_coordination(
 /// fixed alphabet (alphanumerics plus `-` and `_`) keeps the cache files inside
 /// the chosen `--cache-dir` and prevents path traversal (e.g. `..`).
 fn cache_file_name(container: &str, blob: &str) -> String {
-    let mut name = String::with_capacity(container.len() + blob.len() + 1);
-    for ch in format!("{container}-{blob}").chars() {
+    sanitize_cache_component(&format!("{container}-{blob}"))
+}
+
+/// Sanitize a single string to the cache file-name alphabet (alphanumerics plus
+/// `-` and `_`), so an operator-supplied `--cache-instance` / blob identity
+/// stays inside `--cache-dir` and cannot traverse paths.
+fn sanitize_cache_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            name.push(ch);
+            out.push(ch);
         } else {
-            name.push('_');
+            out.push('_');
         }
     }
-    name
+    out
 }
 
 fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {

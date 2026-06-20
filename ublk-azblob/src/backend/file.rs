@@ -28,6 +28,7 @@
 //! forces a re-read from the inner backend, so those updates are not `fsync`ed.
 
 use super::cache_budget::CacheBudget;
+use super::cache_index::CacheIndex;
 use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
@@ -52,7 +53,10 @@ const HEADER_SIZE: u64 = 64;
 pub struct FileCacheConfig {
     /// Directory that holds the cache data and metadata files.
     pub dir: PathBuf,
-    /// Base file name (without extension) for the cache files.
+    /// Base file name (without extension) for the cache files.  Must be unique
+    /// per cache instance within `dir`; when [`share_pages`](Self::share_pages)
+    /// is set it is also the *owner* key peers use to locate this cache's data
+    /// file for cross-process page sharing.
     pub name: String,
     /// Size of each cache page in bytes (must be a non-zero multiple of 512).
     pub page_size: u64,
@@ -60,6 +64,17 @@ pub struct FileCacheConfig {
     /// all processes** using the same `dir` (see [`CacheBudget`]).  `0` means
     /// unlimited (no eviction), preserving the original grow-only behaviour.
     pub max_bytes: u64,
+    /// Identity of the backing blob this cache mirrors.  Caches in the same
+    /// `dir` that share a `blob_identity` may serve each other's clean pages
+    /// (cross-process page sharing); only used when
+    /// [`share_pages`](Self::share_pages) is set.  Typically the container/blob
+    /// (or golden-image) identity.
+    pub blob_identity: String,
+    /// Enable cross-process clean-page sharing via a shared `.cache-index`
+    /// (see [`CacheIndex`]).  `false` (default) preserves the original
+    /// behaviour with zero overhead — each cache only ever reads its own pages
+    /// and the blob.
+    pub share_pages: bool,
 }
 
 impl Default for FileCacheConfig {
@@ -69,6 +84,8 @@ impl Default for FileCacheConfig {
             name: "ublk-azblob-cache".to_string(),
             page_size: 1024 * 1024, // 1 MiB
             max_bytes: 0,           // unlimited
+            blob_identity: String::new(),
+            share_pages: false,
         }
     }
 }
@@ -158,6 +175,8 @@ pub struct FileCacheBackend {
     page_size: u64,
     /// Shared cross-process byte budget; `None` when unlimited.
     budget: Option<CacheBudget>,
+    /// Shared cross-process clean-page index; `None` when page sharing is off.
+    index: Option<CacheIndex>,
     state: Mutex<CacheState>,
 }
 
@@ -307,11 +326,31 @@ impl FileCacheBackend {
             lru,
         };
 
+        // Optional shared cross-process clean-page index.  When active, publish
+        // every page recovered as present **and clean** so peers caching the
+        // same blob can read it from our data file instead of the blob.
+        let index = if cfg.share_pages {
+            let idx = CacheIndex::open(&cfg.dir, &cfg.name, &cfg.blob_identity, cfg.page_size)
+                .context("open shared cache index")?;
+            for page_idx in 0..state.num_pages {
+                if bit_get(&state.present, page_idx) && !bit_get(&state.dirty, page_idx) {
+                    let offset = page_idx * cfg.page_size;
+                    let page_len = cfg.page_size.min(dev_size.saturating_sub(offset));
+                    idx.publish(page_idx, page_len)
+                        .context("publish recovered clean page")?;
+                }
+            }
+            Some(idx)
+        } else {
+            None
+        };
+
         Ok((
             Self {
                 inner,
                 page_size: cfg.page_size,
                 budget,
+                index,
                 state: Mutex::new(state),
             },
             recovered_dirty,
@@ -340,6 +379,9 @@ impl FileCacheBackend {
         state.lru.clear();
         if let Some(b) = &self.budget {
             b.reset(0).context("reset cache budget on reinit")?;
+        }
+        if let Some(idx) = &self.index {
+            idx.unpublish_all().context("clear cache index on reinit")?;
         }
         Ok(())
     }
@@ -405,6 +447,15 @@ impl FileCacheBackend {
             let offset = page_idx * self.page_size;
             let len = self.page_len(state, page_idx);
 
+            // Withdraw the page from the shared index *before* punching its hole
+            // so no peer can be mid-read of bytes we are about to deallocate
+            // (`read_peer_page` and `unpublish` are mutually exclusive under the
+            // index lock).
+            if let Some(idx) = &self.index {
+                idx.unpublish(page_idx)
+                    .with_context(|| format!("unpublish evicted page {page_idx}"))?;
+            }
+
             if len > 0 {
                 punch_hole(&state.data, offset, len)
                     .with_context(|| format!("punch hole for evicted page {page_idx}"))?;
@@ -461,8 +512,9 @@ impl FileCacheBackend {
     }
 
     /// Ensure page `page_idx` is fully present in the data file, loading it from
-    /// the inner backend if necessary.  Returns the page's valid length (the last
-    /// page may be shorter than `page_size`).
+    /// a peer cache (cross-process sharing) or the inner backend if necessary.
+    /// Returns the page's valid length (the last page may be shorter than
+    /// `page_size`).
     async fn ensure_page(&self, state: &mut CacheState, page_idx: u64) -> anyhow::Result<u64> {
         let offset = page_idx * self.page_size;
         let page_len = self.page_size.min(state.dev_size.saturating_sub(offset));
@@ -471,18 +523,25 @@ impl FileCacheBackend {
             return Ok(page_len);
         }
 
-        // Load existing content for this page from the inner backend.
-        let data = self
-            .inner
-            .read(offset, page_len)
-            .await
-            .with_context(|| format!("load page {page_idx} from inner backend"))?;
-        if data.len() as u64 != page_len {
-            bail!(
-                "inner backend returned {} bytes for page {page_idx} (expected {page_len})",
-                data.len()
-            );
-        }
+        // Prefer a live peer's clean copy of this page (copy-on-write: cheaper
+        // than a blob round-trip); fall back to the inner backend.
+        let data: Vec<u8> = match self.try_peer_page(state, page_idx, page_len)? {
+            Some(buf) => buf,
+            None => {
+                let data = self
+                    .inner
+                    .read(offset, page_len)
+                    .await
+                    .with_context(|| format!("load page {page_idx} from inner backend"))?;
+                if data.len() as u64 != page_len {
+                    bail!(
+                        "inner backend returned {} bytes for page {page_idx} (expected {page_len})",
+                        data.len()
+                    );
+                }
+                data.to_vec()
+            }
+        };
         state
             .data
             .write_all_at(&data, offset)
@@ -505,6 +564,30 @@ impl FileCacheBackend {
         self.account_present(state, page_idx, true)?;
 
         Ok(page_len)
+    }
+
+    /// Try to fetch a full page from a live peer's cache via the shared index.
+    /// Returns the page bytes on a sharing hit, `None` when no peer has it (so
+    /// the caller fetches from the blob).  A no-op when sharing is disabled.
+    fn try_peer_page(
+        &self,
+        _state: &CacheState,
+        page_idx: u64,
+        page_len: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(idx) = &self.index else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; page_len as usize];
+        if idx
+            .read_peer_page(page_idx, &mut buf)
+            .with_context(|| format!("read peer copy of page {page_idx}"))?
+        {
+            trace!(page_idx, len = page_len, "served page from peer cache");
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Flush a single dirty page to the inner backend and clear its dirty bit.
@@ -542,6 +625,12 @@ impl FileCacheBackend {
         if self.budget.is_some() {
             state.lru.touch(page_idx, true);
         }
+        // A freshly-flushed page is clean and resident, so peers caching the
+        // same blob may now read it from our data file (cross-process sharing).
+        if let Some(idx) = &self.index {
+            idx.publish(page_idx, page_len)
+                .with_context(|| format!("publish flushed page {page_idx}"))?;
+        }
         Ok(())
     }
 
@@ -555,6 +644,15 @@ impl FileCacheBackend {
         page_offset: u64,
         payload: &[u8],
     ) -> anyhow::Result<()> {
+        // Copy-on-write: withdraw this page from the shared index *before*
+        // mutating it so peers stop reading our (now diverging) copy and never
+        // observe a torn write.  The page becomes private to us until it is
+        // flushed clean again (and re-published).
+        if let Some(idx) = &self.index {
+            idx.unpublish(page_idx)
+                .with_context(|| format!("unpublish dirtied page {page_idx}"))?;
+        }
+
         let offset = page_idx * self.page_size + page_offset;
         state
             .data
@@ -679,21 +777,34 @@ impl BlobBackend for FileCacheBackend {
                     state.lru.touch(page_idx, clean);
                 }
             } else {
-                // Cache miss: read straight from the inner backend.  Pure reads do
-                // not populate the cache to avoid evicting/overwriting dirty data
-                // and to keep read latency predictable.
-                let data = self
-                    .inner
-                    .read(abs_offset, chunk_len)
-                    .await
-                    .with_context(|| format!("read offset={abs_offset} len={chunk_len}"))?;
-                if data.len() as u64 != chunk_len {
-                    bail!(
-                        "inner backend returned {} bytes for read offset={abs_offset} len={chunk_len}",
-                        data.len()
-                    );
+                // Cache miss.  When cross-process sharing is on, try to serve
+                // the page from a live peer's local copy (a peer that already
+                // fetched this blob page) before falling back to the inner
+                // backend.  Pure reads do not populate our own cache — keeping
+                // read latency predictable and the byte budget single-owner:
+                // the page stays resident only in the peer that owns it.
+                let page_len = self.page_len(&state, page_idx);
+                let mut served = false;
+                if let Some(page) = self.try_peer_page(&state, page_idx, page_len)? {
+                    let start = page_offset as usize;
+                    result[pos as usize..(pos + chunk_len) as usize]
+                        .copy_from_slice(&page[start..start + chunk_len as usize]);
+                    served = true;
                 }
-                result[pos as usize..(pos + chunk_len) as usize].copy_from_slice(&data);
+                if !served {
+                    let data = self
+                        .inner
+                        .read(abs_offset, chunk_len)
+                        .await
+                        .with_context(|| format!("read offset={abs_offset} len={chunk_len}"))?;
+                    if data.len() as u64 != chunk_len {
+                        bail!(
+                            "inner backend returned {} bytes for read offset={abs_offset} len={chunk_len}",
+                            data.len()
+                        );
+                    }
+                    result[pos as usize..(pos + chunk_len) as usize].copy_from_slice(&data);
+                }
             }
 
             pos += chunk_len;
@@ -804,6 +915,9 @@ impl BlobBackend for FileCacheBackend {
         state.lru.clear();
         if let Some(b) = &self.budget {
             b.reset(0).context("reset cache budget on delete")?;
+        }
+        if let Some(idx) = &self.index {
+            idx.unpublish_all().context("clear cache index on delete")?;
         }
         drop(state);
         self.inner.delete().await
@@ -943,6 +1057,33 @@ mod tests {
                 name: "test".to_string(),
                 page_size,
                 max_bytes,
+                blob_identity: String::new(),
+                share_pages: false,
+            },
+            dev_size,
+        )
+        .unwrap()
+    }
+
+    /// Open a sharing-enabled cache with a given owner `name` and shared
+    /// `blob_identity` so two instances in one dir can serve each other's pages.
+    fn open_shared(
+        inner: Arc<dyn BlobBackend>,
+        dir: &Path,
+        name: &str,
+        blob_identity: &str,
+        page_size: u64,
+        dev_size: u64,
+    ) -> (FileCacheBackend, u64) {
+        FileCacheBackend::open(
+            inner,
+            FileCacheConfig {
+                dir: dir.to_path_buf(),
+                name: name.to_string(),
+                page_size,
+                max_bytes: 0,
+                blob_identity: blob_identity.to_string(),
+                share_pages: true,
             },
             dev_size,
         )
@@ -1355,6 +1496,165 @@ mod tests {
             "data file kept {} blocks (baseline {baseline}); holes were not punched",
             blocks()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `BlobBackend` decorator that counts how many `read` calls reach it, so
+    /// cross-process sharing tests can assert a peer served a page with **zero**
+    /// blob reads.
+    struct CountingBackend {
+        inner: Arc<dyn BlobBackend>,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingBackend {
+        fn new(inner: Arc<dyn BlobBackend>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                reads: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+        fn read_count(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for CountingBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_serves_clean_page_without_blob_read() {
+        // Stage 2: process A populates the cache for a blob; process B (a second
+        // cache of the *same* blob_identity in the same dir) serves a read of
+        // that page from A's data file without ever reading the blob.
+        let dir = tmp_dir("share-read");
+        let page = 4096u64;
+        let dev = 2 * page;
+
+        // A's own blob, seeded so page 0 has known content.
+        let a_inner = Arc::new(MemBackend::new(dev).unwrap());
+        a_inner
+            .write(0, Bytes::from(vec![0xA7; page as usize]))
+            .await
+            .unwrap();
+        let (a, _) = open_shared(a_inner.clone(), &dir, "volA", "golden", page, dev);
+
+        // A writes page 0 and flushes → it is now clean, resident and published.
+        a.write(0, Bytes::from(vec![0xA7; page as usize]))
+            .await
+            .unwrap();
+        a.flush().await.unwrap();
+
+        // B caches the same golden identity but its own (empty) blob whose reads
+        // we count.  Its data file starts empty (page 0 absent).
+        let b_blob = Arc::new(MemBackend::new(dev).unwrap());
+        let b_counting = CountingBackend::new(b_blob);
+        let (b, _) = open_shared(b_counting.clone(), &dir, "volB", "golden", page, dev);
+
+        // B reads page 0: it is absent locally but A published it, so B copies
+        // A's bytes — with zero reads against B's own blob.
+        let got = b.read(0, page).await.unwrap();
+        assert_eq!(got, Bytes::from(vec![0xA7; page as usize]));
+        assert_eq!(b_counting.read_count(), 0, "page should come from peer, not blob");
+
+        // A page no peer published still falls back to the blob (one read).
+        let _ = b.read(page, page).await.unwrap();
+        assert_eq!(b_counting.read_count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cow_writers_do_not_corrupt_each_other() {
+        // Stage 3: two caches share a blob_identity.  When each writes the same
+        // page, it copies-on-write into its own data file and withdraws the page
+        // from the index, so neither observes the other's bytes.
+        let dir = tmp_dir("share-cow");
+        let page = 4096u64;
+        let dev = page;
+
+        let a_inner = Arc::new(MemBackend::new(dev).unwrap());
+        let (a, _) = open_shared(a_inner.clone(), &dir, "cowA", "golden", page, dev);
+        let b_inner = Arc::new(MemBackend::new(dev).unwrap());
+        let (b, _) = open_shared(b_inner.clone(), &dir, "cowB", "golden", page, dev);
+
+        // A writes and flushes page 0, publishing it.
+        a.write(0, Bytes::from(vec![0x11; page as usize]))
+            .await
+            .unwrap();
+        a.flush().await.unwrap();
+
+        // B writes its own value to page 0.  Because B dirties the page it must
+        // withdraw any inherited copy and keep its write private to its file.
+        b.write(0, Bytes::from(vec![0x22; page as usize]))
+            .await
+            .unwrap();
+        b.flush().await.unwrap();
+
+        // Each reads back its own value; neither is corrupted by the other.
+        assert_eq!(a.read(0, page).await.unwrap(), Bytes::from(vec![0x11; page as usize]));
+        assert_eq!(b.read(0, page).await.unwrap(), Bytes::from(vec![0x22; page as usize]));
+        // And each backing blob holds its own value.
+        assert_eq!(a_inner.read(0, page).await.unwrap(), Bytes::from(vec![0x11; page as usize]));
+        assert_eq!(b_inner.read(0, page).await.unwrap(), Bytes::from(vec![0x22; page as usize]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dirtying_page_withdraws_it_from_peers() {
+        // A page a peer is serving must stop being shared the moment its owner
+        // dirties it (so peers never read a diverging/torn copy).
+        let dir = tmp_dir("share-withdraw");
+        let page = 4096u64;
+        let dev = page;
+
+        let a_inner = Arc::new(MemBackend::new(dev).unwrap());
+        let (a, _) = open_shared(a_inner.clone(), &dir, "wA", "golden", page, dev);
+        a.write(0, Bytes::from(vec![0x55; page as usize]))
+            .await
+            .unwrap();
+        a.flush().await.unwrap();
+
+        // B can see A's published page.
+        let b_blob = Arc::new(MemBackend::new(dev).unwrap());
+        let b_counting = CountingBackend::new(b_blob);
+        let (b, _) = open_shared(b_counting.clone(), &dir, "wB", "golden", page, dev);
+        assert_eq!(b.read(0, page).await.unwrap(), Bytes::from(vec![0x55; page as usize]));
+        assert_eq!(b_counting.read_count(), 0);
+
+        // A dirties the page (without flushing) → it is withdrawn from sharing.
+        a.write(0, Bytes::from(vec![0x66; page as usize]))
+            .await
+            .unwrap();
+
+        // B now misses the peer and falls back to its own blob.
+        let _ = b.read(0, page).await.unwrap();
+        assert_eq!(b_counting.read_count(), 1, "withdrawn page must hit the blob");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -206,7 +206,7 @@ fn prune_dead(entries: &mut Vec<Entry>, self_pid: u32) {
 /// `0`/`EPERM` mean the process exists; `ESRCH` means it does not.  Any other
 /// error is treated conservatively as "alive" so we never reclaim a peer's
 /// budget by mistake.
-fn pid_alive(pid: u32) -> bool {
+pub(super) fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -266,13 +266,16 @@ fn write_entries(file: &mut File, entries: &[Entry]) -> Result<()> {
     Ok(())
 }
 
-/// RAII wrapper around an exclusive advisory `flock` on the state file.
-struct FlockGuard {
+/// RAII wrapper around an exclusive advisory `flock` on a state file.
+///
+/// Shared with [`super::cache_index`] so both the byte budget and the page
+/// index serialize cross-process access the same way.
+pub(super) struct FlockGuard {
     fd: libc::c_int,
 }
 
 impl FlockGuard {
-    fn acquire(file: &File) -> Result<Self> {
+    pub(super) fn acquire(file: &File) -> Result<Self> {
         let fd = file.as_raw_fd();
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
         if ret != 0 {
