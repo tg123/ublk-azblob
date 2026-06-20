@@ -149,11 +149,11 @@ impl NodeService {
             }
         }
 
-        // Read-only / snapshot: when the StorageClass selects a blob snapshot
-        // (`snapshot: "<timestamp>"`) or opts the volume read-only
-        // (`readOnly: "true"`), the child `run` process exposes the device
-        // read-only and rejects every write/discard.  A snapshot is immutable
-        // and therefore always implies read-only.
+        // Read-only / snapshot: when the volume targets a blob snapshot (only
+        // via a `templateBlobUrl` with `?snapshot=<timestamp>`) or opts the
+        // volume read-only (`readOnly: "true"`), the child `run` process exposes
+        // the device read-only and rejects every write/discard. A snapshot is
+        // immutable and therefore always implies read-only.
         if let Some(snapshot) = get("snapshot").filter(|s| !s.is_empty()) {
             env.push(("AZURE_STORAGE_SNAPSHOT".to_string(), snapshot));
         }

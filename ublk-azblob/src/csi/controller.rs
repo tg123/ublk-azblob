@@ -45,7 +45,11 @@ const PARAM_COORDINATION: &str = "coordination";
 const PARAM_LEASE_NAMESPACE: &str = "leaseNamespace";
 const PARAM_RECOVERY_TIMEOUT_SECS: &str = "recoveryTimeoutSecs";
 const PARAM_LEASE_DURATION_SECS: &str = "leaseDurationSecs";
-/// Parameter key targeting an immutable blob snapshot (read-only).
+/// Volume-context key carrying a blob snapshot timestamp.
+///
+/// This is **not** a StorageClass parameter — it is only populated from a
+/// `templateBlobUrl` that includes a `?snapshot=<timestamp>` query, and read by
+/// the node to mount the immutable snapshot read-only.
 const PARAM_SNAPSHOT: &str = "snapshot";
 /// Parameter key exposing the volume read-only (no writes reach the blob).
 const PARAM_READ_ONLY: &str = "readOnly";
@@ -206,14 +210,11 @@ impl Controller for ControllerService {
         ));
 
         // `templateBlobUrl` provisions the volume from a golden-image blob.
-        // Read-only when the StorageClass opts in (`readOnly`/`snapshot`) — such
-        // volumes mount the template directly with no copy, no lock and no lease;
-        // read-write volumes copy the template into the per-PVC blob.
-        let read_only_mode = is_truthy(req.parameters.get(PARAM_READ_ONLY))
-            || req
-                .parameters
-                .get(PARAM_SNAPSHOT)
-                .is_some_and(|s| !s.is_empty());
+        // Read-only when the StorageClass opts in via `readOnly`, or when the
+        // template URL targets a snapshot — such volumes mount the template
+        // directly with no copy, no lock and no lease; read-write volumes copy
+        // the template into the per-PVC blob.
+        let read_only_mode = is_truthy(req.parameters.get(PARAM_READ_ONLY));
 
         // Tracks state when provisioning from a template (see below).
         let mut size = size;
@@ -345,7 +346,6 @@ impl Controller for ControllerService {
             PARAM_LEASE_NAMESPACE,
             PARAM_RECOVERY_TIMEOUT_SECS,
             PARAM_LEASE_DURATION_SECS,
-            PARAM_SNAPSHOT,
             PARAM_READ_ONLY,
         ] {
             if let Some(v) = req.parameters.get(key) {

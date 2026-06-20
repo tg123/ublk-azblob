@@ -42,9 +42,6 @@ parameters:
   {{- if .fsType }}
   fsType: {{ .fsType }}
   {{- end }}
-  {{- if .snapshot }}
-  snapshot: {{ .snapshot | quote }}
-  {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}
   {{- end }}
@@ -87,9 +84,6 @@ parameters:
   {{- end }}
   {{- if .fsType }}
   fsType: {{ .fsType }}
-  {{- end }}
-  {{- if .snapshot }}
-  snapshot: {{ .snapshot | quote }}
   {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}
