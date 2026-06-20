@@ -381,18 +381,22 @@ pub fn fsck(dev: &str, fs_type: &str, mode: FsckMode) -> anyhow::Result<()> {
     // `fsck` returns a bitmask: bit 0 (1) = errors corrected, bit 1 (2) = reboot
     // recommended, bit 2 (4) = errors left uncorrected, bit 3 (8) = operational
     // error, etc. Treat 0 (clean) and 1 (corrected) as success.
-    let code = output.status.code().unwrap_or(-1);
-    if code == 0 || code == 1 {
-        if code == 1 {
-            warn!(dev, "fsck corrected filesystem errors");
+    if let Some(code) = output.status.code() {
+        if code == 0 || code == 1 {
+            if code == 1 {
+                warn!(dev, "fsck corrected filesystem errors");
+            }
+            return Ok(());
         }
-        return Ok(());
     }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     bail!(
-        "`fsck {}` failed (exit {code}): {} {}",
+        "`fsck {}` failed ({}): {} {}",
         args.join(" "),
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim()
+        output.status,
+        stdout.trim(),
+        stderr.trim()
     );
 }
 
