@@ -32,6 +32,11 @@
 //! `run --read-only`: it asserts the kernel marks `/dev/ublkbN` read-only,
 //! verifies the data is still readable, and confirms a write to the read-only
 //! mount fails without mutating the backing blob.
+//!
+//! A third test, [`mount_fsck`](fn.mount_fsck.html), exercises the CSI `fsck`
+//! option: after a clean unmount it runs `fsck -a` (preen) and `fsck -f -y`
+//! (force) — the exact argv the node plugin builds — against the raw device and
+//! confirms both report a clean/corrected filesystem with the data intact.
 #![cfg(feature = "ublk")]
 
 use std::fs;
@@ -103,6 +108,23 @@ fn run(cmd: &str, args: &[&str]) {
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn `{cmd}`: {e}"));
     assert!(status.success(), "`{cmd}` failed with {status}");
+}
+
+/// Run `fsck` and assert a clean/corrected exit (the same bitmask the CSI node
+/// plugin's `mount::fsck` accepts): 0 (clean) or 1 (errors corrected) pass;
+/// anything else fails the test. Mirrors the exact argv the CSI driver builds.
+fn run_fsck(args: &[&str]) {
+    log(&format!("$ fsck {}", args.join(" ")));
+    let status = Command::new("fsck")
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn `fsck`: {e}"));
+    let code = status.code().unwrap_or(-1);
+    assert!(
+        code == 0 || code == 1,
+        "`fsck {}` returned {code} (expected 0=clean or 1=corrected)",
+        args.join(" ")
+    );
 }
 
 /// Common Azure environment passed to the `ublk-azblob` child process.
@@ -604,4 +626,93 @@ fn graceful_shutdown_flush() {
     let _ = fs::remove_dir_all(&work);
 
     log("graceful shutdown e2e PASSED ✓");
+}
+
+/// e2e for the CSI `fsck` option over the kernel ublk path.
+///
+/// The CSI node plugin can run `fsck` on an already-formatted, writable volume
+/// before mounting it (StorageClass parameter `fsck: preen|force`). This test
+/// exercises that exact path against a real ublk device backed by an Azure Page
+/// Blob, running the same `fsck` argv the driver builds (`mount::fsck`):
+///
+/// Cycle:
+///   1. provision the device writable, make an ext4 filesystem, write random
+///      files, record their checksums, flush and tear the device down
+///   2. bring the device back up over the *same* blob and run, against the raw
+///      `/dev/ublkbN`:
+///        * `fsck -t ext4 -a`     (preen mode) — must report clean/corrected
+///        * `fsck -t ext4 -f -y`  (force mode) — must report clean/corrected
+///
+///      proving fsck behaves on this device type and reports a clean filesystem
+///   3. mount and verify every file's checksum still matches (fsck preserved the
+///      data), then tear the device down
+#[test]
+fn mount_fsck() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_fsck: requires root and a loaded ublk_drv \
+             (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let spec = DeviceSpec {
+        // Distinct, high device id and blob so this test never collides with the
+        // other mount tests (40/41/42/43) or the k8s CSI e2e's low ids.
+        dev_id: "44".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-fsck", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: None,
+        disable_auto_flush: false,
+    };
+    let dev = spec.dev_path();
+    let mnt = tempdir("ublk-azblob-fsck-mnt");
+
+    // ── Phase 1: provision the device writable and seed known files ───────────
+    let child = start_device(&spec, true);
+    log(&format!("mkfs.ext4 on {dev}"));
+    run("mkfs.ext4", &["-q", "-F", "-E", "nodiscard", &dev]);
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+
+    log(&format!("writing {NUM_FILES} random files"));
+    let mut checksums: Vec<(String, String)> = Vec::with_capacity(NUM_FILES);
+    for i in 1..=NUM_FILES {
+        let name = format!("random_{i}.bin");
+        let path = mnt.join(&name);
+        let len = 1024 * (1 + (i * 509) % 4096);
+        write_random_file(&path, len);
+        checksums.push((name, sha256_file(&path)));
+    }
+
+    log("sync + SIGUSR1 to force flush to the page blob");
+    run("sync", &[]);
+    signal(&child, libc::SIGUSR1);
+    sleep(Duration::from_secs(2));
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // ── Phase 2: reopen writable and fsck the raw device (preen, then force) ──
+    let child = start_device(&spec, false);
+
+    // The filesystem was cleanly unmounted, so both passes must report it clean
+    // (exit 0) or corrected (exit 1). These are exactly the argv the CSI node
+    // plugin builds for `fsck: preen` and `fsck: force`.
+    log(&format!("fsck -t ext4 -a {dev} (preen)"));
+    run_fsck(&["-t", "ext4", "-a", &dev]);
+    log(&format!("fsck -t ext4 -f -y {dev} (force)"));
+    run_fsck(&["-t", "ext4", "-f", "-y", &dev]);
+
+    // ── Phase 3: mount and verify fsck left the data intact ───────────────────
+    log(&format!("mounting {dev} at {} after fsck", mnt.display()));
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+    log("verifying checksums after fsck");
+    for (name, expected) in &checksums {
+        let actual = sha256_file(&mnt.join(name));
+        assert_eq!(&actual, expected, "checksum mismatch for {name} after fsck");
+    }
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    let _ = fs::remove_dir_all(&mnt);
+    log("mount fsck e2e PASSED ✓");
 }
