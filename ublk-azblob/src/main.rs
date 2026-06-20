@@ -63,6 +63,14 @@ struct Cli {
     #[arg(long, env = "AZURE_STORAGE_BLOB")]
     blob: Option<String>,
 
+    /// Target a specific blob *snapshot* (the `x-ms-snapshot` timestamp).
+    ///
+    /// A snapshot is an immutable, point-in-time view of the blob.  Selecting a
+    /// snapshot implies read-only mode: the device is exposed read-only and all
+    /// write/discard operations are rejected.
+    #[arg(long, env = "AZURE_STORAGE_SNAPSHOT")]
+    snapshot: Option<String>,
+
     /// Azure Storage service endpoint URL.
     ///
     /// Defaults to `https://<account>.blob.core.windows.net/`.
@@ -76,6 +84,14 @@ struct Cli {
     /// Azurite and local dev.
     #[arg(long, env = "AZURE_STORAGE_KEY", conflicts_with_all = ["msi", "msi_client_id", "msi_object_id", "msi_resource_id", "workload_identity"])]
     account_key: Option<String>,
+
+    /// Shared Access Signature (SAS) token authenticating the blob.
+    ///
+    /// The query string of a SAS URL (with or without a leading `?`). Used to
+    /// read a `templateBlobUrl` golden image that carries its own SAS (possibly
+    /// in a different storage account). Takes precedence over other auth modes.
+    #[arg(long, env = "AZURE_STORAGE_SAS")]
+    sas_token: Option<String>,
 
     /// Enable system-assigned Managed Identity.
     #[arg(long, env = "AZURE_USE_MSI")]
@@ -141,6 +157,21 @@ enum Command {
         #[arg(long)]
         create: bool,
 
+        /// Expose the device read-only.
+        ///
+        /// The ublk device / NBD export is advertised read-only and every
+        /// write, discard, and write-zeroes request is rejected.  Implied when
+        /// `--snapshot` is set.
+        #[arg(
+            long,
+            env = "UBLK_READ_ONLY",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
+        read_only: bool,
+
         /// Number of io_uring queues.
         #[arg(long, default_value = "1")]
         nr_queues: u16,
@@ -173,7 +204,14 @@ enum Command {
         /// ("blob lock") and a Kubernetes `coordination.k8s.io` Lease ("cluster
         /// lease") before mounting, so at most one node serves the volume.
         /// Requires the `coordination` build feature.
-        #[arg(long, env = "UBLK_COORDINATION")]
+        #[arg(
+            long,
+            env = "UBLK_COORDINATION",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
         coordination: bool,
 
         /// Recovery timeout (seconds): how long a holder's cluster lease may go
@@ -289,6 +327,26 @@ enum Command {
         create: bool,
     },
 
+    /// Copy a golden-image *template* blob into the configured target blob
+    /// (`--container` / `--blob`), then exit.
+    ///
+    /// This is the same server-side-style streamed copy the CSI controller uses
+    /// to provision a read-write volume from `templateBlobUrl`. The target blob
+    /// is created sized to hold the template (and at least `--size`). Requires
+    /// the `csi` build feature.
+    #[cfg(feature = "csi")]
+    Copy {
+        /// Full Azure blob URL of the template (may carry a SAS and/or
+        /// `snapshot=` query).
+        #[arg(long, env = "TEMPLATE_BLOB_URL")]
+        template_url: String,
+
+        /// Minimum target size in bytes (the target is grown to the template
+        /// size when larger). Rounded up to 512.
+        #[arg(long, default_value = "0")]
+        size: u64,
+    },
+
     /// Run the Kubernetes CSI driver (Container Storage Interface gRPC server).
     ///
     /// Lets a Kubernetes PersistentVolumeClaim be backed by an Azure Page Blob
@@ -359,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             size,
             create,
+            read_only,
             nr_queues,
             queue_depth,
             id,
@@ -377,8 +436,18 @@ async fn main() -> anyhow::Result<()> {
             flush_io_timeout_secs,
             ref nbd,
         } => {
+            // A snapshot is immutable, so selecting one forces read-only mode.
+            let read_only = read_only || cli.snapshot.is_some();
+            if read_only {
+                info!("read-only mode: writes, discards, and creation are disabled");
+            }
             let azure_backend = build_azure_backend(&cli, &endpoint)?;
             if create {
+                if read_only {
+                    anyhow::bail!(
+                        "--create cannot be used in read-only mode (--read-only/--snapshot)"
+                    );
+                }
                 info!(size, "creating page blob");
                 azure_backend
                     .create(size)
@@ -455,8 +524,13 @@ async fn main() -> anyhow::Result<()> {
                 backend
             };
 
-            // Wrap with write-back buffer if page_size > 0.
-            let backend: Arc<dyn BlobBackend> = if page_size > 0 {
+            // Wrap with write-back buffer if page_size > 0.  The buffer only
+            // serves to batch writes, so it is skipped entirely in read-only
+            // mode where no writes ever reach the backend.
+            let backend: Arc<dyn BlobBackend> = if read_only {
+                info!("write-through mode (read-only)");
+                backend
+            } else if page_size > 0 {
                 info!(
                     page_size,
                     max_dirty_pages,
@@ -487,10 +561,11 @@ async fn main() -> anyhow::Result<()> {
                 nr_queues,
                 queue_depth,
                 id,
+                read_only,
             };
             let result = if let Some(addr) = nbd {
                 info!(addr = %addr, "starting NBD compatibility server");
-                nbd_target::run_nbd_target(backend, addr, actual_size)
+                nbd_target::run_nbd_target(backend, addr, actual_size, read_only)
                     .await
                     .context("nbd target")
             } else {
@@ -534,6 +609,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             .context("benchmark")?;
+        }
+
+        #[cfg(feature = "csi")]
+        Command::Copy {
+            ref template_url,
+            size,
+        } => {
+            run_template_copy(&cli, &endpoint, template_url, size).await?;
         }
 
         #[cfg(feature = "csi")]
@@ -591,7 +674,71 @@ fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<AzurePag
     let auth = build_auth(cli)?;
     let container_client = auth::build_container_client(endpoint, &cli.container, &auth)
         .context("build container client")?;
-    Ok(Arc::new(AzurePageBlobBackend::new(container_client, blob)))
+    let backend = AzurePageBlobBackend::new(container_client, blob);
+    let backend = match &cli.snapshot {
+        Some(snapshot) => {
+            info!(snapshot = %snapshot, "targeting blob snapshot (read-only)");
+            backend.with_snapshot(snapshot.clone())
+        }
+        None => backend,
+    };
+    Ok(Arc::new(backend))
+}
+
+/// Copy a `templateBlobUrl` golden image into the configured target blob
+/// (`--container` / `--blob`) using a server-side copy. Mirrors what the CSI
+/// controller does when provisioning a read-write volume from a template.
+#[cfg(feature = "csi")]
+async fn run_template_copy(
+    cli: &Cli,
+    endpoint: &str,
+    template_url: &str,
+    min_size: u64,
+) -> anyhow::Result<()> {
+    use backend::azure::AzurePageBlobBackend;
+    use csi::{copy_template, parse_blob_url, round_up_512};
+
+    let tmpl = parse_blob_url(template_url).context("parse --template-url")?;
+
+    // Authenticate the source with its own SAS when present; otherwise reuse the
+    // CLI credentials (the template must then be reachable with them). The source
+    // service URL is taken from the template URL's own host so a non-SAS template
+    // in a different account/host than `--endpoint` is read from the right place.
+    let src_service_url = format!("{}/", tmpl.service_url.trim_end_matches('/'));
+    let src_auth = match &tmpl.sas {
+        Some(sas) => AuthConfig::Sas {
+            sas_token: sas.clone(),
+        },
+        None => build_auth(cli)?,
+    };
+    let src_container = auth::build_container_client(&src_service_url, &tmpl.container, &src_auth)
+        .context("build template container client")?;
+    let mut source = AzurePageBlobBackend::new(src_container, tmpl.blob.clone());
+    if let Some(snapshot) = &tmpl.snapshot {
+        source = source.with_snapshot(snapshot.clone());
+    }
+    let source_size = source.size().await.context("stat template blob")?;
+    let size = round_up_512(source_size.max(min_size));
+
+    let dest = build_azure_backend(cli, endpoint)?;
+    let dest_auth = build_auth(cli)?;
+    info!(
+        template = %template_url, source_size, target_size = size,
+        container = %cli.container, "server-side copy of template into target blob"
+    );
+    dest.create(size).await.context("create target blob")?;
+    copy_template(
+        dest.as_ref(),
+        &source,
+        template_url,
+        tmpl.sas.is_some(),
+        &dest_auth,
+        source_size,
+    )
+    .await
+    .context("copy template blob")?;
+    info!("template copy complete");
+    Ok(())
 }
 
 /// Best-effort node hostname for the CSI `--node-id` default.
@@ -714,6 +861,12 @@ fn cache_file_name(container: &str, blob: &str) -> String {
 }
 
 fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
+    if let Some(sas) = &cli.sas_token {
+        return Ok(AuthConfig::Sas {
+            sas_token: sas.clone(),
+        });
+    }
+
     if let Some(key) = &cli.account_key {
         return Ok(AuthConfig::SharedKey {
             account_name: cli.account.clone(),

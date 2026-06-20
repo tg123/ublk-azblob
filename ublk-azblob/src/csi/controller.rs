@@ -25,7 +25,11 @@ use super::proto::{
     ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesRequest, ListVolumesResponse,
     ValidateVolumeCapabilitiesRequest, ValidateVolumeCapabilitiesResponse, Volume,
 };
-use super::{build_backend, make_volume_id, parse_volume_id, round_up_512, DriverConfig};
+use super::{
+    build_backend, build_backend_concrete, build_template_backend, copy_template, make_volume_id,
+    make_volume_id_ro, parse_blob_url, parse_volume_id, round_up_512, DriverConfig,
+};
+use crate::backend::BlobBackend;
 
 /// Parameter key (StorageClass `parameters`) for storage account.
 const PARAM_STORAGE_ACCOUNT: &str = "storageAccount";
@@ -41,6 +45,24 @@ const PARAM_COORDINATION: &str = "coordination";
 const PARAM_LEASE_NAMESPACE: &str = "leaseNamespace";
 const PARAM_RECOVERY_TIMEOUT_SECS: &str = "recoveryTimeoutSecs";
 const PARAM_LEASE_DURATION_SECS: &str = "leaseDurationSecs";
+/// Volume-context key carrying a blob snapshot timestamp.
+///
+/// This is **not** a StorageClass parameter — it is only populated from a
+/// `templateBlobUrl` that includes a `?snapshot=<timestamp>` query, and read by
+/// the node to mount the immutable snapshot read-only.
+const PARAM_SNAPSHOT: &str = "snapshot";
+/// Parameter key exposing the volume read-only (no writes reach the blob).
+const PARAM_READ_ONLY: &str = "readOnly";
+/// Parameter key: a full Azure blob URL to use as a golden-image template.
+/// Read-only/snapshot volumes mount it directly (no lock/lease); read-write
+/// volumes copy it into a fresh per-PVC blob and skip formatting.
+const PARAM_TEMPLATE_BLOB_URL: &str = "templateBlobUrl";
+
+/// Parse a `"true"`/`"1"`/`"yes"` style flag value.
+fn is_truthy(v: Option<&String>) -> bool {
+    v.map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
 
 /// Default blob path template
 const DEFAULT_BLOB_PATH_TEMPLATE: &str = "ublk-azblob-disk/${pv.name}";
@@ -187,14 +209,108 @@ impl Controller for ControllerService {
             pv_name,
         ));
 
+        // `templateBlobUrl` provisions the volume from a golden-image blob.
+        // Read-only when the StorageClass opts in via `readOnly`, or when the
+        // template URL targets a snapshot — such volumes mount the template
+        // directly with no copy, no lock and no lease; read-write volumes copy
+        // the template into the per-PVC blob.
+        let read_only_mode = is_truthy(req.parameters.get(PARAM_READ_ONLY));
+
+        // Tracks state when provisioning from a template (see below).
+        let mut size = size;
+        let mut already_created = false;
+        let mut from_template = false;
+
+        if let Some(template_url) = req
+            .parameters
+            .get(PARAM_TEMPLATE_BLOB_URL)
+            .filter(|s| !s.is_empty())
+        {
+            let tmpl = parse_blob_url(template_url)
+                .map_err(|e| Status::invalid_argument(format!("templateBlobUrl: {e:#}")))?;
+            let read_only_mode = read_only_mode || tmpl.snapshot.is_some();
+            let source = build_template_backend(&self.config, &tmpl, &req.secrets)
+                .map_err(|e| Status::internal(format!("build template backend: {e:#}")))?;
+            let source_size = source
+                .size()
+                .await
+                .map_err(|e| Status::internal(format!("stat template blob: {e:#}")))?;
+
+            if read_only_mode {
+                // Mount the shared golden-image blob directly, read-only, with no
+                // copy and (crucially) no coordination — many PVCs may mount it.
+                info!(
+                    template = %template_url, source_size,
+                    "CreateVolume: read-only template mount (no copy, no lease)"
+                );
+                let mut volume_context: HashMap<String, String> = HashMap::new();
+                volume_context.insert("account".to_string(), tmpl.account.clone());
+                volume_context.insert("container".to_string(), tmpl.container.clone());
+                volume_context.insert("blob".to_string(), tmpl.blob.clone());
+                volume_context.insert(
+                    "endpoint".to_string(),
+                    format!("{}/", tmpl.service_url.trim_end_matches('/')),
+                );
+                volume_context.insert("size".to_string(), source_size.to_string());
+                volume_context.insert(PARAM_READ_ONLY.to_string(), "true".to_string());
+                if let Some(snapshot) = &tmpl.snapshot {
+                    volume_context.insert(PARAM_SNAPSHOT.to_string(), snapshot.clone());
+                }
+                if let Some(sas) = &tmpl.sas {
+                    volume_context.insert("sasToken".to_string(), sas.clone());
+                }
+                if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
+                    volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
+                }
+                return Ok(Response::new(CreateVolumeResponse {
+                    volume: Some(Volume {
+                        capacity_bytes: source_size as i64,
+                        volume_id: make_volume_id_ro(&tmpl.account, &tmpl.container, &tmpl.blob),
+                        volume_context,
+                        content_source: None,
+                        accessible_topology: Vec::new(),
+                    }),
+                }));
+            }
+
+            // Read-write: copy the template into a fresh per-PVC blob, sized to
+            // hold the image (and at least the requested size), then skip mkfs on
+            // the node since the copy is already formatted.
+            size = round_up_512(source_size.max(size));
+            info!(
+                template = %template_url, source_size, size,
+                "CreateVolume: server-side copy of template into per-PVC blob"
+            );
+            let (dest, dest_auth) =
+                build_backend_concrete(&self.config, &account, &container, &blob, &req.secrets)
+                    .map_err(|e| Status::internal(format!("build backend: {e:#}")))?;
+            dest.create(size)
+                .await
+                .map_err(|e| Status::internal(format!("create page blob: {e:#}")))?;
+            copy_template(
+                &dest,
+                source.as_ref(),
+                template_url,
+                tmpl.sas.is_some(),
+                &dest_auth,
+                source_size,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("copy template blob: {e:#}")))?;
+            already_created = true;
+            from_template = true;
+        }
+
         info!(name = %req.name, account = %account, container = %container, size, "CreateVolume");
 
         let backend = build_backend(&self.config, &account, &container, &blob, &req.secrets)
             .map_err(|e| Status::internal(format!("build backend: {e:#}")))?;
-        backend.create(size).await.map_err(|e| {
-            error!(error = %format!("{e:#}"), "create page blob failed");
-            Status::internal(format!("create page blob: {e:#}"))
-        })?;
+        if !already_created {
+            backend.create(size).await.map_err(|e| {
+                error!(error = %format!("{e:#}"), "create page blob failed");
+                Status::internal(format!("create page blob: {e:#}"))
+            })?;
+        }
 
         // Hand the node everything it needs to attach the device later.
         let mut volume_context: HashMap<String, String> = HashMap::new();
@@ -213,6 +329,11 @@ impl Controller for ControllerService {
 
         volume_context.insert("endpoint".to_string(), endpoint);
         volume_context.insert("size".to_string(), size.to_string());
+        if from_template {
+            // The copied blob already carries a filesystem; tell the node to skip
+            // mkfs so it preserves the template's contents.
+            volume_context.insert("fromTemplate".to_string(), "true".to_string());
+        }
         if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
             volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
         }
@@ -225,6 +346,7 @@ impl Controller for ControllerService {
             PARAM_LEASE_NAMESPACE,
             PARAM_RECOVERY_TIMEOUT_SECS,
             PARAM_LEASE_DURATION_SECS,
+            PARAM_READ_ONLY,
         ] {
             if let Some(v) = req.parameters.get(key) {
                 volume_context.insert(key.to_string(), v.clone());
@@ -251,10 +373,19 @@ impl Controller for ControllerService {
         if req.volume_id.is_empty() {
             return Err(Status::invalid_argument("volume id is required"));
         }
-        let (account, container, blob) = parse_volume_id(&req.volume_id)
+        let (read_only, account, container, blob) = parse_volume_id(&req.volume_id)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
 
-        info!(volume_id = %req.volume_id, account = %account, "DeleteVolume");
+        info!(volume_id = %req.volume_id, account = %account, read_only, "DeleteVolume");
+
+        // Read-only template volumes (`templateBlobUrl` + readOnly/snapshot) point
+        // many PVCs at one shared golden-image blob, so deleting it when a single
+        // PVC is removed would destroy the template for everyone. Treat delete as
+        // a no-op for these — the template's lifecycle is managed out of band.
+        if read_only {
+            info!(volume_id = %req.volume_id, "read-only template volume; skipping blob deletion");
+            return Ok(Response::new(DeleteVolumeResponse {}));
+        }
 
         // The storage account is recovered from the volume id (encoded at create
         // time), so a per-volume `storageAccount` is targeted correctly rather
