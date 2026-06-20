@@ -179,9 +179,17 @@ impl CacheIndex {
             };
             use std::os::unix::fs::FileExt as _;
             let offset = page_idx * self.page_size;
-            file.read_exact_at(buf, offset)
-                .with_context(|| format!("read peer page {page_idx} from {}", path.display()))?;
-            Ok(true)
+            match file.read_exact_at(buf, offset) {
+                Ok(()) => Ok(true),
+                // The peer's page is shorter than advertised (truncated, or the
+                // blocks were reclaimed by an external hole-punch). Treat it as
+                // "peer cannot supply this page" and fall back to the blob rather
+                // than failing the read with stale/invalid bytes.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+                Err(e) => Err(e).with_context(|| {
+                    format!("read peer page {page_idx} from {}", path.display())
+                }),
+            }
         })?
     }
 

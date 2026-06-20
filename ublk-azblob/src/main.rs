@@ -32,7 +32,7 @@ use backend::{
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -515,9 +515,11 @@ async fn main() -> anyhow::Result<()> {
                     .map(|s| sanitize_cache_component(&s))
                     .unwrap_or_else(|| default_name.clone());
                 if cache_share_pages && cache_instance.is_none() {
-                    warn!(
-                        "--cache-share-pages set without --cache-instance: peers sharing \
-                         this --cache-dir for the same blob will collide on one data file"
+                    anyhow::bail!(
+                        "--cache-share-pages requires --cache-instance (or \
+                         UBLK_CACHE_INSTANCE): peers sharing this --cache-dir for the \
+                         same blob must each own a distinct data file, otherwise they \
+                         collide on one `.dat` and corrupt each other"
                     );
                 }
                 info!(
