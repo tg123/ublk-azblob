@@ -354,7 +354,10 @@ fn mount_roundtrip_file_cache_budget() {
         // 44 avoids mount_read_only's 42 and graceful_shutdown's 43.
         dev_id: "44".to_string(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
-        blob: format!("{}-fcache-budget", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        blob: format!(
+            "{}-fcache-budget",
+            env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)
+        ),
         cache_dir: Some(cache_dir.clone()),
         // 8 MiB budget while the test writes well over that (up to ~4 MiB per
         // file across NUM_FILES files), so eviction is exercised.

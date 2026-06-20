@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd as _;
+use std::path::Path;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 use tracing::{info, trace, warn};
@@ -177,6 +178,11 @@ pub struct FileCacheBackend {
     budget: Option<CacheBudget>,
     /// Shared cross-process clean-page index; `None` when page sharing is off.
     index: Option<CacheIndex>,
+    /// Whether the cache dir's filesystem supports `FALLOC_FL_PUNCH_HOLE`.
+    /// Eviction reclaims disk by punching holes; on a filesystem that lacks it
+    /// (NFS, some overlay / virtio-fs) we degrade to grow-only instead of
+    /// failing live writes (see [`FileCacheBackend::open`]).
+    eviction_supported: bool,
     state: Mutex<CacheState>,
 }
 
@@ -345,12 +351,34 @@ impl FileCacheBackend {
             None
         };
 
+        // Eviction reclaims disk by punching holes in the data file. Probe
+        // support once (only matters when a budget is set); if the cache dir's
+        // filesystem lacks `FALLOC_FL_PUNCH_HOLE` (NFS, some overlay/virtio-fs),
+        // degrade to grow-only rather than turning the first over-budget write
+        // into a fatal I/O error.
+        let eviction_supported = if budget.is_some() {
+            let ok = probe_punch_hole(&cfg.dir);
+            if !ok {
+                warn!(
+                    dir = %cfg.dir.display(),
+                    "cache filesystem does not support FALLOC_FL_PUNCH_HOLE; \
+                     disabling eviction (cache grows without reclaiming disk and \
+                     the byte budget is not enforced)"
+                );
+            }
+            ok
+        } else {
+            // No budget → eviction never runs, so support is irrelevant.
+            true
+        };
+
         Ok((
             Self {
                 inner,
                 page_size: cfg.page_size,
                 budget,
                 index,
+                eviction_supported,
                 state: Mutex::new(state),
             },
             recovered_dirty,
@@ -438,6 +466,12 @@ impl FileCacheBackend {
         let Some(budget) = &self.budget else {
             return Ok(());
         };
+        if !self.eviction_supported {
+            // Grow-only: this filesystem can't reclaim disk via hole-punching, so
+            // we keep all pages rather than failing the live write (warned once at
+            // open). The byte budget is effectively unenforced.
+            return Ok(());
+        }
 
         let mut evicted = 0u64;
         while over > 0 {
@@ -457,8 +491,20 @@ impl FileCacheBackend {
             }
 
             if len > 0 {
-                punch_hole(&state.data, offset, len)
-                    .with_context(|| format!("punch hole for evicted page {page_idx}"))?;
+                if let Err(err) = punch_hole(&state.data, offset, len) {
+                    // Couldn't reclaim this page's disk (e.g. a transient
+                    // fallocate failure on an otherwise-supported FS). Restore it
+                    // to a consistent state — back into the LRU and re-published —
+                    // and stop evicting rather than failing the live write or
+                    // leaving the LRU/budget out of sync. We may briefly run over
+                    // budget until the next eviction pass.
+                    warn!(page_idx, %err, "punch hole failed; skipping eviction this pass");
+                    state.lru.touch(page_idx, true);
+                    if let Some(idx) = &self.index {
+                        let _ = idx.publish(page_idx, len);
+                    }
+                    break;
+                }
             }
             // Clear the present bit and persist it.  A clean bit needs no fsync:
             // if the cleared bit is lost on crash the worst case is a redundant
@@ -723,6 +769,27 @@ fn punch_hole(file: &File, offset: u64, len: u64) -> anyhow::Result<()> {
         return Err(std::io::Error::last_os_error()).context("fallocate punch hole");
     }
     Ok(())
+}
+
+/// Probe whether `dir`'s filesystem supports `FALLOC_FL_PUNCH_HOLE` by punching a
+/// hole in a throwaway temp file. Returns `false` on `EOPNOTSUPP` (or any other
+/// failure), in which case eviction is disabled and the cache runs grow-only.
+fn probe_punch_hole(dir: &Path) -> bool {
+    let path = dir.join(format!(".punch-probe.{}", std::process::id()));
+    let ok = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .and_then(|f| {
+            f.set_len(4096)?;
+            // 4096 is a safe, alignment-agnostic probe length.
+            punch_hole(&f, 0, 4096).map_err(std::io::Error::other)
+        })
+        .is_ok();
+    let _ = std::fs::remove_file(&path);
+    ok
 }
 
 #[async_trait]
@@ -1402,9 +1469,18 @@ mod tests {
 
         // They all flush correctly (no data lost to eviction).
         b.flush().await.unwrap();
-        assert_eq!(inner.read(0, 1024).await.unwrap(), Bytes::from(vec![0xB0; 1024]));
-        assert_eq!(inner.read(1024, 1024).await.unwrap(), Bytes::from(vec![0xB1; 1024]));
-        assert_eq!(inner.read(2048, 1024).await.unwrap(), Bytes::from(vec![0xB2; 1024]));
+        assert_eq!(
+            inner.read(0, 1024).await.unwrap(),
+            Bytes::from(vec![0xB0; 1024])
+        );
+        assert_eq!(
+            inner.read(1024, 1024).await.unwrap(),
+            Bytes::from(vec![0xB1; 1024])
+        );
+        assert_eq!(
+            inner.read(2048, 1024).await.unwrap(),
+            Bytes::from(vec![0xB2; 1024])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1446,8 +1522,14 @@ mod tests {
 
         // Both pages read back their correct values: page 1 from the resident
         // cache, page 0 reloaded from the blob after its eviction.
-        assert_eq!(b.read(4096, 4096).await.unwrap(), Bytes::from(vec![0xD1; 4096]));
-        assert_eq!(b.read(0, 4096).await.unwrap(), Bytes::from(vec![0xD0; 4096]));
+        assert_eq!(
+            b.read(4096, 4096).await.unwrap(),
+            Bytes::from(vec![0xD1; 4096])
+        );
+        assert_eq!(
+            b.read(0, 4096).await.unwrap(),
+            Bytes::from(vec![0xD0; 4096])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1578,7 +1660,11 @@ mod tests {
         // A's bytes — with zero reads against B's own blob.
         let got = b.read(0, page).await.unwrap();
         assert_eq!(got, Bytes::from(vec![0xA7; page as usize]));
-        assert_eq!(b_counting.read_count(), 0, "page should come from peer, not blob");
+        assert_eq!(
+            b_counting.read_count(),
+            0,
+            "page should come from peer, not blob"
+        );
 
         // A page no peer published still falls back to the blob (one read).
         let _ = b.read(page, page).await.unwrap();
@@ -1615,11 +1701,23 @@ mod tests {
         b.flush().await.unwrap();
 
         // Each reads back its own value; neither is corrupted by the other.
-        assert_eq!(a.read(0, page).await.unwrap(), Bytes::from(vec![0x11; page as usize]));
-        assert_eq!(b.read(0, page).await.unwrap(), Bytes::from(vec![0x22; page as usize]));
+        assert_eq!(
+            a.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x11; page as usize])
+        );
+        assert_eq!(
+            b.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x22; page as usize])
+        );
         // And each backing blob holds its own value.
-        assert_eq!(a_inner.read(0, page).await.unwrap(), Bytes::from(vec![0x11; page as usize]));
-        assert_eq!(b_inner.read(0, page).await.unwrap(), Bytes::from(vec![0x22; page as usize]));
+        assert_eq!(
+            a_inner.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x11; page as usize])
+        );
+        assert_eq!(
+            b_inner.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x22; page as usize])
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1643,7 +1741,10 @@ mod tests {
         let b_blob = Arc::new(MemBackend::new(dev).unwrap());
         let b_counting = CountingBackend::new(b_blob);
         let (b, _) = open_shared(b_counting.clone(), &dir, "wB", "golden", page, dev);
-        assert_eq!(b.read(0, page).await.unwrap(), Bytes::from(vec![0x55; page as usize]));
+        assert_eq!(
+            b.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x55; page as usize])
+        );
         assert_eq!(b_counting.read_count(), 0);
 
         // A dirties the page (without flushing) → it is withdrawn from sharing.
@@ -1653,7 +1754,11 @@ mod tests {
 
         // B now misses the peer and falls back to its own blob.
         let _ = b.read(0, page).await.unwrap();
-        assert_eq!(b_counting.read_count(), 1, "withdrawn page must hit the blob");
+        assert_eq!(
+            b_counting.read_count(),
+            1,
+            "withdrawn page must hit the blob"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1690,7 +1795,7 @@ mod tests {
         lru.touch(0, true); // clean
         lru.touch(1, false); // dirty
         lru.touch(2, true); // clean
-        // Page 1 is present but never an eviction candidate.
+                            // Page 1 is present but never an eviction candidate.
         assert!(lru.contains(1));
         assert_eq!(lru.pop_lru(None), Some(0));
         assert_eq!(lru.pop_lru(None), Some(2));

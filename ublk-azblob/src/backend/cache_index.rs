@@ -82,12 +82,7 @@ impl CacheIndex {
     /// `<dir>/<owner>.dat`) and must be unique per instance within the
     /// directory; `blob_identity` is the shared key under which clean pages are
     /// published and looked up.  Neither may contain a tab or newline.
-    pub fn open(
-        dir: &Path,
-        owner: &str,
-        blob_identity: &str,
-        page_size: u64,
-    ) -> Result<Self> {
+    pub fn open(dir: &Path, owner: &str, blob_identity: &str, page_size: u64) -> Result<Self> {
         for (what, s) in [("owner", owner), ("blob_identity", blob_identity)] {
             if s.contains('\t') || s.contains('\n') {
                 anyhow::bail!("cache index {what} must not contain tab or newline: {s:?}");
@@ -121,7 +116,14 @@ impl CacheIndex {
     /// caching the same `blob_identity` may read it instead of the blob.
     pub fn publish(&self, page_idx: u64, len: u64) -> Result<()> {
         self.with_locked(|entries| {
-            upsert(entries, &self.blob_identity, page_idx, &self.owner, self.pid, len);
+            upsert(
+                entries,
+                &self.blob_identity,
+                page_idx,
+                &self.owner,
+                self.pid,
+                len,
+            );
         })
     }
 
@@ -172,9 +174,8 @@ impl CacheIndex {
                 // A missing peer file is not fatal: fall back to the blob.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("open peer cache file {}", path.display())
-                    })
+                    return Err(e)
+                        .with_context(|| format!("open peer cache file {}", path.display()))
                 }
             };
             use std::os::unix::fs::FileExt as _;
@@ -186,9 +187,8 @@ impl CacheIndex {
                 // "peer cannot supply this page" and fall back to the blob rather
                 // than failing the read with stale/invalid bytes.
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-                Err(e) => Err(e).with_context(|| {
-                    format!("read peer page {page_idx} from {}", path.display())
-                }),
+                Err(e) => Err(e)
+                    .with_context(|| format!("read peer page {page_idx} from {}", path.display())),
             }
         })?
     }
@@ -426,11 +426,7 @@ mod tests {
         let dir = tmp_dir("deadpeer");
         let page = 4096u64;
         // Hand-write an entry for a definitely-dead pid.
-        std::fs::write(
-            dir.join(STATE_FILE),
-            "blob\t0\tghost\t999999999\t4096\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join(STATE_FILE), "blob\t0\tghost\t999999999\t4096\n").unwrap();
         let b = CacheIndex::open(&dir, "b", "blob", page).unwrap();
         let mut buf = vec![0u8; page as usize];
         // The ghost is dead, so its page is pruned and not served.

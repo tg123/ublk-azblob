@@ -177,7 +177,9 @@ impl Drop for CacheBudget {
 
 /// Sum of all owners' resident byte counts.
 fn total(entries: &[Entry]) -> u64 {
-    entries.iter().fold(0u64, |acc, e| acc.saturating_add(e.bytes))
+    entries
+        .iter()
+        .fold(0u64, |acc, e| acc.saturating_add(e.bytes))
 }
 
 /// Find this owner's entry, inserting a fresh zero-balance one if absent.
@@ -235,8 +237,7 @@ fn read_entries(file: &mut File) -> Result<Vec<Entry>> {
             continue;
         }
         let mut parts = line.split('\t');
-        let (Some(owner), Some(pid), Some(bytes)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(owner), Some(pid), Some(bytes)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
