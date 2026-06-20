@@ -14,6 +14,7 @@
 
 mod auth;
 mod backend;
+#[cfg(feature = "csi")]
 mod bloburl;
 #[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 mod coordination;
@@ -70,15 +71,6 @@ struct Cli {
     /// local cache safe to reuse: there is no separate `--read-only` flag.
     #[arg(long, env = "AZURE_STORAGE_SNAPSHOT")]
     snapshot: Option<String>,
-
-    /// Load the blob target from a full blob URL in this file (testing).
-    ///
-    /// The file's first line is parsed as an Azure blob URL; its account,
-    /// container, blob, `?snapshot=` and SAS override the corresponding flags.
-    /// Convenient for pointing `run`/`test` at a golden-image snapshot URL, e.g.
-    /// `--blob-url-file /tmp/s`.
-    #[arg(long, env = "AZURE_BLOB_URL_FILE")]
-    blob_url_file: Option<String>,
 
     /// Azure Storage service endpoint URL.
     ///
@@ -431,37 +423,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let mut cli = Cli::parse();
-
-    // Testing convenience: load the full blob target from a URL file (e.g.
-    // `/tmp/s` holding a golden-image snapshot URL). Its components override the
-    // individual flags before anything else is derived from them.
-    if let Some(path) = cli.blob_url_file.clone() {
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read --blob-url-file {path}"))?;
-        let url = raw.lines().next().unwrap_or("").trim().to_string();
-        if url.is_empty() {
-            anyhow::bail!("--blob-url-file {path} is empty");
-        }
-        let r = bloburl::parse_blob_url(&url).context("parse --blob-url-file URL")?;
-        cli.account = r.account;
-        cli.container = r.container;
-        cli.blob = Some(r.blob);
-        cli.endpoint = Some(format!("{}/", r.service_url.trim_end_matches('/')));
-        if r.snapshot.is_some() {
-            cli.snapshot = r.snapshot;
-        }
-        if r.sas.is_some() {
-            cli.sas_token = r.sas;
-        }
-        info!(
-            file = %path,
-            account = %cli.account,
-            container = %cli.container,
-            snapshot = ?cli.snapshot,
-            "loaded blob target from --blob-url-file"
-        );
-    }
+    let cli = Cli::parse();
 
     // The endpoint *template* may contain a `%s` placeholder for the account
     // (subdomain-style, e.g. `http://%s.blob.localhost:10000/`). The CSI driver
