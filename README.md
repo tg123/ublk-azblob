@@ -242,10 +242,35 @@ scenarios where many per-volume processes share one node's cache disk: a single
 noisy volume cannot fill the disk at the expense of its neighbours. The shared
 total is crash-safe — entries for processes that died are pruned automatically.
 
-> **Scope (stage 1):** each process only ever evicts *its own* clean pages, so it
+> **Eviction scope:** each process only ever evicts *its own* clean pages, so it
 > never touches a peer's cache files. The budget therefore bounds the aggregate
 > resident set of the *active* processes; a fully idle peer keeps its pages until
-> it next does I/O or exits. Cross-process page sharing is a future stage.
+> it next does I/O or exits.
+
+### Cross-process page sharing (`--cache-share-pages`)
+
+With `--cache-share-pages` (or `UBLK_CACHE_SHARE_PAGES=1`), processes that cache
+the **same blob** in the same `--cache-dir` serve each other's clean pages off
+local disk instead of re-fetching from Azure. A shared `.cache-index` file
+(locked with `flock`, alongside `.cache-budget`) maps each cached `(blob, page)`
+to the owning process's `.dat` file and offset. On a read miss, a process first
+consults the index: if a live peer holds the page clean, it copies the bytes from
+the peer's file (read-only) and only falls back to the blob if the page is
+absent, stale, or the peer has died. Shared reads are served directly and are
+**not** double-counted against the budget — every resident page still has exactly
+one on-disk owner.
+
+Writes use **copy-on-write** to preserve the single-writer-per-file invariant:
+before mutating a page that a peer owns, the writer withdraws it from the index
+and writes into its *own* `.dat`, marking it dirty locally. Dirty pages are never
+evicted and never served cross-process; once flushed and clean again the new
+owner re-publishes the page so subsequent peer reads resolve to it. As with the
+budget, a crashed peer's index entries are pruned automatically (`kill(pid, 0)`),
+and losing the index only forgoes sharing — correctness falls back to the blob.
+
+In CSI deployments enable this through the Helm chart's `node.cache.sharePages`;
+the node plugin assigns each volume a unique cache instance so concurrent mounts
+of the same blob transparently share clean pages.
 
 ---
 

@@ -66,6 +66,7 @@ impl NodeService {
         &self,
         ctx: &HashMap<String, String>,
         secrets: &HashMap<String, String>,
+        volume_id: &str,
     ) -> anyhow::Result<Vec<(String, String)>> {
         let get = |k: &str| ctx.get(k).cloned();
         let account = get("account").unwrap_or_else(|| self.config.account.clone());
@@ -169,6 +170,19 @@ impl NodeService {
         if let Some(sas) = get("sasToken").filter(|s| !s.is_empty()) {
             env.push(("AZURE_STORAGE_SAS".to_string(), sas));
         }
+
+        // Cross-process page sharing: when the node enables a shared cache with
+        // `UBLK_CACHE_SHARE_PAGES` (inherited from the DaemonSet), give each
+        // volume a stable, unique cache instance name (its volume id) so peers
+        // caching the same blob get distinct data files and can share each
+        // other's clean pages off local disk.  The blob identity defaults to the
+        // container/blob, so concurrent mounts of the *same* blob share pages.
+        let share_pages = std::env::var("UBLK_CACHE_SHARE_PAGES")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        if share_pages {
+            env.push(("UBLK_CACHE_INSTANCE".to_string(), volume_id.to_string()));
+        }
         Ok(env)
     }
 }
@@ -230,7 +244,7 @@ impl Node for NodeService {
             .unwrap_or(0);
 
         let env = self
-            .child_env(&req.volume_context, &req.secrets)
+            .child_env(&req.volume_context, &req.secrets, &req.volume_id)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
 
         let volume_id = req.volume_id.clone();

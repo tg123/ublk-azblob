@@ -134,6 +134,13 @@ spec:
               value: {{ .Values.node.cache.maxBytes | quote }}
             - name: UBLK_CACHE_PAGE_SIZE
               value: {{ .Values.node.cache.pageSize | quote }}
+            {{- if .Values.node.cache.sharePages }}
+            # Cross-process clean-page sharing: volumes caching the same blob
+            # serve each other's clean pages off the shared directory. The node
+            # plugin assigns each volume a unique UBLK_CACHE_INSTANCE.
+            - name: UBLK_CACHE_SHARE_PAGES
+              value: "1"
+            {{- end }}
             {{- end }}
             {{- with .Values.node.env }}
             # Additional environment variables

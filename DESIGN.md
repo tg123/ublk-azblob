@@ -241,8 +241,21 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
   hole-punching the sparse `.dat` file) once the budget is exceeded; dirty pages
   are never evicted. The budget is shared across every process using the same
   `--cache-dir` via a `flock`-coordinated, crash-safe `.cache-budget` file, so a
-  single noisy volume cannot fill a shared CSI node's cache disk. Stage 1 scope:
-  each process evicts only its own clean pages (no cross-process page sharing yet).
+  single noisy volume cannot fill a shared CSI node's cache disk. Each process
+  evicts only its own clean pages and never touches a peer's cache files.
+- ✅ Cross-process clean-page sharing (`--cache-share-pages`): processes caching
+  the same blob in one `--cache-dir` serve each other's clean pages off local
+  disk via a `flock`-coordinated `.cache-index` (sibling to `.cache-budget`)
+  mapping `(blob, page) → owner .dat + offset`. A read miss consults the index
+  and copies a live peer's clean page read-only instead of fetching the blob,
+  falling back to the blob if the page is absent/stale/peer-dead. Shared reads
+  are not double-counted (one on-disk owner per resident page), and dead-PID
+  entries are pruned exactly as in the budget file.
+- ✅ Copy-on-write writes: before mutating a page a peer owns, the writer
+  withdraws it from the index and writes into its **own** `.dat`, marking it
+  dirty locally — preserving the single-writer-per-file invariant. Dirty pages
+  are never evicted and never served cross-process; once flushed clean the new
+  owner re-publishes the page so later peer reads resolve to it.
 - ✅ Persistent local-disk cache (`FileCacheBackend`), composable into a
   multi-level cache (memory → local disk → blob) with crash-recoverable dirty
   pages that are flushed to the blob on restart

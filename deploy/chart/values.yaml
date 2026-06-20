@@ -68,6 +68,15 @@ node:
     # Cache page size in bytes (the local-disk cache granularity).
     pageSize: 1048576
 
+    # Cross-process clean-page sharing. When true, volumes on the node that
+    # cache the *same* blob serve each other's already-fetched clean pages
+    # directly off the shared cache directory (via a flock-coordinated
+    # `.cache-index`), avoiding redundant blob reads. Each volume still writes
+    # only its own data file (copy-on-write on a dirtying write), so a write to
+    # one volume never affects another. The node plugin gives each volume a
+    # unique, stable cache instance (its volume id) automatically.
+    sharePages: false
+
   resources:
     limits:
       cpu: 500m
