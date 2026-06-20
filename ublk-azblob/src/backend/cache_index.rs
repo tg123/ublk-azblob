@@ -108,14 +108,14 @@ impl CacheIndex {
         };
 
         // Prune any dead peers' leftovers on startup.
-        index.with_locked(|_| {})?;
+        index.with_locked_mut(|_| {})?;
         Ok(index)
     }
 
     /// Advertise that this owner holds `page_idx` clean on local disk, so peers
     /// caching the same `blob_identity` may read it instead of the blob.
     pub fn publish(&self, page_idx: u64, len: u64) -> Result<()> {
-        self.with_locked(|entries| {
+        self.with_locked_mut(|entries| {
             upsert(
                 entries,
                 &self.blob_identity,
@@ -130,7 +130,7 @@ impl CacheIndex {
     /// Withdraw `page_idx` from the index (the page was evicted or is being
     /// dirtied by this owner and may no longer be read by peers).
     pub fn unpublish(&self, page_idx: u64) -> Result<()> {
-        self.with_locked(|entries| {
+        self.with_locked_mut(|entries| {
             entries.retain(|e| {
                 !(e.owner == self.owner
                     && e.pid == self.pid
@@ -142,7 +142,7 @@ impl CacheIndex {
 
     /// Withdraw every page this owner has published (used on reinit/delete).
     pub fn unpublish_all(&self) -> Result<()> {
-        self.with_locked(|entries| {
+        self.with_locked_mut(|entries| {
             entries.retain(|e| !(e.owner == self.owner && e.pid == self.pid));
         })
     }
@@ -155,7 +155,7 @@ impl CacheIndex {
     /// peer's file is read while the index lock is held so the peer cannot
     /// concurrently evict or overwrite the page (both of which take the lock).
     pub fn read_peer_page(&self, page_idx: u64, buf: &mut [u8]) -> Result<bool> {
-        self.with_locked(|entries| -> Result<bool> {
+        self.with_locked_read(|entries| -> Result<bool> {
             // Find a live peer (a different owner/pid) that published this page
             // with a matching length.  Self entries are skipped: a present page
             // is served from our own file, never via the index.
@@ -196,7 +196,7 @@ impl CacheIndex {
     /// Number of entries this owner currently has published (test helper).
     #[cfg(test)]
     pub fn published_count(&self) -> Result<usize> {
-        self.with_locked(|entries| {
+        self.with_locked_read(|entries| {
             entries
                 .iter()
                 .filter(|e| e.owner == self.owner && e.pid == self.pid)
@@ -206,8 +206,9 @@ impl CacheIndex {
 
     /// Run `f` against the parsed entries while holding both the in-process
     /// mutex and an exclusive `flock`, pruning dead owners first and persisting
-    /// the (possibly mutated) entries afterwards.
-    fn with_locked<R>(&self, f: impl FnOnce(&mut Vec<Entry>) -> R) -> Result<R> {
+    /// the (possibly mutated) entries afterwards. For **mutating** operations
+    /// (publish/unpublish).
+    fn with_locked_mut<R>(&self, f: impl FnOnce(&mut Vec<Entry>) -> R) -> Result<R> {
         let mut file = self.file.lock().expect("cache index mutex poisoned");
         let _guard = FlockGuard::acquire(&file)?;
 
@@ -216,6 +217,20 @@ impl CacheIndex {
         let result = f(&mut entries);
         write_entries(&mut file, &entries)?;
         Ok(result)
+    }
+
+    /// Like [`with_locked_mut`] but for **read-only** operations
+    /// (`read_peer_page`, `published_count`): the index file is **not** rewritten,
+    /// which matters because it holds one line per published *page* and these run
+    /// on every cross-process cache miss. Dead-owner pruning is applied in-memory
+    /// only; it is persisted by the next mutating operation.
+    fn with_locked_read<R>(&self, f: impl FnOnce(&[Entry]) -> R) -> Result<R> {
+        let mut file = self.file.lock().expect("cache index mutex poisoned");
+        let _guard = FlockGuard::acquire(&file)?;
+
+        let mut entries = read_entries(&mut file)?;
+        prune_dead(&mut entries, self.pid);
+        Ok(f(&entries))
     }
 }
 

@@ -30,14 +30,15 @@
 //! purely advisory — losing it (or any individual update) only loses accounting
 //! accuracy, never correctness of the cached data itself.
 //!
-//! # Scope (Stage 1)
+//! # Scope
 //!
-//! A process only ever evicts *its own* clean pages: it never mutates another
-//! process's cache files, so each backend stays the sole authority over its own
-//! `present` bitmap and data file.  The shared total therefore bounds the
-//! aggregate footprint of *active* processes; a fully idle peer keeps its
-//! resident pages until it does I/O again or exits.  Sharing actual cached page
-//! data between processes is a later stage.
+//! A process only ever evicts *its own* clean pages via this budget: it never
+//! mutates another process's cache files, so each backend stays the sole
+//! authority over its own `present` bitmap and data file.  The shared total
+//! therefore bounds the aggregate footprint of *active* processes; a fully idle
+//! peer keeps its resident pages until it does I/O again or exits.  Sharing the
+//! actual cached page data between processes (so a read miss can be served from a
+//! peer's data file) is layered on top by [`super::cache_index::CacheIndex`].
 
 use anyhow::{Context as _, Result};
 use std::fs::{File, OpenOptions};
