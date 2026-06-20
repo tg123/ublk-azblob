@@ -8,10 +8,23 @@ on:
 
 jobs:
   e2e:
-    name: e2e
+    name: e2e (${{ matrix.arch }})
+    # Run the full mount + NBD + k8s PVC suite on both architectures. All images
+    # the harness pulls (azurite, rancher/k3s, rust) are multi-arch, so the same
+    # compose stack runs natively on the arm64 runner.
+    #
     # The ublk_drv kernel module Oopses on the ubuntu-24.04 azure kernel
-    # (actions/runner-images#14175); 22.04 ships a stable 6.x kernel.
-    runs-on: ubuntu-22.04
+    # (actions/runner-images#14175); 22.04 ships a stable 6.x kernel, so pin both
+    # legs to 22.04 (amd64 + native arm64).
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
     permissions:
       contents: read
     steps:
@@ -41,8 +54,8 @@ jobs:
           file: tests/e2e/Dockerfile
           tags: ublk-azblob-e2e-runner:local
           load: true
-          cache-from: type=gha,scope=e2e-runner
-          cache-to: type=gha,mode=max,scope=e2e-runner
+          cache-from: type=gha,scope=e2e-runner-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=e2e-runner-${{ matrix.arch }}
 
       - name: Cache cargo registry and target
         # The compile happens inside the runner container, which writes
@@ -55,11 +68,15 @@ jobs:
             .cargo-home/registry/cache
             .cargo-home/git/db
             target
-          key: e2e-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: e2e-cargo-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            e2e-cargo-${{ runner.os }}-
+            e2e-cargo-${{ runner.os }}-${{ matrix.arch }}-
 
       - name: Run e2e (compile once, mount + NBD + k8s PVC)
+        # The `runner` service builds with --features ublk and runs the ublk
+        # mount/remount/checksum tests (including the read-only mount test),
+        # the NBD roundtrip + read-only tests, and the k8s PVC tests; Azurite is
+        # brought up as its dependency.
         run: |
           KUBELET_DIR=/tmp/ublk-e2e/kubelet \
           docker compose -f tests/e2e/docker-compose.yml up \

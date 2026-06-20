@@ -3245,6 +3245,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "futures",
  "hmac-sha256",
  "k8s-openapi",
  "kube",

@@ -340,6 +340,14 @@ pub fn mount(
     let mut options: Vec<String> = mount_flags.to_vec();
     if readonly {
         options.push("ro".into());
+        // The backing block device is hardware read-only, so the kernel cannot
+        // replay an ext journal. For an unclean ext2/3/4 image (e.g. a
+        // crash-consistent snapshot) a plain `-o ro` mount fails with "write
+        // access unavailable, cannot proceed (try mounting with noload)". Add
+        // `noload` so journal recovery is skipped and the image mounts read-only.
+        if matches!(fs_type, "ext2" | "ext3" | "ext4") && !options.iter().any(|o| o == "noload") {
+            options.push("noload".into());
+        }
     }
     if !options.is_empty() {
         args.push("-o".into());
