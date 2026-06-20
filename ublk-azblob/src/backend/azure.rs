@@ -13,11 +13,13 @@ use azure_storage_blob::{
     models::{
         BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
         BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
-        PageBlobClientCreateOptions, PageBlobClientUploadPagesOptions,
+        PageBlobClientCreateOptions, PageBlobClientUploadPagesFromUrlOptions,
+        PageBlobClientUploadPagesOptions,
     },
-    BlobContainerClient,
+    BlobClient, BlobContainerClient,
 };
 use bytes::Bytes;
+use futures::stream::{StreamExt as _, TryStreamExt as _};
 use std::sync::RwLock;
 use tracing::{error, instrument, trace};
 
@@ -31,6 +33,10 @@ use tracing::{error, instrument, trace};
 pub struct AzurePageBlobBackend {
     container: BlobContainerClient,
     blob_name: String,
+    /// Optional snapshot ID (`x-ms-snapshot` timestamp).  When set, every
+    /// operation targets the immutable snapshot rather than the live blob, so
+    /// the backend is effectively read-only.
+    snapshot: Option<String>,
     /// Blob-lease id (`x-ms-lease-id`) to attach to every mutating request.
     ///
     /// When cluster coordination is enabled the holder takes an exclusive lease
@@ -52,7 +58,30 @@ impl AzurePageBlobBackend {
         Self {
             container,
             blob_name: blob_name.into(),
+            snapshot: None,
             lease_id: RwLock::new(None),
+        }
+    }
+
+    /// Target a specific blob snapshot.
+    ///
+    /// A blob snapshot is an immutable, read-only view of the blob taken at a
+    /// point in time; mutating operations against it are rejected by Azure.
+    /// Callers should pair this with a read-only mount.
+    pub fn with_snapshot(mut self, snapshot: impl Into<String>) -> Self {
+        self.snapshot = Some(snapshot.into());
+        self
+    }
+
+    /// Build a `BlobClient` for the target blob, scoped to the configured
+    /// snapshot when one is set.
+    fn blob_client(&self) -> anyhow::Result<BlobClient> {
+        let client = self.container.blob_client(&self.blob_name);
+        match &self.snapshot {
+            Some(snapshot) => client
+                .with_snapshot(snapshot)
+                .with_context(|| format!("target snapshot '{snapshot}'")),
+            None => Ok(client),
         }
     }
 
@@ -69,12 +98,105 @@ impl AzurePageBlobBackend {
     fn lease_id(&self) -> Option<String> {
         self.lease_id.read().unwrap().clone()
     }
+
+    /// Server-side copy `total_size` bytes from `source_url` into this page blob
+    /// using concurrent `Put Page From URL` requests.
+    ///
+    /// This is a true server-to-server copy: the storage service fetches each
+    /// 4 MiB range directly from `source_url` — no bytes flow through this
+    /// process. The destination blob must already exist (call [`BlobBackend::create`]
+    /// first) and be at least `total_size`.
+    ///
+    /// `copy_source_auth` is the driver credential used to authorize the service
+    /// to read a source in a *different* storage account (`Some` for Entra auth);
+    /// pass `None` when the source carries its own SAS or lives in the same
+    /// account. The Entra token is re-minted per ~8 GiB batch so a copy whose
+    /// wall-clock time exceeds the (~1 h) token lifetime does not start failing
+    /// late chunks with HTTP 403. Ranges are 512-aligned; sparse source ranges
+    /// copy as zeros.
+    pub async fn copy_pages_from_url(
+        &self,
+        source_url: &str,
+        total_size: u64,
+        copy_source_auth: Option<crate::auth::AuthConfig>,
+    ) -> anyhow::Result<()> {
+        if !total_size.is_multiple_of(512) {
+            bail!("copy size {total_size} is not 512-byte aligned");
+        }
+        /// Concurrent in-flight copy requests (override with `UBLK_COPY_CONCURRENCY`).
+        const DEFAULT_CONCURRENCY: usize = 32;
+        /// Re-mint the copy-source token roughly every this many bytes.
+        const BATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        // Per-request size (override with `UBLK_COPY_CHUNK_BYTES`); `Put Page From
+        // URL` caps it at 4 MiB.
+        let chunk = crate::backend::copy_chunk_bytes();
+        let concurrency = std::env::var("UBLK_COPY_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_CONCURRENCY);
+
+        let blob_client = self.container.blob_client(&self.blob_name);
+        let page_client = blob_client.page_blob_client();
+        let lease_id = self.lease_id();
+
+        let n_chunks = total_size.div_ceil(chunk);
+        let chunks_per_batch = (BATCH_BYTES / chunk).max(concurrency as u64);
+        trace!(
+            total_size,
+            n_chunks,
+            chunk,
+            concurrency,
+            "server-side copy via Put Page From URL"
+        );
+
+        let mut batch_start = 0u64;
+        while batch_start < n_chunks {
+            let batch_end = (batch_start + chunks_per_batch).min(n_chunks);
+            // Fresh copy-source authorization for this batch (Entra tokens expire).
+            let csa = match &copy_source_auth {
+                Some(auth) => crate::auth::storage_bearer_token(auth)
+                    .await
+                    .context("mint copy-source authorization token")?,
+                None => None,
+            };
+            let copies = (batch_start..batch_end).map(|i| {
+                let offset = i * chunk;
+                let len = chunk.min(total_size - offset);
+                let src_range = HttpRange::new(offset, len);
+                let dst_range = HttpRange::new(offset, len);
+                let opts = PageBlobClientUploadPagesFromUrlOptions {
+                    lease_id: lease_id.clone(),
+                    copy_source_authorization: csa.clone(),
+                    ..Default::default()
+                };
+                let page_client = &page_client;
+                let source_url = source_url.to_string();
+                async move {
+                    page_client
+                        .upload_pages_from_url(source_url, src_range, len, dst_range, Some(opts))
+                        .await
+                        .with_context(|| format!("put page from url offset={offset} len={len}"))?;
+                    Ok::<(), anyhow::Error>(())
+                }
+            });
+            futures::stream::iter(copies)
+                .buffer_unordered(concurrency)
+                .try_collect::<()>()
+                .await?;
+            batch_start = batch_end;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl BlobBackend for AzurePageBlobBackend {
     #[instrument(skip(self), fields(blob = %self.blob_name))]
     async fn create(&self, size: u64) -> anyhow::Result<()> {
+        if self.snapshot.is_some() {
+            bail!("cannot create: backend targets a read-only blob snapshot");
+        }
         if size == 0 || !size.is_multiple_of(512) {
             bail!("size must be a non-zero multiple of 512 bytes, got {size}");
         }
@@ -137,7 +259,7 @@ impl BlobBackend for AzurePageBlobBackend {
         if !len.is_multiple_of(512) {
             bail!("len {len} is not 512-byte aligned");
         }
-        let blob_client = self.container.blob_client(&self.blob_name);
+        let blob_client = self.blob_client()?;
         trace!(offset, len, "downloading range");
         let opts = BlobClientDownloadOptions {
             range: Some(HttpRange::new(offset, len)),
@@ -159,6 +281,9 @@ impl BlobBackend for AzurePageBlobBackend {
 
     #[instrument(skip(self, data), fields(blob = %self.blob_name, offset, len = data.len()))]
     async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+        if self.snapshot.is_some() {
+            bail!("cannot write: backend targets a read-only blob snapshot");
+        }
         if !offset.is_multiple_of(512) {
             bail!("offset {offset} is not 512-byte aligned");
         }
@@ -193,6 +318,9 @@ impl BlobBackend for AzurePageBlobBackend {
 
     #[instrument(skip(self), fields(blob = %self.blob_name, offset, len))]
     async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+        if self.snapshot.is_some() {
+            bail!("cannot clear: backend targets a read-only blob snapshot");
+        }
         if !offset.is_multiple_of(512) {
             bail!("offset {offset} is not 512-byte aligned");
         }
@@ -240,7 +368,7 @@ impl BlobBackend for AzurePageBlobBackend {
 
     #[instrument(skip(self), fields(blob = %self.blob_name))]
     async fn size(&self) -> anyhow::Result<u64> {
-        let blob_client = self.container.blob_client(&self.blob_name);
+        let blob_client = self.blob_client()?;
         let props = blob_client
             .get_properties(None)
             .await

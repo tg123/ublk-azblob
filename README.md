@@ -97,6 +97,45 @@ sudo mount /dev/ublkb0 /mnt/azblob
 
 ---
 
+## Read-only mode and blob snapshots
+
+Pass `--read-only` to the `run` subcommand to expose the device read-only. The
+ublk device (or NBD export) is advertised read-only and every write, discard,
+and write-zeroes request is rejected, so the underlying blob can never be
+modified through the device.
+
+```bash
+# Mount the live blob read-only
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount \
+  --container mydisks \
+  --blob myvm.vhd \
+  --msi \
+  run --size 10737418240 --read-only
+```
+
+To mount an immutable **point-in-time snapshot** of the blob, pass
+`--snapshot <SNAPSHOT>` (the `x-ms-snapshot` timestamp returned when the
+snapshot was created). Selecting a snapshot **implies `--read-only`** — the
+snapshot is immutable, so writes are always rejected:
+
+```bash
+# Mount a specific blob snapshot (read-only is implied)
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount \
+  --container mydisks \
+  --blob myvm.vhd \
+  --snapshot 2024-01-31T12:00:00.0000000Z \
+  --msi \
+  run --size 10737418240
+```
+
+`--create` cannot be combined with `--read-only` or `--snapshot`. The
+read-only mount skips the write-back buffer entirely (there are no writes to
+batch); read caching via `--cache-dir` still works.
+
+---
+
 ## NBD compatibility mode (no `ublk_drv` required)
 
 For kernels or platforms **without** `ublk_drv` (older kernels, containers that
@@ -141,6 +180,8 @@ All CLI flags have environment-variable equivalents:
 | `--account-key` | `AZURE_STORAGE_KEY` |
 | `--container` | `AZURE_STORAGE_CONTAINER` |
 | `--blob` | `AZURE_STORAGE_BLOB` |
+| `--snapshot` | `AZURE_STORAGE_SNAPSHOT` |
+| `--read-only` | `UBLK_READ_ONLY` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
 | `--nbd` | `NBD_LISTEN` |
