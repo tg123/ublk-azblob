@@ -67,6 +67,10 @@ sidecars:
     image:
       repository: registry.k8s.io/sig-storage/csi-provisioner
       tag: v5.1.0
+    # CreateVolume/DeleteVolume RPC timeout. Raise this when provisioning large
+    # read-write `templateBlobUrl` volumes, since the controller copies the whole
+    # template synchronously within CreateVolume.
+    timeout: 60s
     resources:
       limits:
         cpu: 100m
@@ -123,6 +127,21 @@ storageClass:
     
     # Filesystem type: ext4, xfs, btrfs, etc.
     fsType: ext4
+
+    # Expose the volume read-only ("true"/"false"). The device rejects every
+    # write/discard and is mounted read-only; the blob must already be formatted.
+    # readOnly: "true"
+
+    # Provision the volume from a golden-image *template* blob. Full Azure blob
+    # URL, optionally carrying a SAS token and/or a `?snapshot=` query. With no
+    # SAS, the driver authenticates the template with its own credentials (the
+    # template must then be reachable with those creds).
+    #   - read-only volumes (readOnly: "true" or a snapshot URL) mount
+    #     the template directly — no copy, and no cluster lock/lease (so many PVCs
+    #     can share one golden image); DeleteVolume never deletes the template.
+    #   - read-write volumes copy the template into a fresh per-PVC blob and skip
+    #     formatting (the copy is already a filesystem).
+    # templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd?sv=...&sig=...'
 
 # Secret configuration for global mode
 # Only used when secretSearchMode: global
@@ -197,7 +216,7 @@ additionalStorageClasses: []
   #     container: "database-volumes"
   #     blobPathTemplate: '${pvc.namespace}/db/${pv.name}'
   #     fsType: xfs
-  # 
+  #
   # - name: azblob-per-tenant
   #   isDefault: false
   #   reclaimPolicy: Delete
@@ -208,6 +227,37 @@ additionalStorageClasses: []
   #     container: '${pvc.namespace}'
   #     blobPathTemplate: 'volumes/${pv.name}'
   #     fsType: ext4
+  #
+  # ── Golden-image (templateBlobUrl) StorageClasses ───────────────────────────
+  #
+  # Read-only mount of a shared golden image: many PVCs mount the template blob
+  # directly — no copy, and no cluster lock/lease. The volume id is tagged `ro:`
+  # so DeleteVolume never deletes the template; pair it with reclaimPolicy:
+  # Retain and Immediate binding.
+  # - name: azblob-template-ro
+  #   isDefault: false
+  #   reclaimPolicy: Retain
+  #   volumeBindingMode: Immediate
+  #   allowVolumeExpansion: false
+  #   parameters:
+  #     readOnly: "true"
+  #     templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd'
+  #
+  # Read-write copy of a golden image: the controller server-side copies the
+  # template into a fresh per-PVC blob and the node skips mkfs. Set storageAccount
+  # to the destination account (may differ from the template's). Large copies may
+  # need a higher sidecars.provisioner.timeout.
+  # - name: azblob-template-rw
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   volumeBindingMode: Immediate
+  #   allowVolumeExpansion: false
+  #   parameters:
+  #     storageAccount: 'mydeststorage'
+  #     container: '${pvc.namespace}'
+  #     blobPathTemplate: '${pvc.namespace}/tmpl/${pv.name}'
+  #     fsType: ext4
+  #     templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd'
 
 # Namespace where CSI driver components are deployed
 namespace: kube-system

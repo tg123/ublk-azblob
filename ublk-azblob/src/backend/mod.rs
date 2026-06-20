@@ -11,6 +11,22 @@ pub mod mem;
 use async_trait::async_trait;
 use bytes::Bytes;
 
+/// Maximum bytes per Azure Put Page / Put Page From URL request (4 MiB).
+pub const MAX_PAGE_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Per-request chunk size used by the template copy paths, in bytes.
+///
+/// Overridable via `UBLK_COPY_CHUNK_BYTES`; the value is 512-aligned and clamped
+/// to `[512, MAX_PAGE_REQUEST_BYTES]` (Azure caps Put Page / Put Page From URL
+/// at 4 MiB). Defaults to the 4 MiB maximum.
+pub fn copy_chunk_bytes() -> u64 {
+    std::env::var("UBLK_COPY_CHUNK_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|n| (n / 512 * 512).clamp(512, MAX_PAGE_REQUEST_BYTES))
+        .unwrap_or(MAX_PAGE_REQUEST_BYTES)
+}
+
 /// Abstraction over a page-blob–like byte store.
 ///
 /// All offsets and lengths **must** be multiples of 512 bytes (Azure Page Blob

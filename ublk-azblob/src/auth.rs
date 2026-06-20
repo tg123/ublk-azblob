@@ -1,6 +1,6 @@
 //! Authentication helpers for Azure Storage.
 //!
-//! Supports four auth modes:
+//! Supports five auth modes:
 //!
 //! 1. **Managed Identity (MSI)** — uses [`azure_identity::ManagedIdentityCredential`].
 //!    Suitable for production workloads running on Azure VMs / AKS / App Service.
@@ -25,13 +25,17 @@
 //!    authenticating with a Microsoft Entra application client id, tenant id and
 //!    client secret.
 //!
+//! 5. **Shared Access Signature (SAS)** — appends a SAS query string to every
+//!    request via [`SasPolicy`]. Used to read a `templateBlobUrl` golden image
+//!    that carries its own SAS, possibly from a different storage account.
+//!
 //! ## Note on SDK preview status
 //! `azure_identity` and `azure_storage_blob` are 0.x / preview crates.  All
 //! auth construction lives here so a breaking SDK change only requires editing
 //! this file.
 
 use anyhow::Context as _;
-use azure_core::credentials::Secret;
+use azure_core::credentials::{Secret, TokenCredential};
 use azure_core::http::{
     policies::{Policy, PolicyResult},
     Context, Request,
@@ -93,6 +97,13 @@ pub enum AuthConfig {
         account_name: String,
         account_key: String,
     },
+
+    /// Shared Access Signature (SAS) token.
+    ///
+    /// The token is the query string of a SAS URL (with or without a leading
+    /// `?`).  Used to read a `templateBlobUrl` that carries its own SAS, possibly
+    /// from a different storage account than the driver's own credentials.
+    Sas { sas_token: String },
 }
 
 // ── BlobContainerClient factory ───────────────────────────────────────────────
@@ -192,7 +203,90 @@ pub fn build_container_client(
             BlobContainerClient::new(container_url, None, Some(container_opts))
                 .context("create BlobContainerClient (SharedKey)")
         }
+
+        AuthConfig::Sas { sas_token } => {
+            debug!("using SAS token credential");
+            let policy = SasPolicy::new(sas_token);
+            let mut container_opts = BlobContainerClientOptions::default();
+            container_opts
+                .client_options
+                .per_try_policies
+                .push(Arc::new(policy));
+            let container_url = format!("{}/{container_name}", service_url.trim_end_matches('/'));
+            let container_url = azure_core::http::Url::parse(&container_url)
+                .with_context(|| format!("parse container URL: {container_url}"))?;
+            // `None` credential: the SasPolicy appends the SAS query string to
+            // every request, so the SDK must not also add an auth header.
+            BlobContainerClient::new(container_url, None, Some(container_opts))
+                .context("create BlobContainerClient (SAS)")
+        }
     }
+}
+
+/// Build an Entra (Microsoft Entra ID) token credential for `auth`, or `None`
+/// for SharedKey/SAS auth (which don't yield an OAuth token).
+fn build_token_credential(auth: &AuthConfig) -> anyhow::Result<Option<Arc<dyn TokenCredential>>> {
+    let cred: Arc<dyn TokenCredential> = match auth {
+        AuthConfig::Msi(user_assigned) => {
+            let opts = user_assigned.as_ref().map(|id| {
+                let uid = match id {
+                    UserAssignedIdentity::ClientId(s) => UserAssignedId::ClientId(s.clone()),
+                    UserAssignedIdentity::ObjectId(s) => UserAssignedId::ObjectId(s.clone()),
+                    UserAssignedIdentity::ResourceId(s) => UserAssignedId::ResourceId(s.clone()),
+                };
+                ManagedIdentityCredentialOptions {
+                    user_assigned_id: Some(uid),
+                    ..Default::default()
+                }
+            });
+            ManagedIdentityCredential::new(opts).context("create ManagedIdentityCredential")?
+        }
+        AuthConfig::WorkloadIdentity {
+            client_id,
+            tenant_id,
+            token_file,
+        } => {
+            let opts = WorkloadIdentityCredentialOptions {
+                client_id: client_id.clone(),
+                tenant_id: tenant_id.clone(),
+                token_file_path: token_file.clone().map(PathBuf::from),
+                ..Default::default()
+            };
+            WorkloadIdentityCredential::new(Some(opts))
+                .context("create WorkloadIdentityCredential")?
+        }
+        AuthConfig::ServicePrincipal {
+            tenant_id,
+            client_id,
+            client_secret,
+        } => ClientSecretCredential::new(
+            tenant_id,
+            client_id.clone(),
+            Secret::from(client_secret.clone()),
+            None,
+        )
+        .context("create ClientSecretCredential")?,
+        AuthConfig::SharedKey { .. } | AuthConfig::Sas { .. } => return Ok(None),
+    };
+    Ok(Some(cred))
+}
+
+/// Mint a `Bearer <token>` storage authorization header value for `auth`, or
+/// `None` for SharedKey/SAS.
+///
+/// Used as the `x-ms-copy-source-authorization` header on a server-side
+/// `Put Page From URL` copy so the storage service can read a source blob in a
+/// *different* account (cross-account golden-image template) under the driver's
+/// own Entra identity.
+pub async fn storage_bearer_token(auth: &AuthConfig) -> anyhow::Result<Option<String>> {
+    let Some(cred) = build_token_credential(auth)? else {
+        return Ok(None);
+    };
+    let token = cred
+        .get_token(&["https://storage.azure.com/.default"], None)
+        .await
+        .context("acquire storage OAuth token for copy-source-authorization")?;
+    Ok(Some(format!("Bearer {}", token.token.secret())))
 }
 
 // ── SharedKeyPolicy ───────────────────────────────────────────────────────────
@@ -368,6 +462,66 @@ impl Policy for SharedKeyPolicy {
     }
 }
 
+// ── SasPolicy ─────────────────────────────────────────────────────────────────
+
+/// Appends a SAS (Shared Access Signature) query string to every request URL.
+///
+/// A SAS URL authenticates the request entirely through its query parameters
+/// (`sv`, `sig`, `se`, …), so this policy merges those parameters into each
+/// outgoing request URL.  It is injected via `per_try_policies` (like
+/// [`SharedKeyPolicy`]) and the client is built with a `None` credential so the
+/// SDK does not add a conflicting `Authorization` header.
+#[derive(Debug)]
+pub struct SasPolicy {
+    /// SAS query pairs, parsed once (leading `?` stripped).
+    pairs: Vec<(String, String)>,
+}
+
+impl SasPolicy {
+    pub fn new(sas_token: &str) -> Self {
+        let trimmed = sas_token.trim_start_matches('?');
+        let pairs = azure_core::http::Url::parse(&format!("https://x/?{trimmed}"))
+            .map(|u| {
+                u.query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { pairs }
+    }
+}
+
+#[async_trait::async_trait]
+impl Policy for SasPolicy {
+    async fn send(
+        &self,
+        ctx: &Context,
+        request: &mut Request,
+        next: &[Arc<dyn Policy>],
+    ) -> PolicyResult {
+        // Merge the SAS pairs into the request URL, skipping any already present
+        // so a snapshot/comp query the SDK added is preserved.
+        let existing: std::collections::HashSet<String> = request
+            .url()
+            .query_pairs()
+            .map(|(k, _)| k.into_owned())
+            .collect();
+        let to_add: Vec<(String, String)> = self
+            .pairs
+            .iter()
+            .filter(|(k, _)| !existing.contains(k))
+            .cloned()
+            .collect();
+        if !to_add.is_empty() {
+            let mut qp = request.url_mut().query_pairs_mut();
+            for (k, v) in &to_add {
+                qp.append_pair(k, v);
+            }
+        }
+        next[0].send(ctx, request, &next[1..]).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_container_client, AuthConfig, SharedKeyPolicy};
@@ -430,5 +584,76 @@ mod tests {
         let err = client.err().map(|e| format!("{e:#}"));
         std::fs::remove_file(&token_path).ok();
         assert!(ok, "workload identity client failed: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn sas_policy_merges_query_and_preserves_existing() {
+        use super::SasPolicy;
+        use azure_core::error::{Error, ErrorKind};
+        use azure_core::http::policies::{Policy, PolicyResult};
+        use azure_core::http::{Context, Method, Request, Url};
+        use std::sync::{Arc, Mutex};
+
+        // Terminal policy that captures the final request URL after `SasPolicy`
+        // has merged the SAS query in, then short-circuits the pipeline.
+        #[derive(Debug)]
+        struct Capture(Arc<Mutex<Option<Url>>>);
+
+        #[async_trait::async_trait]
+        impl Policy for Capture {
+            async fn send(
+                &self,
+                _ctx: &Context,
+                request: &mut Request,
+                _next: &[Arc<dyn Policy>],
+            ) -> PolicyResult {
+                *self.0.lock().unwrap() = Some(request.url().clone());
+                Err(Error::with_message(ErrorKind::Other, "terminal"))
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let terminal: Arc<dyn Policy> = Arc::new(Capture(captured.clone()));
+
+        let sas =
+            SasPolicy::new("?sv=2021-08-06&ss=b&sig=abc%2Bdef%3D&se=2030-01-01T00%3A00%3A00Z");
+
+        // The request URL already carries `comp`/`snapshot` (as the SDK would add
+        // for a Put Page against a snapshot); those must survive the merge.
+        let url = Url::parse(
+            "https://acct.blob.core.windows.net/container/blob\
+             ?comp=page&snapshot=2020-01-01T00%3A00%3A00Z",
+        )
+        .unwrap();
+        let mut request = Request::new(url, Method::Put);
+
+        let _ = sas
+            .send(
+                &Context::new(),
+                &mut request,
+                std::slice::from_ref(&terminal),
+            )
+            .await;
+
+        let final_url = captured.lock().unwrap().clone().expect("url captured");
+        let pairs: std::collections::HashMap<String, String> = final_url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        // Pre-existing keys are preserved with their original values.
+        assert_eq!(pairs.get("comp").map(String::as_str), Some("page"));
+        assert_eq!(
+            pairs.get("snapshot").map(String::as_str),
+            Some("2020-01-01T00:00:00Z")
+        );
+        // SAS pairs are merged in.
+        assert_eq!(pairs.get("sv").map(String::as_str), Some("2021-08-06"));
+        assert_eq!(pairs.get("ss").map(String::as_str), Some("b"));
+        assert_eq!(pairs.get("sig").map(String::as_str), Some("abc+def="));
+        assert_eq!(
+            pairs.get("se").map(String::as_str),
+            Some("2030-01-01T00:00:00Z")
+        );
     }
 }
