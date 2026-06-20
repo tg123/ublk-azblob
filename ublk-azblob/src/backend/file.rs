@@ -880,6 +880,38 @@ impl BlobBackend for FileCacheBackend {
         Ok(result.freeze())
     }
 
+    async fn prefetch(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if !offset.is_multiple_of(512) || !len.is_multiple_of(512) {
+            bail!("prefetch: offset ({offset}) and len ({len}) must be 512-byte aligned");
+        }
+
+        let page_size = self.page_size;
+        let dev_size = {
+            let state = self.state.lock().await;
+            state.dev_size
+        };
+        check_in_bounds("prefetch", offset, len, dev_size)?;
+
+        // Align the start down to a page boundary and walk page-by-page, taking
+        // the lock for one page at a time so live I/O can interleave during a
+        // long warm-up.  `ensure_page` fetches the page (from a peer or the
+        // inner backend) and stores it locally as a clean page.
+        let end = offset + len;
+        let mut page_off = offset - (offset % page_size);
+        while page_off < end {
+            let page_idx = page_off / page_size;
+            {
+                let mut state = self.state.lock().await;
+                self.ensure_page(&mut state, page_idx).await?;
+            }
+            page_off += page_size;
+        }
+        Ok(())
+    }
+
     async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -1363,8 +1395,32 @@ mod tests {
 
         let (b, _) = open(inner.clone(), &dir, 1024, 4096);
         assert_eq!(b.read(0, 512).await.unwrap(), Bytes::from(vec![0x6E; 512]));
-        // Read does not dirty anything.
+        // Read does not dirty anything, and the page stays absent from the cache.
         assert_eq!(b.dirty_count().await, 0);
+        assert_eq!(b.present_count().await, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn prefetch_populates_cache_as_clean_pages() {
+        // Warm-up's prefetch makes pages resident locally (clean, not dirty) so
+        // later reads are served from the cache file even if the inner backend
+        // changes, and no write-back is scheduled.
+        let dir = tmp_dir("prefetch");
+        let inner = Arc::new(MemBackend::new(8192).unwrap());
+        inner.write(0, Bytes::from(vec![0xAB; 2048])).await.unwrap();
+
+        let (b, _) = open(inner.clone(), &dir, 1024, 4096);
+        // Prefetch the first two 1 KiB pages.
+        b.prefetch(0, 2048).await.unwrap();
+
+        // Both pages are now resident and clean (no write-back pending).
+        assert_eq!(b.present_count().await, 2);
+        assert_eq!(b.dirty_count().await, 0);
+
+        // Mutate the inner backend; the cache must serve the warmed copy.
+        inner.write(0, Bytes::from(vec![0x00; 2048])).await.unwrap();
+        assert_eq!(b.read(0, 2048).await.unwrap(), Bytes::from(vec![0xAB; 2048]));
         std::fs::remove_dir_all(&dir).ok();
     }
 

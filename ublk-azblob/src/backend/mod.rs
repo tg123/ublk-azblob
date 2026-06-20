@@ -61,6 +61,19 @@ pub trait BlobBackend: Send + Sync {
     /// Both `offset` and `len` must be multiples of 512.
     async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()>;
 
+    /// Warm the region `[offset, offset+len)` so it is resident locally.
+    ///
+    /// For cache-backed backends this fetches the region from the underlying
+    /// store and stores it in the local cache as *clean* (non-dirty) pages, so
+    /// it is safe in read-only mode and does not schedule any write-back.
+    /// Backends without a local cache fall back to a plain read so the region
+    /// is at least fetched once.  Used by the background warm-up.
+    ///
+    /// Both `offset` and `len` must be multiples of 512.
+    async fn prefetch(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+        self.read(offset, len).await.map(|_| ())
+    }
+
     /// Flush any pending writes to durable storage.
     ///
     /// For write-through backends this is a no-op; for write-back caches it

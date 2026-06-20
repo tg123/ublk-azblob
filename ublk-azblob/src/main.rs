@@ -906,9 +906,10 @@ fn cache_file_name(container: &str, blob: &str) -> String {
     sanitize_cache_component(&format!("{container}-{blob}"))
 }
 
-/// Background cache warm-up: sequentially read `[0, limit_bytes)` of the device
-/// through `backend` (the cache layer) so those pages become resident locally —
-/// served from a peer when one already holds them, else fetched from the blob.
+/// Background cache warm-up: sequentially populate `[0, limit_bytes)` of the
+/// device through `backend` (the cache layer) so those pages become resident
+/// locally — served from a peer when one already holds them, else fetched from
+/// the blob and stored as clean pages in the local cache.
 ///
 /// Best-effort: a read error stops the warm-up (the device keeps serving on
 /// demand). Yields between pages so it doesn't starve live I/O.
@@ -923,8 +924,8 @@ async fn warmup_cache(
     let mut warmed = 0u64;
     while offset < limit {
         let len = page_size.min(dev_size - offset);
-        match backend.read(offset, len).await {
-            Ok(_) => warmed += len,
+        match backend.prefetch(offset, len).await {
+            Ok(()) => warmed += len,
             Err(err) => {
                 warn!(offset, %err, "cache warm-up read failed; stopping early");
                 break;
