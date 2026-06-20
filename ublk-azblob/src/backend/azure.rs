@@ -107,22 +107,26 @@ impl AzurePageBlobBackend {
     /// process. The destination blob must already exist (call [`BlobBackend::create`]
     /// first) and be at least `total_size`.
     ///
-    /// `copy_source_authorization` (an `Authorization` header value such as
-    /// `"Bearer <token>"`) lets the service read a source in a *different*
-    /// storage account; pass `None` when the source carries its own SAS or lives
-    /// in the same account. Ranges are 512-aligned; sparse source ranges copy as
-    /// zeros.
+    /// `copy_source_auth` is the driver credential used to authorize the service
+    /// to read a source in a *different* storage account (`Some` for Entra auth);
+    /// pass `None` when the source carries its own SAS or lives in the same
+    /// account. The Entra token is re-minted per ~8 GiB batch so a copy whose
+    /// wall-clock time exceeds the (~1 h) token lifetime does not start failing
+    /// late chunks with HTTP 403. Ranges are 512-aligned; sparse source ranges
+    /// copy as zeros.
     pub async fn copy_pages_from_url(
         &self,
         source_url: &str,
         total_size: u64,
-        copy_source_authorization: Option<String>,
+        copy_source_auth: Option<crate::auth::AuthConfig>,
     ) -> anyhow::Result<()> {
         if !total_size.is_multiple_of(512) {
             bail!("copy size {total_size} is not 512-byte aligned");
         }
         /// Concurrent in-flight copy requests (override with `UBLK_COPY_CONCURRENCY`).
         const DEFAULT_CONCURRENCY: usize = 32;
+        /// Re-mint the copy-source token roughly every this many bytes.
+        const BATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
         // Per-request size (override with `UBLK_COPY_CHUNK_BYTES`); `Put Page From
         // URL` caps it at 4 MiB.
         let chunk = crate::backend::copy_chunk_bytes();
@@ -137,6 +141,7 @@ impl AzurePageBlobBackend {
         let lease_id = self.lease_id();
 
         let n_chunks = total_size.div_ceil(chunk);
+        let chunks_per_batch = (BATCH_BYTES / chunk).max(concurrency as u64);
         trace!(
             total_size,
             n_chunks,
@@ -144,31 +149,43 @@ impl AzurePageBlobBackend {
             concurrency,
             "server-side copy via Put Page From URL"
         );
-        let copies = (0..n_chunks).map(|i| {
-            let offset = i * chunk;
-            let len = chunk.min(total_size - offset);
-            let src_range = HttpRange::new(offset, len);
-            let dst_range = HttpRange::new(offset, len);
-            let opts = PageBlobClientUploadPagesFromUrlOptions {
-                lease_id: lease_id.clone(),
-                copy_source_authorization: copy_source_authorization.clone(),
-                ..Default::default()
-            };
-            let page_client = &page_client;
-            let source_url = source_url.to_string();
-            async move {
-                page_client
-                    .upload_pages_from_url(source_url, src_range, len, dst_range, Some(opts))
-                    .await
-                    .with_context(|| format!("put page from url offset={offset} len={len}"))?;
-                Ok::<(), anyhow::Error>(())
-            }
-        });
 
-        futures::stream::iter(copies)
-            .buffer_unordered(concurrency)
-            .try_collect::<()>()
-            .await?;
+        let mut batch_start = 0u64;
+        while batch_start < n_chunks {
+            let batch_end = (batch_start + chunks_per_batch).min(n_chunks);
+            // Fresh copy-source authorization for this batch (Entra tokens expire).
+            let csa = match &copy_source_auth {
+                Some(auth) => crate::auth::storage_bearer_token(auth)
+                    .await
+                    .context("mint copy-source authorization token")?,
+                None => None,
+            };
+            let copies = (batch_start..batch_end).map(|i| {
+                let offset = i * chunk;
+                let len = chunk.min(total_size - offset);
+                let src_range = HttpRange::new(offset, len);
+                let dst_range = HttpRange::new(offset, len);
+                let opts = PageBlobClientUploadPagesFromUrlOptions {
+                    lease_id: lease_id.clone(),
+                    copy_source_authorization: csa.clone(),
+                    ..Default::default()
+                };
+                let page_client = &page_client;
+                let source_url = source_url.to_string();
+                async move {
+                    page_client
+                        .upload_pages_from_url(source_url, src_range, len, dst_range, Some(opts))
+                        .await
+                        .with_context(|| format!("put page from url offset={offset} len={len}"))?;
+                    Ok::<(), anyhow::Error>(())
+                }
+            });
+            futures::stream::iter(copies)
+                .buffer_unordered(concurrency)
+                .try_collect::<()>()
+                .await?;
+            batch_start = batch_end;
+        }
         Ok(())
     }
 }

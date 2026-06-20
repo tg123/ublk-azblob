@@ -1,6 +1,6 @@
 //! Authentication helpers for Azure Storage.
 //!
-//! Supports four auth modes:
+//! Supports five auth modes:
 //!
 //! 1. **Managed Identity (MSI)** — uses [`azure_identity::ManagedIdentityCredential`].
 //!    Suitable for production workloads running on Azure VMs / AKS / App Service.
@@ -24,6 +24,10 @@
 //! 4. **Service Principal** — uses [`azure_identity::ClientSecretCredential`],
 //!    authenticating with a Microsoft Entra application client id, tenant id and
 //!    client secret.
+//!
+//! 5. **Shared Access Signature (SAS)** — appends a SAS query string to every
+//!    request via [`SasPolicy`]. Used to read a `templateBlobUrl` golden image
+//!    that carries its own SAS, possibly from a different storage account.
 //!
 //! ## Note on SDK preview status
 //! `azure_identity` and `azure_storage_blob` are 0.x / preview crates.  All

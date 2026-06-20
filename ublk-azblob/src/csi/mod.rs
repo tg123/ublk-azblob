@@ -397,16 +397,30 @@ pub async fn copy_template(
     dest_auth: &AuthConfig,
     total_size: u64,
 ) -> anyhow::Result<()> {
-    let copy_source_authorization = if source_has_sas {
+    // A SAS in the URL authenticates the source itself; otherwise the storage
+    // service needs an Entra copy-source authorization (minted per batch inside
+    // `copy_pages_from_url`). SharedKey with no SAS can't authenticate a
+    // server-side source read, so we probe for a token and fall back to streaming.
+    let entra_token = if source_has_sas {
         None
     } else {
         auth::storage_bearer_token(dest_auth)
             .await
             .context("mint copy-source authorization token")?
     };
-    if source_has_sas || copy_source_authorization.is_some() {
-        info!(total_size, "server-side copy (Put Page From URL)");
-        dest.copy_pages_from_url(source_url, total_size, copy_source_authorization)
+    if source_has_sas {
+        info!(
+            total_size,
+            "server-side copy (Put Page From URL, SAS source)"
+        );
+        dest.copy_pages_from_url(source_url, total_size, None).await
+    } else if entra_token.is_some() {
+        info!(
+            total_size,
+            "server-side copy (Put Page From URL, Entra source)"
+        );
+        // Pass the auth (not the probe token) so the token is re-minted per batch.
+        dest.copy_pages_from_url(source_url, total_size, Some(dest_auth.clone()))
             .await
     } else {
         info!(

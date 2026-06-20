@@ -244,8 +244,10 @@ fn start_server_opts(
 }
 
 /// Stop the running NBD server: the data was already flushed (`NBD_CMD_FLUSH` +
-/// `NBD_CMD_DISC`) before this is called, so the process is simply killed.  The
-/// NBD path installs no signal handler, so a clean exit status is not expected.
+/// `NBD_CMD_DISC`) before this is called, so the process is simply killed.
+/// `child.kill()` sends `SIGKILL`, which is uncatchable, so the server's
+/// SIGINT/SIGTERM graceful-flush handler never runs and a clean exit status is
+/// not expected. (Use [`stop_server_graceful`] when a clean exit is required.)
 fn stop_server(mut child: Child) {
     log(&format!("stopping NBD server (pid {})", child.id()));
     let _ = child.kill();
