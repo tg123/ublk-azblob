@@ -898,14 +898,25 @@ impl BlobBackend for FileCacheBackend {
         // Align the start down to a page boundary and walk page-by-page, taking
         // the lock for one page at a time so live I/O can interleave during a
         // long warm-up.  `ensure_page` fetches the page (from a peer or the
-        // inner backend) and stores it locally as a clean page.
+        // inner backend) and stores it locally as a clean page; when cross-process
+        // sharing is on we also publish it so peers caching the same blob can read
+        // it from our data file (this is what makes warm-up populate the *shared*
+        // cache, not just our own — otherwise clean warmed pages stay unpublished).
         let end = offset + len;
         let mut page_off = offset - (offset % page_size);
         while page_off < end {
             let page_idx = page_off / page_size;
             {
                 let mut state = self.state.lock().await;
-                self.ensure_page(&mut state, page_idx).await?;
+                let page_len = self.ensure_page(&mut state, page_idx).await?;
+                if let Some(idx) = &self.index {
+                    // Only publish genuinely clean pages: a page already dirtied
+                    // by a concurrent write must not be advertised as a clean copy.
+                    if page_len > 0 && !bit_get(&state.dirty, page_idx) {
+                        idx.publish(page_idx, page_len)
+                            .with_context(|| format!("publish warmed page {page_idx}"))?;
+                    }
+                }
             }
             page_off += page_size;
         }
@@ -1420,7 +1431,10 @@ mod tests {
 
         // Mutate the inner backend; the cache must serve the warmed copy.
         inner.write(0, Bytes::from(vec![0x00; 2048])).await.unwrap();
-        assert_eq!(b.read(0, 2048).await.unwrap(), Bytes::from(vec![0xAB; 2048]));
+        assert_eq!(
+            b.read(0, 2048).await.unwrap(),
+            Bytes::from(vec![0xAB; 2048])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1725,6 +1739,48 @@ mod tests {
         // A page no peer published still falls back to the blob (one read).
         let _ = b.read(page, page).await.unwrap();
         assert_eq!(b_counting.read_count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn warmup_publishes_clean_pages_for_peers() {
+        // Warm-up (prefetch) must publish the clean pages it makes resident so a
+        // peer caching the same blob_identity can read them from the warmer's data
+        // file — the read-only golden-image use case, where no process ever
+        // writes+flushes. Without publishing, the peer would always miss.
+        let dir = tmp_dir("share-warmup");
+        let page = 4096u64;
+        let dev = 2 * page;
+
+        // A's blob, seeded so page 0 has known content; A only *prefetches* it.
+        let a_inner = Arc::new(MemBackend::new(dev).unwrap());
+        a_inner
+            .write(0, Bytes::from(vec![0xC3; page as usize]))
+            .await
+            .unwrap();
+        let (a, _) = open_shared(a_inner.clone(), &dir, "volA", "golden", page, dev);
+
+        // Warm page 0 into A's cache (clean, resident, and — with the fix —
+        // published). No write/flush happens.
+        a.prefetch(0, page).await.unwrap();
+        assert_eq!(a.present_count().await, 1);
+        assert_eq!(a.dirty_count().await, 0);
+
+        // B caches the same golden identity but its own (empty) blob whose reads
+        // we count.
+        let b_blob = Arc::new(MemBackend::new(dev).unwrap());
+        let b_counting = CountingBackend::new(b_blob);
+        let (b, _) = open_shared(b_counting.clone(), &dir, "volB", "golden", page, dev);
+
+        // B reads page 0 from A's warmed copy — zero reads against B's own blob.
+        let got = b.read(0, page).await.unwrap();
+        assert_eq!(got, Bytes::from(vec![0xC3; page as usize]));
+        assert_eq!(
+            b_counting.read_count(),
+            0,
+            "warmed page should come from peer, not blob"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

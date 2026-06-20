@@ -274,7 +274,14 @@ enum Command {
         /// dirtying write), so the single-writer-per-file invariant holds.
         /// Requires a per-instance `--cache-instance` so peers have distinct
         /// data files.  Only used when `--cache-dir` is set.
-        #[arg(long, default_value = "false", env = "UBLK_CACHE_SHARE_PAGES")]
+        #[arg(
+            long,
+            env = "UBLK_CACHE_SHARE_PAGES",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
         cache_share_pages: bool,
 
         /// Shared identity of the blob this cache mirrors, used to match peers
@@ -297,7 +304,14 @@ enum Command {
         /// online) and is sharing-aware (pages a live peer already caches are
         /// fetched from the peer, not Azure). Only used when `--cache-dir` is set;
         /// best for read-only / read-mostly datasets that fit the cache budget.
-        #[arg(long, default_value = "false", env = "UBLK_CACHE_WARMUP")]
+        #[arg(
+            long,
+            env = "UBLK_CACHE_WARMUP",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
         cache_warmup: bool,
 
         /// Cap in bytes for `--cache-warmup`. `0` = auto: the cache byte budget
