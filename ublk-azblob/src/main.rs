@@ -417,6 +417,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        // Diagnostics go to stderr so stdout carries only program output (e.g.
+        // the `snapshot` subcommand prints the bare snapshot id to stdout).
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("ublk_azblob=info".parse().unwrap()),
