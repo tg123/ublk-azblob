@@ -277,12 +277,16 @@ of the same blob transparently share clean pages.
 
 ### Cache warm-up (`--cache-warmup`)
 
-By default the cache is **lazy** — a page is fetched from the blob only when it
-is first read. With `--cache-warmup` (or `UBLK_CACHE_WARMUP=1`) the process
-instead **prefetches the blob into the cache on start**, sequentially, in the
-**background** (the device comes online immediately). Warm-up is **sharing-aware**:
-it goes through the normal read path, so a page a live peer already caches is
-copied from the peer rather than re-fetched from Azure.
+By default there is no warm-up: the local cache is populated **on demand by
+writes** (copy-on-write). A pure read miss is served straight from a live peer
+or the blob and is **not** stored in the local `.dat`, so a read-only blob that
+is never warmed keeps reading through to its source. With `--cache-warmup` (or
+`UBLK_CACHE_WARMUP=1`) the process instead **prefetches the blob into the cache
+on start**, sequentially, in the **background** (the device comes online
+immediately). Each prefetched page is stored locally as a clean, resident page
+(and, with `--cache-share-pages`, published to the shared index). Warm-up is
+**sharing-aware**: a page a live peer already caches is copied from the peer
+rather than re-fetched from Azure.
 
 Prefetch stops after `--cache-warmup-bytes` (or `UBLK_CACHE_WARMUP_BYTES`); `0`
 (the default) means auto — the cache byte budget (`--cache-max-bytes`) when set,

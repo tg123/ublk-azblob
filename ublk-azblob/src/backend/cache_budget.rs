@@ -268,18 +268,36 @@ fn write_entries(file: &mut File, entries: &[Entry]) -> Result<()> {
     Ok(())
 }
 
-/// RAII wrapper around an exclusive advisory `flock` on a state file.
+/// RAII wrapper around an advisory `flock` on a state file.
 ///
 /// Shared with [`super::cache_index`] so both the byte budget and the page
-/// index serialize cross-process access the same way.
+/// index serialize cross-process access the same way.  [`acquire`] takes an
+/// **exclusive** (`LOCK_EX`) lock for mutating operations; [`acquire_shared`]
+/// takes a **shared** (`LOCK_SH`) lock for read-only lookups, allowing
+/// concurrent readers across processes while still excluding exclusive holders.
+///
+/// [`acquire`]: FlockGuard::acquire
+/// [`acquire_shared`]: FlockGuard::acquire_shared
 pub(super) struct FlockGuard {
     fd: libc::c_int,
 }
 
 impl FlockGuard {
     pub(super) fn acquire(file: &File) -> Result<Self> {
+        Self::flock(file, libc::LOCK_EX)
+    }
+
+    /// Acquire a **shared** advisory lock (`LOCK_SH`): multiple holders may hold
+    /// it at once (so concurrent peers reading *different* pages don't serialize
+    /// on a single lock), but it still mutually excludes an exclusive
+    /// [`acquire`](Self::acquire) holder (`publish`/`unpublish`).
+    pub(super) fn acquire_shared(file: &File) -> Result<Self> {
+        Self::flock(file, libc::LOCK_SH)
+    }
+
+    fn flock(file: &File, operation: libc::c_int) -> Result<Self> {
         let fd = file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        let ret = unsafe { libc::flock(fd, operation) };
         if ret != 0 {
             return Err(std::io::Error::last_os_error()).context("flock cache state file");
         }

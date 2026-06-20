@@ -222,11 +222,14 @@ impl CacheIndex {
     /// Like [`with_locked_mut`] but for **read-only** operations
     /// (`read_peer_page`, `published_count`): the index file is **not** rewritten,
     /// which matters because it holds one line per published *page* and these run
-    /// on every cross-process cache miss. Dead-owner pruning is applied in-memory
-    /// only; it is persisted by the next mutating operation.
+    /// on every cross-process cache miss. A **shared** `flock` (`LOCK_SH`) is used
+    /// so concurrent peers reading different pages do not serialize on a single
+    /// exclusive lock (they still mutually exclude `publish`/`unpublish`, which
+    /// take `LOCK_EX`). Dead-owner pruning is applied in-memory only; it is
+    /// persisted by the next mutating operation.
     fn with_locked_read<R>(&self, f: impl FnOnce(&[Entry]) -> R) -> Result<R> {
         let mut file = self.file.lock().expect("cache index mutex poisoned");
-        let _guard = FlockGuard::acquire(&file)?;
+        let _guard = FlockGuard::acquire_shared(&file)?;
 
         let mut entries = read_entries(&mut file)?;
         prune_dead(&mut entries, self.pid);
