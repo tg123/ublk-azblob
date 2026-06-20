@@ -123,14 +123,25 @@ impl AzurePageBlobBackend {
         }
         /// `Put Page From URL` allows at most 4 MiB per request.
         const CHUNK: u64 = 4 * 1024 * 1024;
-        /// Concurrent in-flight copy requests.
-        const CONCURRENCY: usize = 16;
+        /// Concurrent in-flight copy requests (override with `UBLK_COPY_CONCURRENCY`).
+        const DEFAULT_CONCURRENCY: usize = 32;
+        let concurrency = std::env::var("UBLK_COPY_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_CONCURRENCY);
 
         let blob_client = self.container.blob_client(&self.blob_name);
         let page_client = blob_client.page_blob_client();
         let lease_id = self.lease_id();
 
         let n_chunks = total_size.div_ceil(CHUNK);
+        trace!(
+            total_size,
+            n_chunks,
+            concurrency,
+            "server-side copy via Put Page From URL"
+        );
         let copies = (0..n_chunks).map(|i| {
             let offset = i * CHUNK;
             let len = CHUNK.min(total_size - offset);
@@ -153,7 +164,7 @@ impl AzurePageBlobBackend {
         });
 
         futures::stream::iter(copies)
-            .buffer_unordered(CONCURRENCY)
+            .buffer_unordered(concurrency)
             .try_collect::<()>()
             .await?;
         Ok(())
