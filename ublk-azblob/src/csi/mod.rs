@@ -426,10 +426,10 @@ async fn copy_blob_streamed(
     dest: &dyn BlobBackend,
     total_size: u64,
 ) -> anyhow::Result<()> {
-    const CHUNK: u64 = 4 * 1024 * 1024;
+    let chunk = crate::backend::copy_chunk_bytes();
     let mut offset = 0u64;
     while offset < total_size {
-        let len = CHUNK.min(total_size - offset);
+        let len = chunk.min(total_size - offset);
         let data = source
             .read(offset, len)
             .await

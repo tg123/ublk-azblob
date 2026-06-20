@@ -121,10 +121,11 @@ impl AzurePageBlobBackend {
         if !total_size.is_multiple_of(512) {
             bail!("copy size {total_size} is not 512-byte aligned");
         }
-        /// `Put Page From URL` allows at most 4 MiB per request.
-        const CHUNK: u64 = 4 * 1024 * 1024;
         /// Concurrent in-flight copy requests (override with `UBLK_COPY_CONCURRENCY`).
         const DEFAULT_CONCURRENCY: usize = 32;
+        // Per-request size (override with `UBLK_COPY_CHUNK_BYTES`); `Put Page From
+        // URL` caps it at 4 MiB.
+        let chunk = crate::backend::copy_chunk_bytes();
         let concurrency = std::env::var("UBLK_COPY_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -135,16 +136,17 @@ impl AzurePageBlobBackend {
         let page_client = blob_client.page_blob_client();
         let lease_id = self.lease_id();
 
-        let n_chunks = total_size.div_ceil(CHUNK);
+        let n_chunks = total_size.div_ceil(chunk);
         trace!(
             total_size,
             n_chunks,
+            chunk,
             concurrency,
             "server-side copy via Put Page From URL"
         );
         let copies = (0..n_chunks).map(|i| {
-            let offset = i * CHUNK;
-            let len = CHUNK.min(total_size - offset);
+            let offset = i * chunk;
+            let len = chunk.min(total_size - offset);
             let src_range = HttpRange::new(offset, len);
             let dst_range = HttpRange::new(offset, len);
             let opts = PageBlobClientUploadPagesFromUrlOptions {
