@@ -281,7 +281,7 @@ impl FlockGuard {
         let fd = file.as_raw_fd();
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
         if ret != 0 {
-            return Err(std::io::Error::last_os_error()).context("flock budget file");
+            return Err(std::io::Error::last_os_error()).context("flock cache state file");
         }
         Ok(Self { fd })
     }
