@@ -649,18 +649,12 @@ async fn run_template_copy(
     // CLI credentials (the template must then be reachable with them). The source
     // service URL is taken from the template URL's own host so a non-SAS template
     // in a different account/host than `--endpoint` is read from the right place.
-    let (src_service_url, src_auth) = if let Some(sas) = &tmpl.sas {
-        (
-            format!("{}/", tmpl.service_url.trim_end_matches('/')),
-            AuthConfig::Sas {
-                sas_token: sas.clone(),
-            },
-        )
-    } else {
-        (
-            format!("{}/", tmpl.service_url.trim_end_matches('/')),
-            build_auth(cli)?,
-        )
+    let src_service_url = format!("{}/", tmpl.service_url.trim_end_matches('/'));
+    let src_auth = match &tmpl.sas {
+        Some(sas) => AuthConfig::Sas {
+            sas_token: sas.clone(),
+        },
+        None => build_auth(cli)?,
     };
     let src_container = auth::build_container_client(&src_service_url, &tmpl.container, &src_auth)
         .context("build template container client")?;
@@ -692,6 +686,7 @@ async fn run_template_copy(
     Ok(())
 }
 
+/// Best-effort node hostname for the CSI `--node-id` default.
 #[cfg(feature = "csi")]
 fn hostname() -> String {
     std::env::var("HOSTNAME")
