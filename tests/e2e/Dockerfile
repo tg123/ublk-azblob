@@ -1,6 +1,6 @@
 # Unified test-runner image for the ublk-azblob e2e suite.
 #
-# One runner drives every e2e from a single compile (`--features "ublk csi"`):
+# One runner drives every e2e from a single compile (default ublk + csi build):
 #   * mount_e2e / nbd_e2e — run the freshly-built binary against Azurite.
 #   * k8s_pvc_e2e         — package that same binary into a thin image and run
 #                           the CSI driver on the in-compose k3s cluster.

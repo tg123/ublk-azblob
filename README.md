@@ -29,16 +29,13 @@ as a local block device (`/dev/ublkbN`), written in Rust.
 git clone https://github.com/tg123/ublk-azblob.git
 cd ublk-azblob
 
-# Build (no ublk feature — works on any kernel)
+# Build the full binary (ublk + CSI on by default).
+# Needs `protoc` plus the protobuf well-known types and libclang for the ublk
+# bindgen, e.g. apt `protobuf-compiler libprotobuf-dev libclang-dev`.
 cargo build --release -p ublk-azblob
 
-# Build with real ublk device support (requires Linux ≥6.0 + ublk_drv)
-cargo build --release -p ublk-azblob --features ublk
-
-# Build with the Kubernetes CSI driver
-# (needs `protoc` plus the protobuf well-known types, e.g. apt
-#  `protobuf-compiler libprotobuf-dev`; combine with `ublk`)
-cargo build --release -p ublk-azblob --features "ublk csi"
+# Core-only build for any kernel / macOS (no ublk, no CSI, no protoc needed)
+cargo build --release -p ublk-azblob --no-default-features
 ```
 
 ---
@@ -62,7 +59,7 @@ cargo run -p ublk-azblob -- \
   test --size 4096
 ```
 
-### Run as a block device (requires root + ublk_drv + `--features ublk`)
+### Run as a block device (requires root + ublk_drv; ublk is built in by default)
 
 ```bash
 # System-assigned Managed Identity (recommended on Azure VMs / AKS)
@@ -100,6 +97,45 @@ sudo mount /dev/ublkb0 /mnt/azblob
 
 ---
 
+## Read-only mode and blob snapshots
+
+Pass `--read-only` to the `run` subcommand to expose the device read-only. The
+ublk device (or NBD export) is advertised read-only and every write, discard,
+and write-zeroes request is rejected, so the underlying blob can never be
+modified through the device.
+
+```bash
+# Mount the live blob read-only
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount \
+  --container mydisks \
+  --blob myvm.vhd \
+  --msi \
+  run --size 10737418240 --read-only
+```
+
+To mount an immutable **point-in-time snapshot** of the blob, pass
+`--snapshot <SNAPSHOT>` (the `x-ms-snapshot` timestamp returned when the
+snapshot was created). Selecting a snapshot **implies `--read-only`** — the
+snapshot is immutable, so writes are always rejected:
+
+```bash
+# Mount a specific blob snapshot (read-only is implied)
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount \
+  --container mydisks \
+  --blob myvm.vhd \
+  --snapshot 2024-01-31T12:00:00.0000000Z \
+  --msi \
+  run --size 10737418240
+```
+
+`--create` cannot be combined with `--read-only` or `--snapshot`. The
+read-only mount skips the write-back buffer entirely (there are no writes to
+batch); read caching via `--cache-dir` still works.
+
+---
+
 ## NBD compatibility mode (no `ublk_drv` required)
 
 For kernels or platforms **without** `ublk_drv` (older kernels, containers that
@@ -109,7 +145,7 @@ This mode needs no special kernel module — only a TCP socket and the standard
 NBD client — and does **not** require the `ublk` Cargo feature.
 
 ```bash
-# Start the NBD server (works on any kernel; no --features ublk needed)
+# Start the NBD server (works on any kernel; no ublk device needed)
 ./target/release/ublk-azblob \
   --endpoint http://127.0.0.1:10000/devstoreaccount1 \
   --account devstoreaccount1 \
@@ -144,6 +180,8 @@ All CLI flags have environment-variable equivalents:
 | `--account-key` | `AZURE_STORAGE_KEY` |
 | `--container` | `AZURE_STORAGE_CONTAINER` |
 | `--blob` | `AZURE_STORAGE_BLOB` |
+| `--snapshot` | `AZURE_STORAGE_SNAPSHOT` |
+| `--read-only` | `UBLK_READ_ONLY` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
 | `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
@@ -241,8 +279,8 @@ else — the Rust build, `mkfs.ext4`, and Azurite — runs inside docker compose
 sudo modprobe ublk_drv
 
 # 2. Build + run the mount → write → flush → unmount → remount → verify cycle.
-#    The `runner` service builds with --features ublk and runs the Rust test;
-#    Azurite is started automatically as its dependency.
+#    The `runner` service builds the default (ublk + CSI) binary and runs the
+#    Rust test; Azurite is started automatically as its dependency.
 docker compose -f tests/e2e/docker-compose.yml up \
   --build --abort-on-container-exit --exit-code-from runner
 
@@ -261,7 +299,7 @@ it is gated behind the `ublk` feature and skips itself when not run as root with
 `ublk-azblob` ships an in-tree **Container Storage Interface (CSI)** driver so
 each `PersistentVolumeClaim` is provisioned as one Azure Page Blob and exposed
 to pods as an ext4 filesystem on a ublk block device. The driver is the same
-binary, built with `--features "ublk csi"` and run via the `csi` subcommand:
+binary (ublk + CSI are on by default) run via the `csi` subcommand:
 
 ```bash
 # controller (provisions/deletes page blobs) — runs in a Deployment
@@ -346,8 +384,8 @@ Unit tests run against `MemBackend` — no network, no kernel required.
 
 GitHub Actions runs on every push to `main` and every pull request:
 - `cargo fmt --check`
-- `cargo clippy --all-features -- -D warnings`
-- `cargo test --all-features` (unit tests, `MemBackend`)
+- `cargo clippy -- -D warnings`
+- `cargo test` (unit tests, `MemBackend`)
 - the `e2e` workflow: one job that builds the shipped image once and runs the
   mount (`/dev/ublkbN` + ext4 ↔ Azurite), NBD, and Kubernetes PVC e2e against a
   k3s cluster from `tests/e2e/docker-compose.yml`.
@@ -371,8 +409,8 @@ ublk-azblob/
 │   ├── src/
 │   │   ├── main.rs             # CLI entry point (clap)
 │   │   ├── auth.rs             # MSI + SharedKey credential factory
-│   │   ├── ublk_target.rs      # ublk device I/O loop (gated on --features ublk)
-│   │   ├── csi/                # Kubernetes CSI driver (gated on --features csi)
+│   │   ├── ublk_target.rs      # ublk device I/O loop (default feature `ublk`)
+│   │   ├── csi/                # Kubernetes CSI driver (default feature `csi`)
 │   │   │   ├── mod.rs          # gRPC server, role/config, volume-id encoding
 │   │   │   ├── identity.rs     # CSI Identity service
 │   │   │   ├── controller.rs   # CSI Controller service (Create/DeleteVolume)
@@ -388,7 +426,7 @@ ublk-azblob/
 │   └── tests/
 │       └── mount_e2e.rs        # full mount → write → flush → remount → verify
 ├── deploy/
-│   ├── Dockerfile              # CSI driver image (--features "ublk csi")
+│   ├── Dockerfile              # CSI driver image (default ublk + csi build)
 │   ├── chart/                  # Helm chart (CSIDriver, RBAC, controller, node, StorageClass)
 │   └── example/                # sample PVC + pod
 ├── tests/

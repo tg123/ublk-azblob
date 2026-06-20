@@ -27,6 +27,11 @@
 //!   AZURE_STORAGE_ENDPOINT="http://127.0.0.1:10000/devstoreaccount1" \
 //!   cargo test --release --features ublk --test mount_e2e -- --nocapture
 //! ```
+//!
+//! A second test, [`mount_read_only`](fn.mount_read_only.html), exercises
+//! `run --read-only`: it asserts the kernel marks `/dev/ublkbN` read-only,
+//! verifies the data is still readable, and confirms a write to the read-only
+//! mount fails without mutating the backing blob.
 #![cfg(feature = "ublk")]
 
 use std::fs;
@@ -64,6 +69,11 @@ struct DeviceSpec {
     /// Shared local-disk cache byte budget (`--cache-max-bytes`); `0` (the
     /// default) means unlimited.  Only meaningful when `cache_dir` is `Some`.
     cache_max_bytes: u64,
+    /// When true the device is started with all automatic flushing disabled
+    /// (`--idle-flush-secs 0 --force-flush-timeout-secs 0`), so the only thing
+    /// that can persist a buffered write is an explicit flush or the
+    /// flush-on-shutdown path. Used by the graceful-shutdown test.
+    disable_auto_flush: bool,
 }
 
 impl DeviceSpec {
@@ -123,14 +133,23 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
 /// `stop_device`), so the zombie-process lint does not apply.
 #[allow(clippy::zombie_processes)]
 fn start_device(spec: &DeviceSpec, create: bool) -> Child {
+    start_device_opts(spec, create, false)
+}
+
+/// Like [`start_device`] but lets the caller expose the device read-only
+/// (`run --read-only`).  `create` and `read_only` are mutually exclusive at the
+/// CLI level, so callers pass `create=false` when `read_only=true`.
+#[allow(clippy::zombie_processes)]
+fn start_device_opts(spec: &DeviceSpec, create: bool, read_only: bool) -> Child {
     let dev = spec.dev_path();
     log(&format!(
-        "starting ublk device {dev} ({}{})",
+        "starting ublk device {dev} ({}{}{})",
         if create {
             "--create"
         } else {
             "reuse existing blob"
         },
+        if read_only { ", --read-only" } else { "" },
         match &spec.cache_dir {
             Some(d) => format!(", cache_dir={}", d.display()),
             None => String::new(),
@@ -149,12 +168,23 @@ fn start_device(spec: &DeviceSpec, create: bool) -> Child {
     if create {
         cmd.arg("--create");
     }
+    if read_only {
+        cmd.arg("--read-only");
+    }
     if let Some(dir) = &spec.cache_dir {
         cmd.arg("--cache-dir").arg(dir);
         if spec.cache_max_bytes > 0 {
             cmd.arg("--cache-max-bytes")
                 .arg(spec.cache_max_bytes.to_string());
         }
+    }
+    if spec.disable_auto_flush {
+        // Disable both the idle and the force-flush timers so a buffered write
+        // is only persisted by an explicit flush or the shutdown flush path.
+        cmd.arg("--idle-flush-secs")
+            .arg("0")
+            .arg("--force-flush-timeout-secs")
+            .arg("0");
     }
     azure_env(&mut cmd, &spec.container, &spec.blob);
 
@@ -265,6 +295,7 @@ fn mount_roundtrip() {
         blob: env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB),
         cache_dir: None,
         cache_max_bytes: 0,
+        disable_auto_flush: false,
     });
 }
 
@@ -295,6 +326,7 @@ fn mount_roundtrip_file_cache() {
         blob: format!("{}-fcache", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: Some(cache_dir.clone()),
         cache_max_bytes: 0,
+        disable_auto_flush: false,
     });
     let _ = fs::remove_dir_all(&cache_dir);
 }
@@ -319,13 +351,15 @@ fn mount_roundtrip_file_cache_budget() {
     let cache_dir = tempdir("ublk-azblob-cache-budget");
     run_mount_roundtrip(DeviceSpec {
         // Distinct device id, container and blob (see other tests' comments).
-        dev_id: "42".to_string(),
+        // 44 avoids mount_read_only's 42 and graceful_shutdown's 43.
+        dev_id: "44".to_string(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-fcache-budget", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: Some(cache_dir.clone()),
         // 8 MiB budget while the test writes well over that (up to ~4 MiB per
         // file across NUM_FILES files), so eviction is exercised.
         cache_max_bytes: 8 * 1024 * 1024,
+        disable_auto_flush: false,
     });
     let _ = fs::remove_dir_all(&cache_dir);
 }
@@ -398,4 +432,220 @@ fn run_mount_roundtrip(spec: DeviceSpec) {
     let _ = fs::remove_dir_all(&mnt);
 
     log("mount e2e PASSED ✓");
+}
+
+/// e2e for read-only mode (`run --read-only`) over the kernel ublk path.
+///
+/// Cycle:
+///   1. provision the device writable, make an ext4 filesystem, write random
+///      files, record their checksums, flush and tear the device down
+///   2. bring the device back up over the *same* blob with `--read-only` and
+///      assert:
+///      * the kernel marks `/dev/ublkbN` read-only
+///        (`/sys/block/ublkbN/ro == 1`, courtesy of `UBLK_ATTR_READ_ONLY`)
+///      * the filesystem can be mounted read-only and every file's checksum
+///        still matches (data round-tripped and is served read-only)
+///      * an attempt to write a new file fails (the mount is read-only)
+///   3. reopen the device writable and confirm the blob was never modified
+#[test]
+fn mount_read_only() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_read_only: requires root and a loaded ublk_drv \
+             (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let spec = DeviceSpec {
+        // Distinct, high device id and blob so this test never collides with
+        // the other mount tests or the low ids the k8s CSI e2e auto-assigns.
+        dev_id: "42".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-ro", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: None,
+        cache_max_bytes: 0,
+        disable_auto_flush: false,
+    };
+    let dev = spec.dev_path();
+    let mnt = tempdir("ublk-azblob-ro-mnt");
+
+    // ── Phase 1: provision the device writable and seed known files ───────────
+    let child = start_device(&spec, true);
+    log(&format!("mkfs.ext4 on {dev}"));
+    run("mkfs.ext4", &["-q", "-F", "-E", "nodiscard", &dev]);
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+
+    log(&format!("writing {NUM_FILES} random files"));
+    let mut checksums: Vec<(String, String)> = Vec::with_capacity(NUM_FILES);
+    for i in 1..=NUM_FILES {
+        let name = format!("random_{i}.bin");
+        let path = mnt.join(&name);
+        let len = 1024 * (1 + (i * 509) % 4096);
+        write_random_file(&path, len);
+        checksums.push((name, sha256_file(&path)));
+    }
+
+    log("sync + SIGUSR1 to force flush to the page blob");
+    run("sync", &[]);
+    signal(&child, libc::SIGUSR1);
+    sleep(Duration::from_secs(2));
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // ── Phase 2: reopen read-only and assert the device rejects writes ────────
+    let child = start_device_opts(&spec, false, true);
+
+    // The kernel exposes the read-only attribute via /sys/block/<dev>/ro.
+    let ro_attr = format!("/sys/block/ublkb{}/ro", spec.dev_id);
+    let ro_val = fs::read_to_string(&ro_attr)
+        .unwrap_or_else(|e| panic!("read {ro_attr}: {e}"))
+        .trim()
+        .to_string();
+    assert_eq!(
+        ro_val, "1",
+        "{dev} should be read-only ({ro_attr} = {ro_val}, expected 1)"
+    );
+
+    // Mount read-only.  `noload` skips ext4 journal recovery, which would
+    // otherwise try to write to the (now read-only) device.
+    log(&format!("mounting {dev} read-only at {}", mnt.display()));
+    run("mount", &["-o", "ro,noload", &dev, mnt.to_str().unwrap()]);
+
+    log("verifying checksums on the read-only mount");
+    for (name, expected) in &checksums {
+        let actual = sha256_file(&mnt.join(name));
+        assert_eq!(
+            &actual, expected,
+            "checksum mismatch for {name} (read-only)"
+        );
+    }
+
+    log("verifying a write to the read-only mount fails");
+    let new_file = mnt.join("should_not_write.bin");
+    assert!(
+        fs::write(&new_file, b"nope").is_err(),
+        "writing {new_file:?} unexpectedly succeeded on a read-only mount"
+    );
+    assert!(
+        !new_file.exists(),
+        "{new_file:?} should not exist after a rejected write"
+    );
+
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // ── Phase 3: reopen writable and confirm the blob was untouched ───────────
+    let child = start_device(&spec, false);
+    log(&format!("remounting {dev} writable at {}", mnt.display()));
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+    for (name, expected) in &checksums {
+        let actual = sha256_file(&mnt.join(name));
+        assert_eq!(
+            &actual, expected,
+            "blob changed despite read-only mount for {name}"
+        );
+    }
+    assert!(
+        !mnt.join("should_not_write.bin").exists(),
+        "a file rejected by the read-only mount leaked into the blob"
+    );
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    let _ = fs::remove_dir_all(&mnt);
+    log("mount read-only e2e PASSED ✓");
+}
+
+/// Graceful-shutdown e2e: prove a write buffered only in memory is flushed to
+/// the page blob when the device receives `SIGINT` — with **no** explicit
+/// `SIGUSR1`, **no** `umount` FLUSH, and **no** automatic (idle/force) flush —
+/// and that the data survives tearing the device down and bringing a fresh one
+/// back up over the same blob.
+///
+/// This validates the shutdown flush in `ublk_target::run_ublk_target`: writing
+/// straight to the raw `/dev/ublkbN` with `oflag=direct` (and no `conv=fsync`)
+/// leaves the data sitting in the in-memory write-back buffer, so without the
+/// flush-on-shutdown the pattern would be lost after the restart.
+#[test]
+fn graceful_shutdown_flush() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping graceful_shutdown_flush: requires root and a loaded \
+             ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let spec = DeviceSpec {
+        // Distinct device id, container and blob so this test never collides
+        // with the other mount tests (or the k8s CSI e2e's low auto-assigned ids).
+        dev_id: "43".to_string(), // distinct from mount_read_only's 42; see above
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-shutdown", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: None,
+        cache_max_bytes: 0,
+        // The whole point: only the shutdown flush may persist the write.
+        disable_auto_flush: true,
+    };
+    let dev = spec.dev_path();
+    let work = tempdir("ublk-azblob-shutdown");
+
+    // ── Phase 1: provision the device, write a pattern straight to the raw
+    //    block device with O_DIRECT and no fsync, then SIGINT it ───────────────
+    let child = start_device(&spec, true);
+
+    // 8 MiB of random data, written 1 MiB at a time with oflag=direct so it
+    // bypasses the page cache and lands in the device's in-memory buffer. No
+    // `conv=fsync`, so the kernel never issues a FLUSH.
+    const PATTERN_MIB: usize = 8;
+    let pattern = work.join("pattern.bin");
+    write_random_file(&pattern, PATTERN_MIB * 1024 * 1024);
+    let expected = sha256_file(&pattern);
+
+    log(&format!("dd pattern → raw {dev} (oflag=direct, no fsync)"));
+    run(
+        "dd",
+        &[
+            &format!("if={}", pattern.display()),
+            &format!("of={dev}"),
+            "bs=1M",
+            &format!("count={PATTERN_MIB}"),
+            "oflag=direct",
+            "conv=notrunc",
+        ],
+    );
+
+    // SIGINT and wait for a clean exit. `stop_device` sends SIGINT and asserts
+    // the process exits successfully — the only path that can flush the buffer.
+    log("SIGINT the device (relies solely on the shutdown flush)");
+    stop_device(&dev, child);
+
+    // ── Phase 2: bring up a fresh device over the same blob and read back ──────
+    let child = start_device(&spec, false);
+
+    log(&format!("dd read back from raw {dev} (iflag=direct)"));
+    let readback = work.join("readback.bin");
+    run(
+        "dd",
+        &[
+            &format!("if={dev}"),
+            &format!("of={}", readback.display()),
+            "bs=1M",
+            &format!("count={PATTERN_MIB}"),
+            "iflag=direct",
+        ],
+    );
+
+    let actual = sha256_file(&readback);
+    assert_eq!(
+        actual, expected,
+        "pattern mismatch after SIGINT shutdown + remount — the buffered \
+         write was not flushed on shutdown"
+    );
+
+    stop_device(&dev, child);
+    let _ = fs::remove_dir_all(&work);
+
+    log("graceful shutdown e2e PASSED ✓");
 }

@@ -5,16 +5,16 @@
 //! dispatched to the appropriate `BlobBackend` method.
 //!
 //! ## Feature flag
-//! The real ublk loop is gated behind the `ublk` Cargo feature because it
-//! requires:
+//! The real ublk loop is gated behind the `ublk` Cargo feature, which is **on
+//! by default**.  It requires:
 //! - Linux kernel ≥ 6.0 with `ublk_drv` loaded
 //! - Root / `CAP_SYS_ADMIN`
 //! - The `libublk` crate
 //!
-//! Without the feature flag the module exposes a stub that prints a clear
-//! error and exits.  All `BlobBackend` logic (read/write/clear) can still be
-//! exercised through unit tests and the `test` subcommand without the kernel
-//! driver.
+//! Building with `--no-default-features` (e.g. on macOS or without the kernel
+//! driver) compiles a stub that prints a clear error and exits.  All
+//! `BlobBackend` logic (read/write/clear) can still be exercised through unit
+//! tests and the `test` subcommand without the kernel driver.
 //!
 //! ## Signals (feature = "ublk")
 //! Once the device is up the process installs handlers for:
@@ -40,6 +40,8 @@ pub struct UblkConfig {
     pub queue_depth: u16,
     /// Device id to request (`-1` lets the kernel auto-allocate).
     pub id: i32,
+    /// Expose the device read-only (kernel rejects writes with `EROFS`).
+    pub read_only: bool,
 }
 
 impl Default for UblkConfig {
@@ -50,6 +52,7 @@ impl Default for UblkConfig {
             nr_queues: 1,
             queue_depth: 64,
             id: -1,
+            read_only: false,
         }
     }
 }
@@ -74,8 +77,10 @@ pub async fn run_ublk_target(backend: Arc<dyn BlobBackend>, cfg: UblkConfig) -> 
     {
         let _ = (backend, cfg);
         anyhow::bail!(
-            "ublk kernel target is not compiled in.\n\
-             Rebuild with `--features ublk` on a Linux host with ublk_drv loaded.\n\
+            "ublk kernel target is not compiled in (built with \
+             `--no-default-features`).\n\
+             Rebuild without `--no-default-features` (or with `--features ublk`) \
+             on a Linux host with ublk_drv loaded.\n\
              To exercise the BlobBackend without a kernel, use the `test` \
              subcommand (write → read → clear → verify smoke test)."
         );
@@ -164,6 +169,7 @@ fn run_ublk_target_blocking(
         nr_queues = cfg.nr_queues,
         queue_depth = cfg.queue_depth,
         id = cfg.id,
+        read_only = cfg.read_only,
         "starting ublk target"
     );
 
@@ -178,6 +184,7 @@ fn run_ublk_target_blocking(
 
     let dev_size = cfg.dev_size;
     let block_size = cfg.block_size;
+    let read_only = cfg.read_only;
     if block_size < 512 || !block_size.is_multiple_of(512) || !block_size.is_power_of_two() {
         anyhow::bail!(
             "block_size ({block_size}) must be a power of two that is >= 512 and a multiple of 512"
@@ -192,6 +199,11 @@ fn run_ublk_target_blocking(
         // shift for `block_size`.
         dev.set_default_params(dev_size);
         dev.tgt.params.basic.logical_bs_shift = block_size.trailing_zeros() as u8;
+        // In read-only mode advertise UBLK_ATTR_READ_ONLY so the kernel marks
+        // /dev/ublkbN read-only and rejects writes with EROFS.
+        if read_only {
+            dev.tgt.params.basic.attrs |= sys::UBLK_ATTR_READ_ONLY;
+        }
         Ok(())
     };
 
