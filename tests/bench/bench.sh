@@ -243,8 +243,9 @@ done
 # ── Phase 2: Cache behaviour (buffered I/O so the cache is exercised) ──────────
 # Cold cache = first read after writes; warm cache = immediate re-read.  Both use
 # buffered I/O (direct=0).  Each state is compared against the raw-local-disk
-# baseline (the `vs local` column), and the warm/cold speed-up shows the
-# ublk-azblob read cache working.
+# baseline (the `vs local` column).  The device runs without `--cache-dir` and
+# BufferedBackend does not cache clean reads, so the warm/cold speed-up reflects
+# the kernel's block-device page cache, not a ublk-azblob read cache.
 {
     # ublk-azblob: cold read, then an immediate warm re-read.
     ucold="$(run_fio ublk-azblob "$DEV" read "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "" 0)"
@@ -271,10 +272,10 @@ done
         "2 cache" "warm-cache read" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$uwbw" "$uwiops" "$uwlat" "$uwpct")")
     ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\tlocal-disk\t%s\t%s\t%s\tbaseline' \
         "2 cache" "warm-cache read" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$lwbw" "$lwiops" "$lwlat")")
-    # Warm/cold cache speed-up for ublk-azblob (how much the read cache helps).
+    # Warm/cold speed-up for ublk-azblob (how much the kernel page cache helps).
     uwarmpct="$(pct_of_baseline "$uwbw" "$ucbw")"
     ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\tublk-azblob\t%s\t%s\t%s\t%s%%' \
-        "2 cache" "warm vs cold (cache speed-up)" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$uwbw" "$uwiops" "$uwlat" "$uwarmpct")")
+        "2 cache" "warm vs cold (page-cache speed-up)" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$uwbw" "$uwiops" "$uwlat" "$uwarmpct")")
 }
 
 # ── Phase 4: Scalability (random read at increasing thread counts) ────────────

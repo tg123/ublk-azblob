@@ -422,8 +422,10 @@ result also expressed as a **percentage of the raw-local-disk baseline** (the
   random read/write) plus sweeps over block size (`4k…1M`), queue depth
   (`1…128`), and read/write mix (`100/0`, `70/30`, `50/50`).
 * **Phase 2 — Cache behaviour:** cold-cache vs. warm-cache buffered reads, each
-  compared against the raw-local-disk baseline, plus the ublk-azblob warm/cold
-  read-cache speed-up.
+  compared against the raw-local-disk baseline, plus the warm/cold speed-up.
+  The device runs without `--cache-dir` (and `BufferedBackend` does not cache
+  clean reads), so this warm/cold speed-up reflects the kernel's block-device
+  page cache, not a ublk-azblob read cache.
 * **Phase 4 — Scalability:** the random-read workload at increasing thread
   (`numjobs`) counts.
 
