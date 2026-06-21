@@ -15,6 +15,7 @@ use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures::stream::{StreamExt as _, TryStreamExt as _};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +44,15 @@ pub struct BufferedConfig {
     /// Set to 0 (the default) for no cap, so explicit and shutdown flushes can
     /// run to completion even when there are many dirty pages or a slow link.
     pub flush_io_timeout_secs: u64,
+    /// Maximum number of dirty pages flushed concurrently to the inner backend.
+    ///
+    /// Flushing is latency-bound when the inner backend is remote (e.g. Azure in
+    /// a distant region), so issuing several page writes in flight at once is the
+    /// key throughput lever. Each in-flight write holds its own snapshot of the
+    /// page, so the transient extra memory is bounded by
+    /// `page_size × flush_concurrency`. A value of `1` restores fully sequential
+    /// flushing. Values are clamped to at least `1`.
+    pub flush_concurrency: usize,
 }
 
 impl Default for BufferedConfig {
@@ -53,6 +63,7 @@ impl Default for BufferedConfig {
             idle_flush_secs: 15,           // flush after 15s idle
             force_flush_timeout_secs: 600, // force flush after 10 minutes
             flush_io_timeout_secs: 0,      // no per-flush I/O cap by default
+            flush_concurrency: 16,         // up to 16 pages in flight per flush
         }
     }
 }
@@ -274,15 +285,21 @@ impl BufferedBackend {
 
     /// Flush the given pages to the inner backend.
     ///
-    /// Each page's bytes are snapshotted under a brief lock, written to the
-    /// inner backend with the lock released, then marked clean under the lock —
-    /// but only if the page was not modified again during the write (detected
-    /// via its sequence number).  This guarantees no dirty data is lost.
+    /// Pages are flushed with bounded concurrency (`flush_concurrency`): up to
+    /// that many page writes are in flight at once, which is the key throughput
+    /// lever when the inner backend is latency-bound (e.g. a remote blob store).
+    ///
+    /// Each page's bytes are snapshotted under a brief lock (so at most
+    /// `flush_concurrency` snapshots exist at once), written to the inner backend
+    /// with the lock released, then marked clean under the lock — but only if the
+    /// page was not modified again during the write (detected via its sequence
+    /// number). This guarantees no dirty data is lost.
     ///
     /// If `flush_io_timeout_secs` is configured, the entire flush operation
     /// must complete within that timeout or it will be aborted.
     async fn flush_indices(&self, indices: &[u64]) -> anyhow::Result<()> {
         let page_size = self.config.page_size;
+        let concurrency = self.config.flush_concurrency.max(1);
         let timeout = if self.config.flush_io_timeout_secs > 0 {
             Some(Duration::from_secs(self.config.flush_io_timeout_secs))
         } else {
@@ -290,7 +307,7 @@ impl BufferedBackend {
         };
 
         let flush_task = async {
-            for &page_idx in indices {
+            futures::stream::iter(indices.iter().copied().map(|page_idx| async move {
                 // Snapshot the dirty page under a brief lock (no await held).
                 let snapshot = {
                     let state = self.state.lock().await;
@@ -314,7 +331,7 @@ impl BufferedBackend {
                 };
 
                 let Some((seq, offset, write_len, data)) = snapshot else {
-                    continue;
+                    return Ok(());
                 };
 
                 if write_len > 0 {
@@ -337,8 +354,11 @@ impl BufferedBackend {
                         p.dirty = false;
                     }
                 }
-            }
-            Ok::<(), anyhow::Error>(())
+                Ok::<(), anyhow::Error>(())
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect::<()>()
+            .await
         };
 
         if let Some(timeout_duration) = timeout {
@@ -624,6 +644,7 @@ mod tests {
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
+                flush_concurrency: 16,
             },
         )
         .unwrap()
@@ -659,6 +680,7 @@ mod tests {
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
+                flush_concurrency: 16,
             },
         )
         .unwrap();
@@ -687,6 +709,7 @@ mod tests {
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
+                flush_concurrency: 16,
             },
         )
         .unwrap();
@@ -699,6 +722,67 @@ mod tests {
         // The first page (oldest) should have been flushed to inner.
         let inner_read = inner.read(0, 512).await.unwrap();
         assert_eq!(inner_read, Bytes::from(vec![0x11; 512]));
+    }
+
+    #[tokio::test]
+    async fn concurrent_flush_persists_all_dirty_pages() {
+        // Many dirty pages flushed at once must all reach the inner backend,
+        // regardless of the (bounded, out-of-order) flush concurrency.
+        const PAGES: u64 = 40;
+        let page_size = 1024u64;
+        let dev_size = PAGES * page_size;
+        let inner = Arc::new(MemBackend::new(dev_size).unwrap());
+        let b = BufferedBackend::new(
+            inner.clone(),
+            BufferedConfig {
+                page_size,
+                max_dirty_pages: PAGES as usize, // keep them all dirty until flush()
+                idle_flush_secs: 0,
+                force_flush_timeout_secs: 0,
+                flush_io_timeout_secs: 0,
+                flush_concurrency: 8,
+            },
+        )
+        .unwrap();
+
+        for p in 0..PAGES {
+            let byte = (p & 0xFF) as u8;
+            b.write(p * page_size, Bytes::from(vec![byte; page_size as usize]))
+                .await
+                .unwrap();
+        }
+
+        b.flush().await.unwrap();
+
+        for p in 0..PAGES {
+            let byte = (p & 0xFF) as u8;
+            let got = inner.read(p * page_size, page_size).await.unwrap();
+            assert_eq!(got, Bytes::from(vec![byte; page_size as usize]), "page {p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_concurrency_clamped_to_at_least_one() {
+        // A configured concurrency of 0 must not deadlock or skip pages; it is
+        // clamped up to 1 (fully sequential).
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        let b = BufferedBackend::new(
+            inner.clone(),
+            BufferedConfig {
+                page_size: 1024,
+                max_dirty_pages: 8,
+                idle_flush_secs: 0,
+                force_flush_timeout_secs: 0,
+                flush_io_timeout_secs: 0,
+                flush_concurrency: 0,
+            },
+        )
+        .unwrap();
+
+        let data = Bytes::from(vec![0x5A; 512]);
+        b.write(0, data.clone()).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(inner.read(0, 512).await.unwrap(), data);
     }
 
     #[tokio::test]
@@ -741,6 +825,7 @@ mod tests {
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
+                flush_concurrency: 16,
             },
         )
         .unwrap();
