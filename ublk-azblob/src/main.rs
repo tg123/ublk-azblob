@@ -65,7 +65,8 @@ struct Cli {
     /// snapshot can never change, selecting one is what makes the device
     /// **read-only** (all write/discard operations are rejected) *and* makes the
     /// local cache safe to reuse: there is no separate `--read-only` flag.
-    /// May also be supplied as a `?snapshot=` query on `--blob-url`.
+    /// May also be supplied as a `?snapshot=` query on `--blob-url`; there is no
+    /// `AZURE_STORAGE_SNAPSHOT` environment variable binding.
     #[arg(long)]
     snapshot: Option<String>,
 
