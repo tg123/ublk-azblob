@@ -40,11 +40,11 @@ pub struct TemplateBlobRef {
 /// the SAS token.
 pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
     let parsed =
-        azure_core::http::Url::parse(url).with_context(|| format!("parse blob url: {url}"))?;
+        azure_core::http::Url::parse(url).with_context(|| format!("parse blob URL: {url}"))?;
     let scheme = parsed.scheme();
     let host = parsed
         .host_str()
-        .context("blob url has no host")?
+        .context("blob URL has no host")?
         .to_string();
 
     // Split query into snapshot vs the rest (SAS).
@@ -84,7 +84,7 @@ pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
     let (service_url, account, container, blob) = if azure_subdomain {
         let account = host.split('.').next().unwrap_or("").to_string();
         if segments.len() < 2 {
-            anyhow::bail!("blob url missing container/blob path: {url}");
+            anyhow::bail!("blob URL missing container/blob path: {url}");
         }
         let container = segments[0].clone();
         let blob = segments[1..].join("/");
@@ -93,7 +93,7 @@ pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
     } else {
         // Path-style / Azurite: `host:port/<account>/<container>/<blob...>`.
         if segments.len() < 3 {
-            anyhow::bail!("blob url missing account/container/blob path: {url}");
+            anyhow::bail!("blob URL missing account/container/blob path: {url}");
         }
         let account = segments[0].clone();
         let container = segments[1].clone();
@@ -108,7 +108,7 @@ pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
     };
 
     if container.is_empty() || blob.is_empty() {
-        anyhow::bail!("blob url missing container or blob: {url}");
+        anyhow::bail!("blob URL missing container or blob: {url}");
     }
     Ok(TemplateBlobRef {
         service_url,
