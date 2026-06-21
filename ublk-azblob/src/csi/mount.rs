@@ -322,10 +322,10 @@ pub struct FsProfile {
 /// Return the built-in formatting/mount profile for `fs_type`.
 ///
 /// Supported profiles cover ext2/3/4, xfs, btrfs, squashfs, zfs and ntfs.
-/// squashfs and zfs are read-only image / pool filesystems that are never
-/// created on a live device, so they have no `mkfs` options (`None`). Unknown
-/// types also map to `None`, so [`mkfs`] rejects them instead of shelling out
-/// to a non-existent `mkfs.<fs>`.
+/// squashfs, zfs and ntfs are image / pool filesystems that we only ever mount
+/// from a template (never freshly format on a live device), so they have no
+/// `mkfs` options (`None`). Unknown types also map to `None`, so [`mkfs`]
+/// rejects them instead of shelling out to a non-existent `mkfs.<fs>`.
 pub fn fs_profile(fs_type: &str) -> FsProfile {
     match fs_type {
         "ext2" | "ext3" | "ext4" => FsProfile {
@@ -345,16 +345,13 @@ pub fn fs_profile(fs_type: &str) -> FsProfile {
             mkfs_options: Some(&["-f"]),
             mount_options: &[],
         },
-        // Read-only image / pool filesystems: only ever mounted from a template,
-        // never formatted on a freshly-provisioned device.
-        "squashfs" | "zfs" => FsProfile {
+        // Image / pool filesystems: only ever mounted from a template, never
+        // formatted on a freshly-provisioned device. squashfs/zfs are read-only
+        // images; ntfs is a template-only image too — we do not create NTFS
+        // (no reliable read-write NTFS formatting, and `mkfs.ntfs` isn't shipped
+        // in the runtime image), so it can only be mounted from a template.
+        "squashfs" | "zfs" | "ntfs" => FsProfile {
             mkfs_options: None,
-            mount_options: &[],
-        },
-        "ntfs" => FsProfile {
-            // `-F` forces, `-Q` does a quick format (skip zeroing and the
-            // bad-block scan).
-            mkfs_options: Some(&["-F", "-Q"]),
             mount_options: &[],
         },
         _ => FsProfile {

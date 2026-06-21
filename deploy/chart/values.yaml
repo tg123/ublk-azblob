@@ -166,9 +166,11 @@ storageClass:
     # Use single quotes to preserve ${...} variables literally
     blobPathTemplate: '${pvc.namespace}/volumes/${pv.name}'
     
-    # Filesystem type to format a freshly-provisioned blob with. Each supported
+    # Filesystem type to format a freshly-provisioned blob with. Each formattable
     # type carries a built-in profile of mkfs + mount options: ext2/ext3/ext4,
-    # xfs, btrfs, squashfs, zfs, ntfs.
+    # xfs, btrfs. squashfs, zfs and ntfs are mount-only image filesystems (used
+    # via templateBlobFsType); they are never freshly formatted, so they are not
+    # valid here.
     newBlobFsType: ext4
 
     # Provision the volume from a golden-image *template* blob. Full Azure blob
