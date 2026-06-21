@@ -90,23 +90,22 @@ sudo mount /dev/ublkb0 /mnt/azblob
 ## Read-only mode and blob snapshots
 
 A device is exposed **read-only** by mounting an immutable **point-in-time
-snapshot** of the blob: pass `--snapshot <SNAPSHOT>` (the `x-ms-snapshot`
-timestamp returned when the snapshot was created), or append
-`?snapshot=<SNAPSHOT>` to `--blob-url`. There is no separate read-only flag — a
-snapshot is immutable, so the ublk device (or NBD export) is advertised
-read-only and every write, discard, and write-zeroes request is rejected, and
-(because the content can never change) the local cache is safe to reuse.
+snapshot** of the blob: append `?snapshot=<SNAPSHOT>` (the `x-ms-snapshot`
+timestamp returned when the snapshot was created) to `--blob-url`. There is no
+separate read-only flag — a snapshot is immutable, so the ublk device (or NBD
+export) is advertised read-only and every write, discard, and write-zeroes
+request is rejected, and (because the content can never change) the local cache
+is safe to reuse.
 
 ```bash
 # Mount a specific blob snapshot (read-only is implied)
 sudo ./target/release/ublk-azblob \
-  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
-  --snapshot 2024-01-31T12:00:00.0000000Z \
+  --blob-url "https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd?snapshot=2024-01-31T12:00:00.0000000Z" \
   --msi \
   run --size 10737418240
 ```
 
-`--create` cannot be combined with `--snapshot` (a snapshot is immutable). A
+`--create` cannot be combined with a snapshot URL (a snapshot is immutable). A
 snapshot mount skips the write-back buffer entirely (there are no writes to
 batch); read caching via `--cache-dir` still works.
 
@@ -124,9 +123,7 @@ lapses within ≤60s).
 ```bash
 # Default: the blob lock is acquired automatically — no extra flag needed.
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240
 ```
@@ -136,11 +133,11 @@ process is using the blob:
 
 ```bash
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount --container mydisks --blob myvm.vhd --msi \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd --msi \
   run --size 10737418240 --disable-blob-lock
 ```
 
-Read-only mounts (`--snapshot`) never take the lock, since they
+Read-only snapshot mounts (a `?snapshot=` blob URL) never take the lock, since they
 never write. In Kubernetes, the CSI driver layers a cluster-wide lease on top of
 this blob lock via `--coordination` so a dead node's volume can be safely taken
 over; see [`docs/cluster-testing.md`](docs/cluster-testing.md). `--coordination`

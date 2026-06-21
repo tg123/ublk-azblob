@@ -54,21 +54,15 @@ struct Cli {
     /// or, for Azurite, `http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob`.
     /// The URL may carry a `?snapshot=<timestamp>` and/or a SAS query.
     ///
+    /// Selecting a snapshot (`?snapshot=<timestamp>`) is what makes the device
+    /// **read-only** (all write/discard operations are rejected) *and* makes the
+    /// local cache safe to reuse: there is no separate `--read-only` flag. A
+    /// snapshot is an immutable, point-in-time view of the blob.
+    ///
     /// Required by the `run`, `test` and `copy` subcommands.  Not used in `csi`
     /// mode (values come from StorageClass parameters / secrets).
     #[arg(long, env = "AZURE_STORAGE_BLOB_URL")]
     blob_url: Option<String>,
-
-    /// Target a specific blob *snapshot* (the `x-ms-snapshot` timestamp).
-    ///
-    /// A snapshot is an immutable, point-in-time view of the blob.  Because a
-    /// snapshot can never change, selecting one is what makes the device
-    /// **read-only** (all write/discard operations are rejected) *and* makes the
-    /// local cache safe to reuse: there is no separate `--read-only` flag.
-    /// May also be supplied as a `?snapshot=` query on `--blob-url`; `--snapshot`
-    /// takes precedence when both are provided.
-    #[arg(long)]
-    snapshot: Option<String>,
 
     /// Storage account key (base64).  Enables SharedKey auth mode.
     ///
@@ -799,78 +793,34 @@ struct Location {
     container: String,
     /// Blob name (may contain `/`).
     blob: String,
-    /// Effective snapshot timestamp (CLI `--snapshot` overrides the URL's
-    /// `?snapshot=`).
+    /// Snapshot timestamp from the URL's `?snapshot=` query, when present.
     snapshot: Option<String>,
     /// Effective SAS token (CLI `--sas-token` overrides the URL's SAS query).
     sas: Option<String>,
 }
 
 impl Cli {
-    fn snapshot_from_env() -> Option<String> {
-        std::env::var("AZURE_STORAGE_SNAPSHOT")
-            .ok()
-            .filter(|s| !s.is_empty())
-    }
-
-    /// Resolve the target blob for the single-device subcommands.
+    /// Resolve the target blob for the single-device subcommands from the
+    /// global `--blob-url` (env `AZURE_STORAGE_BLOB_URL`).
     ///
-    /// The user-facing path parses the global `--blob-url` into its components,
-    /// applying the `--snapshot` / `--sas-token` overrides.  When `--blob-url`
-    /// is absent the explicit `AZURE_STORAGE_{ACCOUNT,CONTAINER,BLOB,ENDPOINT}`
-    /// environment is used instead: this is the internal contract the CSI node
-    /// plugin relies on, which spawns this `run` child with those variables (a
-    /// per-volume `%s` subdomain endpoint template cannot be encoded in a single
-    /// parseable `--blob-url`).
+    /// The account, container, blob, endpoint, snapshot and SAS are all carried
+    /// by the URL; the CSI node plugin spawns this `run` child with a single
+    /// `AZURE_STORAGE_BLOB_URL` (substituting any `%s` account placeholder and
+    /// appending `?snapshot=` for read-only snapshot volumes). `--sas-token`
+    /// still overrides the URL's SAS query.
     fn location(&self) -> anyhow::Result<Location> {
-        if let Some(url) = self.blob_url.as_deref() {
-            let parsed = bloburl::parse_blob_url(url).context("parse --blob-url")?;
-            return Ok(Location {
-                endpoint: format!("{}/", parsed.service_url.trim_end_matches('/')),
-                account: parsed.account,
-                container: parsed.container,
-                blob: parsed.blob,
-                snapshot: self
-                    .snapshot
-                    .clone()
-                    .or(parsed.snapshot)
-                    .or_else(Self::snapshot_from_env),
-                sas: self.sas_token.clone().or(parsed.sas),
-            });
-        }
-        self.location_from_env()
-    }
-
-    /// Build a [`Location`] from the explicit `AZURE_STORAGE_*` selectors set by
-    /// the CSI node plugin on the spawned `run` child.
-    fn location_from_env(&self) -> anyhow::Result<Location> {
-        let blob = std::env::var("AZURE_STORAGE_BLOB")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .context("AZURE_STORAGE_BLOB is required when --blob-url is not set")?;
-        let account = std::env::var("AZURE_STORAGE_ACCOUNT")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .context("AZURE_STORAGE_ACCOUNT is required when --blob-url is not set")?;
-        let container = std::env::var("AZURE_STORAGE_CONTAINER")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .context("AZURE_STORAGE_CONTAINER is required when --blob-url is not set")?;
-        // The endpoint template may carry a `%s` placeholder for the account
-        // (subdomain style, e.g. `http://%s.blob.localhost:10000/`); the
-        // single-device child knows its account up-front and substitutes it.
-        let endpoint_template = std::env::var("AZURE_STORAGE_ENDPOINT")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("https://{account}.blob.core.windows.net/"));
-        let endpoint = endpoint_template.replace("%s", &account);
+        let url = self
+            .blob_url
+            .as_deref()
+            .context("--blob-url (or AZURE_STORAGE_BLOB_URL) is required")?;
+        let parsed = bloburl::parse_blob_url(url).context("parse --blob-url")?;
         Ok(Location {
-            endpoint: format!("{}/", endpoint.trim_end_matches('/')),
-            account,
-            container,
-            blob,
-            snapshot: self.snapshot.clone().or_else(Self::snapshot_from_env),
-            sas: self.sas_token.clone(),
+            endpoint: format!("{}/", parsed.service_url.trim_end_matches('/')),
+            account: parsed.account,
+            container: parsed.container,
+            blob: parsed.blob,
+            snapshot: parsed.snapshot,
+            sas: self.sas_token.clone().or(parsed.sas),
         })
     }
 }

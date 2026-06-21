@@ -29,7 +29,7 @@
 //! ```
 //!
 //! A second test, [`mount_read_only`](fn.mount_read_only.html), exercises
-//! `run --snapshot`: it snapshots the blob, asserts the kernel marks `/dev/ublkbN` read-only,
+//! read-only via `?snapshot=`: it snapshots the blob, asserts the kernel marks `/dev/ublkbN` read-only,
 //! verifies the data is still readable, and confirms a write to the read-only
 //! mount fails without mutating the backing blob.
 //!
@@ -134,9 +134,15 @@ fn run_fsck(args: &[&str]) {
 /// The account, container and blob are collapsed into a single
 /// `AZURE_STORAGE_BLOB_URL` (Azurite path-style, so the URL host already
 /// carries the account); only the SharedKey is passed separately.
-fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
+fn azure_env(cmd: &mut Command, container: &str, blob: &str, snapshot: Option<&str>) {
     let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
-    let blob_url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), container, blob);
+    let mut blob_url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), container, blob);
+    if let Some(s) = snapshot {
+        // A snapshot is selected via the URL's `?snapshot=` query (the only way
+        // a device is exposed read-only); there is no separate snapshot flag/env.
+        blob_url.push_str("?snapshot=");
+        blob_url.push_str(s);
+    }
     cmd.env(
         "AZURE_STORAGE_KEY",
         env_or("AZURE_STORAGE_KEY", DEFAULT_KEY),
@@ -197,7 +203,7 @@ fn create_snapshot(spec: &DeviceSpec) -> String {
 }
 
 /// Like [`start_device`] but lets the caller bring the device up against a blob
-/// `snapshot` (`run --snapshot <id>`), which exposes it read-only.  `create` and
+/// `snapshot` (via `?snapshot=` in the blob URL), which exposes it read-only.  `create` and
 /// a snapshot are mutually exclusive (a snapshot is immutable), so callers pass
 /// `create=false` when supplying a snapshot.
 #[allow(clippy::zombie_processes)]
@@ -211,7 +217,7 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
             "reuse existing blob"
         },
         match snapshot {
-            Some(s) => format!(", --snapshot {s}"),
+            Some(s) => format!(", snapshot={s}"),
             None => String::new(),
         },
         match &spec.cache_dir {
@@ -232,12 +238,6 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
     if create {
         cmd.arg("--create");
     }
-    if let Some(s) = snapshot {
-        // `--snapshot` is a top-level option (parsed before the subcommand), so
-        // pass it via its env var — like account/container/blob — rather than as
-        // a `run` argument, where clap would reject it.
-        cmd.env("AZURE_STORAGE_SNAPSHOT", s);
-    }
     if let Some(dir) = &spec.cache_dir {
         cmd.arg("--cache-dir").arg(dir);
         if spec.cache_max_bytes > 0 {
@@ -253,7 +253,7 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
             .arg("--force-flush-timeout-secs")
             .arg("0");
     }
-    azure_env(&mut cmd, &spec.container, &spec.blob);
+    azure_env(&mut cmd, &spec.container, &spec.blob, snapshot);
 
     let mut child = cmd.spawn().expect("failed to spawn ublk-azblob");
 
@@ -504,7 +504,7 @@ fn run_mount_roundtrip(spec: DeviceSpec) {
     log("mount e2e PASSED ✓");
 }
 
-/// e2e for read-only mode (`run --snapshot`) over the kernel ublk path.
+/// e2e for read-only mode (read-only via `?snapshot=`) over the kernel ublk path.
 ///
 /// Cycle:
 ///   1. provision the device writable, make an ext4 filesystem, write random
