@@ -66,6 +66,7 @@ impl NodeService {
         &self,
         ctx: &HashMap<String, String>,
         secrets: &HashMap<String, String>,
+        volume_id: &str,
     ) -> anyhow::Result<Vec<(String, String)>> {
         let get = |k: &str| ctx.get(k).cloned();
         let account = get("account").unwrap_or_else(|| self.config.account.clone());
@@ -149,25 +150,32 @@ impl NodeService {
             }
         }
 
-        // Read-only / snapshot: when the volume targets a blob snapshot (only
-        // via a `templateBlobUrl` with `?snapshot=<timestamp>`) or opts the
-        // volume read-only (`readOnly: "true"`), the child `run` process exposes
-        // the device read-only and rejects every write/discard. A snapshot is
-        // immutable and therefore always implies read-only.
+        // Read-only / snapshot: a volume is read-only exactly when it targets a
+        // blob snapshot (a `templateBlobUrl` with `?snapshot=<timestamp>`). A
+        // snapshot is immutable, so the child `run` process derives read-only
+        // from `AZURE_STORAGE_SNAPSHOT` alone — there is no separate readOnly
+        // flag.
         if let Some(snapshot) = get("snapshot").filter(|s| !s.is_empty()) {
             env.push(("AZURE_STORAGE_SNAPSHOT".to_string(), snapshot));
-        }
-        let read_only = get("readOnly")
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
-        if read_only {
-            env.push(("UBLK_READ_ONLY".to_string(), "1".to_string()));
         }
         // SAS token from a `templateBlobUrl` that carries its own signature; the
         // child `run` process authenticates the (possibly cross-account) template
         // blob with it instead of the driver credentials.
         if let Some(sas) = get("sasToken").filter(|s| !s.is_empty()) {
             env.push(("AZURE_STORAGE_SAS".to_string(), sas));
+        }
+
+        // Cross-process page sharing: when the node enables a shared cache with
+        // `UBLK_CACHE_SHARE_PAGES` (inherited from the DaemonSet), give each
+        // volume a stable, unique cache instance name (its volume id) so peers
+        // caching the same blob get distinct data files and can share each
+        // other's clean pages off local disk.  The blob identity defaults to the
+        // container/blob, so concurrent mounts of the *same* blob share pages.
+        let share_pages = std::env::var("UBLK_CACHE_SHARE_PAGES")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        if share_pages {
+            env.push(("UBLK_CACHE_INSTANCE".to_string(), volume_id.to_string()));
         }
         Ok(env)
     }
@@ -230,24 +238,19 @@ impl Node for NodeService {
             .unwrap_or(0);
 
         let env = self
-            .child_env(&req.volume_context, &req.secrets)
+            .child_env(&req.volume_context, &req.secrets, &req.volume_id)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
 
         let volume_id = req.volume_id.clone();
         let target = req.target_path.clone();
         // The device is read-only when the CSI request asks for it, or when the
-        // StorageClass selects a snapshot / opts the volume read-only.  Mounting
-        // read-write over a read-only block device would fail on first write, so
-        // force a read-only mount (and skip mkfs) in that case.
+        // StorageClass selects a snapshot.  A snapshot is immutable, so mounting
+        // read-write over it would fail on first write; force a read-only mount
+        // (and skip mkfs) in that case.
         let device_read_only = req
             .volume_context
-            .get("readOnly")
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false)
-            || req
-                .volume_context
-                .get("snapshot")
-                .is_some_and(|s| !s.is_empty());
+            .get("snapshot")
+            .is_some_and(|s| !s.is_empty());
         let readonly = req.readonly || device_read_only;
         // A volume copied from a `templateBlobUrl` already carries a filesystem;
         // never reformat it (the copy is the user's golden image).

@@ -1,0 +1,173 @@
+//! Parsing of a full Azure blob URL into its components.
+//!
+//! Used by the CSI controller (to parse a StorageClass `templateBlobUrl`
+//! golden-image source). This module is compiled only with the `csi` feature
+//! (its only caller), so it is gated behind `#[cfg(feature = "csi")]` in
+//! `main.rs`.
+
+use anyhow::Context as _;
+
+/// A parsed Azure blob URL (e.g. a StorageClass `templateBlobUrl`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateBlobRef {
+    /// Blob *service* URL the rest of the code expects (`build_container_client`
+    /// appends `/container`): subdomain-style `https://acct.blob.core.windows.net`
+    /// for Azure, or `http://host:port/account` for Azurite/path-style.
+    pub service_url: String,
+    /// Storage account name.
+    pub account: String,
+    /// Container name.
+    pub container: String,
+    /// Blob name (may contain `/`).
+    pub blob: String,
+    /// Optional `snapshot=` timestamp from the URL.
+    pub snapshot: Option<String>,
+    /// Optional SAS query string (everything except `snapshot`, present only when
+    /// the URL carries a `sig=` signature).
+    pub sas: Option<String>,
+}
+
+/// Parse a full Azure blob URL into its components.
+///
+/// Supports both Azure subdomain hosts (`<account>.blob.core.windows.net`) and
+/// path-style/Azurite hosts (`host:port/<account>/...`). Any `snapshot=` query
+/// is split out; the remaining query (when it carries a `sig=`) is returned as
+/// the SAS token.
+pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
+    let parsed =
+        azure_core::http::Url::parse(url).with_context(|| format!("parse blob URL: {url}"))?;
+    let scheme = parsed.scheme();
+    let host = parsed
+        .host_str()
+        .context("blob URL has no host")?
+        .to_string();
+
+    // Split query into snapshot vs the rest (SAS).
+    let mut snapshot = None;
+    let mut sas_pairs: Vec<(String, String)> = Vec::new();
+    let mut has_sig = false;
+    for (k, v) in parsed.query_pairs() {
+        if k == "snapshot" {
+            snapshot = Some(v.into_owned());
+        } else {
+            if k == "sig" {
+                has_sig = true;
+            }
+            sas_pairs.push((k.into_owned(), v.into_owned()));
+        }
+    }
+    let sas = if has_sig {
+        let mut tmp = azure_core::http::Url::parse("https://x/").unwrap();
+        tmp.query_pairs_mut().extend_pairs(&sas_pairs);
+        tmp.query().map(|q| q.to_string())
+    } else {
+        None
+    };
+
+    let segments: Vec<String> = parsed
+        .path_segments()
+        .map(|it| {
+            it.filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Azure subdomain style: `<account>.blob.<suffix>` → account is the first
+    // host label, the path is `<container>/<blob...>`.
+    let azure_subdomain = host.contains(".blob.");
+    let (service_url, account, container, blob) = if azure_subdomain {
+        let account = host.split('.').next().unwrap_or("").to_string();
+        if segments.len() < 2 {
+            anyhow::bail!("blob URL missing container/blob path: {url}");
+        }
+        let container = segments[0].clone();
+        let blob = segments[1..].join("/");
+        let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+        (format!("{scheme}://{host}{port}"), account, container, blob)
+    } else {
+        // Path-style / Azurite: `host:port/<account>/<container>/<blob...>`.
+        if segments.len() < 3 {
+            anyhow::bail!("blob URL missing account/container/blob path: {url}");
+        }
+        let account = segments[0].clone();
+        let container = segments[1].clone();
+        let blob = segments[2..].join("/");
+        let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+        (
+            format!("{scheme}://{host}{port}/{account}"),
+            account,
+            container,
+            blob,
+        )
+    };
+
+    if container.is_empty() || blob.is_empty() {
+        anyhow::bail!("blob URL missing container or blob: {url}");
+    }
+    Ok(TemplateBlobRef {
+        service_url,
+        account,
+        container,
+        blob,
+        snapshot,
+        sas,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_blob_url_azure_subdomain() {
+        let r =
+            parse_blob_url("https://myacct.blob.core.windows.net/images/golden/disk.vhd").unwrap();
+        assert_eq!(r.service_url, "https://myacct.blob.core.windows.net");
+        assert_eq!(r.account, "myacct");
+        assert_eq!(r.container, "images");
+        assert_eq!(r.blob, "golden/disk.vhd");
+        assert_eq!(r.snapshot, None);
+        assert_eq!(r.sas, None);
+    }
+
+    #[test]
+    fn parse_blob_url_azurite_path_style() {
+        let r = parse_blob_url("http://127.0.0.1:10000/devstoreaccount1/images/golden/disk.vhd")
+            .unwrap();
+        assert_eq!(r.service_url, "http://127.0.0.1:10000/devstoreaccount1");
+        assert_eq!(r.account, "devstoreaccount1");
+        assert_eq!(r.container, "images");
+        assert_eq!(r.blob, "golden/disk.vhd");
+    }
+
+    #[test]
+    fn parse_blob_url_with_sas_and_snapshot() {
+        let r = parse_blob_url(
+            "https://myacct.blob.core.windows.net/c/b?snapshot=2024-01-02T03:04:05.0Z&sv=2022-11-02&sig=ABC%2Bdef&se=2030-01-01",
+        )
+        .unwrap();
+        assert_eq!(r.account, "myacct");
+        assert_eq!(r.container, "c");
+        assert_eq!(r.blob, "b");
+        assert_eq!(r.snapshot.as_deref(), Some("2024-01-02T03:04:05.0Z"));
+        let sas = r.sas.expect("sas present");
+        assert!(sas.contains("sig=ABC%2Bdef"));
+        assert!(sas.contains("sv=2022-11-02"));
+        assert!(!sas.contains("snapshot"));
+    }
+
+    #[test]
+    fn parse_blob_url_no_sig_means_no_sas() {
+        // A bare query without a signature is not treated as a SAS token.
+        let r = parse_blob_url("https://myacct.blob.core.windows.net/c/b?foo=bar").unwrap();
+        assert_eq!(r.sas, None);
+    }
+
+    #[test]
+    fn parse_blob_url_rejects_incomplete() {
+        assert!(parse_blob_url("https://myacct.blob.core.windows.net/onlycontainer").is_err());
+        assert!(parse_blob_url("http://127.0.0.1:10000/acct/onlycontainer").is_err());
+        assert!(parse_blob_url("not a url").is_err());
+    }
+}

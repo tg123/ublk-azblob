@@ -16,8 +16,9 @@
 # The benchmark is organised into phases (see the fio matrix below):
 #   Phase 1 — Raw block performance: the four base patterns (seq/rand read/write)
 #             plus sweeps over block size, queue depth, and read/write mix.
-#   Phase 2 — Cache behaviour: cold-cache vs. warm-cache read (buffered I/O) so
-#             the backend/page-cache re-read speed-up is visible.
+#   Phase 2 — Cache behaviour: cold-cache vs. warm-cache read (buffered I/O),
+#             each compared against the raw-local-disk baseline, plus the
+#             ublk-azblob warm/cold read-cache speed-up.
 #   Phase 4 — Scalability: the same random-read workload at increasing thread
 #             (fio numjobs) counts.
 # (Phase 3 — backend Azure Blob latency/throughput — is covered separately by the
@@ -241,17 +242,39 @@ done
 
 # ── Phase 2: Cache behaviour (buffered I/O so the cache is exercised) ──────────
 # Cold cache = first read after writes; warm cache = immediate re-read.  Both use
-# buffered I/O (direct=0); a warm/cold ratio > 1 shows the read cache working.
+# buffered I/O (direct=0).  Each state is compared against the raw-local-disk
+# baseline (the `vs local` column), and the warm/cold speed-up shows the
+# ublk-azblob read cache working.
 {
-    cold="$(run_fio ublk-azblob "$DEV" read "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "" 0)"
-    warm="$(run_fio ublk-azblob "$DEV" read "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "" 0)"
-    IFS=$'\t' read -r cbw ciops clat <<<"$cold"
-    IFS=$'\t' read -r wbw wiops wlat <<<"$warm"
-    wpct="$(pct_of_baseline "$wbw" "$cbw")"
-    ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\tublk-azblob\t%s\t%s\t%s\tbaseline' \
-        "2 cache" "cold-cache read" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$cbw" "$ciops" "$clat")")
+    # ublk-azblob: cold read, then an immediate warm re-read.
+    ucold="$(run_fio ublk-azblob "$DEV" read "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "" 0)"
+    uwarm="$(run_fio ublk-azblob "$DEV" read "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "" 0)"
+    # local-disk baseline: same cold-then-warm sequence for a fair comparison.
+    lcold="$(run_fio local-disk "$LOOP_DEV" read "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "" 0)"
+    lwarm="$(run_fio local-disk "$LOOP_DEV" read "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "" 0)"
+
+    IFS=$'\t' read -r ucbw uciops uclat <<<"$ucold"
+    IFS=$'\t' read -r uwbw uwiops uwlat <<<"$uwarm"
+    IFS=$'\t' read -r lcbw lciops lclat <<<"$lcold"
+    IFS=$'\t' read -r lwbw lwiops lwlat <<<"$lwarm"
+
+    ucpct="$(pct_of_baseline "$ucbw" "$lcbw")"
+    uwpct="$(pct_of_baseline "$uwbw" "$lwbw")"
+
+    # Cold-cache read: ublk-azblob (vs local %), then the local-disk baseline.
     ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\tublk-azblob\t%s\t%s\t%s\t%s%%' \
-        "2 cache" "warm-cache read" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$wbw" "$wiops" "$wlat" "$wpct")")
+        "2 cache" "cold-cache read" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$ucbw" "$uciops" "$uclat" "$ucpct")")
+    ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\tlocal-disk\t%s\t%s\t%s\tbaseline' \
+        "2 cache" "cold-cache read" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$lcbw" "$lciops" "$lclat")")
+    # Warm-cache read: ublk-azblob (vs local %), then the local-disk baseline.
+    ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\tublk-azblob\t%s\t%s\t%s\t%s%%' \
+        "2 cache" "warm-cache read" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$uwbw" "$uwiops" "$uwlat" "$uwpct")")
+    ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\tlocal-disk\t%s\t%s\t%s\tbaseline' \
+        "2 cache" "warm-cache read" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$lwbw" "$lwiops" "$lwlat")")
+    # Warm/cold cache speed-up for ublk-azblob (how much the read cache helps).
+    uwarmpct="$(pct_of_baseline "$uwbw" "$ucbw")"
+    ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\tublk-azblob\t%s\t%s\t%s\t%s%%' \
+        "2 cache" "warm vs cold (cache speed-up)" "$FIO_BS" "$FIO_IODEPTH" "$FIO_NUMJOBS" "$uwbw" "$uwiops" "$uwlat" "$uwarmpct")")
 }
 
 # ── Phase 4: Scalability (random read at increasing thread counts) ────────────
