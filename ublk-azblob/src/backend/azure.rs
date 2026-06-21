@@ -381,6 +381,16 @@ impl BlobBackend for AzurePageBlobBackend {
         })?;
         Ok(len)
     }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn etag(&self) -> anyhow::Result<Option<String>> {
+        let blob_client = self.blob_client()?;
+        let props = blob_client
+            .get_properties(None)
+            .await
+            .with_context(|| format!("get_properties for blob '{}'", self.blob_name))?;
+        Ok(props.etag()?.map(|e| e.to_string()))
+    }
 }
 
 // ── Blob lease (cluster coordination "blob lock") ─────────────────────────────

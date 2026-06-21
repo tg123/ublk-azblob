@@ -603,6 +603,10 @@ impl BlobBackend for BufferedBackend {
     async fn size(&self) -> anyhow::Result<u64> {
         self.dev_size().await
     }
+
+    async fn etag(&self) -> anyhow::Result<Option<String>> {
+        self.inner.etag().await
+    }
 }
 
 #[cfg(test)]
