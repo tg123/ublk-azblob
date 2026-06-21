@@ -886,6 +886,26 @@ spec:
     );
 }
 
+/// Node name (`spec.nodeName`) the first pod carrying `app=<app>` was scheduled
+/// onto, if any.  Used to co-locate a later pod on the *exact* same node (e.g.
+/// so it shares the node's host-path cache).  Returns `None` when no such pod
+/// exists yet or none has been assigned a node.
+fn pod_node(app: &str) -> Option<String> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "pods",
+            "-l",
+            &format!("app={app}"),
+            "-o",
+            "jsonpath={.items[*].spec.nodeName}",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.split_whitespace().next().map(|n| n.to_string())
+}
+
 /// Capture the combined stdout/stderr logs of the node plugin's `azblob`
 /// container across all node pods.  The child `run` process forwards its own
 /// stdout/stderr to the node container (see `csi::mount::spawn_device`), so the
@@ -923,7 +943,9 @@ fn node_plugin_logs(extra_args: &[&str]) -> String {
 fn test_local_cache_reload(_here: &Path) {
     log("TEST 4: local-disk cache reload across a node-plugin pod restart");
 
-    // Pin writer and reader to the same node so they share one host-path cache.
+    // Pin the writer to a single node so its host-path cache is co-located; the
+    // reader is later pinned to the *exact* node the writer actually ran on (see
+    // `pod_node` below) so it reuses that same on-disk cache.
     let nodes_out = Command::new("kubectl")
         .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
         .output()
@@ -933,7 +955,7 @@ fn test_local_cache_reload(_here: &Path) {
         Some(n) => n.to_string(),
         None => panic!("local-cache test: no nodes found"),
     };
-    log(&format!("pinning cache writer/reader to node {node}"));
+    log(&format!("pinning cache writer to node {node}"));
 
     // Dedicated PVC → dedicated page blob → dedicated cache entry, so this test
     // never races the earlier sub-tests' blobs/cache files.
@@ -1003,6 +1025,21 @@ spec:
         panic!("cache writer Job did not complete");
     }
 
+    // The host-path cache is per-node, so the reader must land on the *exact*
+    // node the writer ran on to see those cached pages.  `nodeSelector` on
+    // `kubernetes.io/hostname` is not a reliable guarantee here (the label is
+    // not always identical to `metadata.name`, and two pods scheduled at
+    // different times can diverge), so read back the node the writer actually
+    // ran on and pin the reader there with `spec.nodeName` (an exact,
+    // scheduler-bypassing match) before tearing the writer down.
+    let writer_node = pod_node("azblob-cache-writer").unwrap_or_else(|| {
+        dump_diagnostics("azblob-cache-writer");
+        panic!("could not determine the node the cache writer ran on");
+    });
+    log(&format!(
+        "cache writer ran on node {writer_node}; reader will be pinned there"
+    ));
+
     log("deleting cache writer (tears down device, flushes blob, leaves clean cache pages)");
     run(
         "kubectl",
@@ -1048,8 +1085,7 @@ spec:
         app: azblob-cache-reader
     spec:
       restartPolicy: Never
-      nodeSelector:
-        kubernetes.io/hostname: {node}
+      nodeName: {writer_node}
       containers:
         - name: reader
           image: busybox:1.36
