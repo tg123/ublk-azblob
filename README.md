@@ -124,6 +124,43 @@ batch); read caching via `--cache-dir` still works.
 
 ---
 
+## Blob lock (single-writer safety)
+
+To prevent two processes from writing to the same page blob at once (which would
+corrupt it), the `run` subcommand acquires an **Azure blob lease** ("blob lock")
+before mounting. This is **on by default**: if another process already holds the
+lease, `run` refuses to mount. The lease is finite and renewed automatically
+while the device is up, and released on clean shutdown (a crashed holder's lease
+lapses within ≤60s).
+
+```bash
+# Default: the blob lock is acquired automatically — no extra flag needed.
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount \
+  --container mydisks \
+  --blob myvm.vhd \
+  --msi \
+  run --size 10737418240
+```
+
+Pass `--disable-blob-lock` to skip it — only when you are certain no other
+process is using the blob:
+
+```bash
+sudo ./target/release/ublk-azblob \
+  --account mystorageaccount --container mydisks --blob myvm.vhd --msi \
+  run --size 10737418240 --disable-blob-lock
+```
+
+Read-only mounts (`--snapshot`) never take the lock, since they
+never write. In Kubernetes, the CSI driver layers a cluster-wide lease on top of
+this blob lock via `--coordination` so a dead node's volume can be safely taken
+over; see [`docs/cluster-testing.md`](docs/cluster-testing.md). `--coordination`
+relies on the blob lock and therefore cannot be combined with
+`--disable-blob-lock`.
+
+---
+
 ## NBD compatibility mode (no `ublk_drv` required)
 
 For kernels or platforms **without** `ublk_drv` (older kernels, containers that

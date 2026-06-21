@@ -48,7 +48,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,13 @@ const NBD_ADDR_TEMPLATE: &str = "127.0.0.1:11811";
 /// Host:port for the `nbd_graceful_shutdown_flush` test (distinct so it can run
 /// in parallel with the others).
 const NBD_ADDR_SHUTDOWN: &str = "127.0.0.1:11812";
+/// Host:port the `nbd_blob_lock_conflict` test's *lock-holding* server binds to.
+const NBD_ADDR_LOCK_HOLDER: &str = "127.0.0.1:11813";
+/// Host:port the `nbd_blob_lock_conflict` test's *would-be take-over* server is
+/// told to bind to.  It never actually binds — the blob lock is held, so the
+/// process exits during `acquire_lock`, before reaching the NBD listener — but a
+/// distinct port guarantees the failure is the held lock and not a port clash.
+const NBD_ADDR_LOCK_TAKER: &str = "127.0.0.1:11814";
 const BLOB_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 const NUM_REGIONS: usize = 8;
 /// Logical block size advertised by the NBD target (matches `BLOCK_SIZE` in
@@ -582,7 +589,10 @@ fn nbd_roundtrip() {
     client.disconnect();
     // Give the server a moment to process the disconnect/flush before teardown.
     sleep(Duration::from_secs(1));
-    stop_server(child);
+    // Shut down gracefully (SIGINT) rather than SIGKILL so the holder releases
+    // its blob lease; otherwise the stale lease would block Phase 2 reopening
+    // the same blob writable (the blob lock is on by default).
+    stop_server_graceful(child);
 
     // Wait for the port to be released so the second server can bind it.
     wait_for_port_release(NBD_ADDR_ROUNDTRIP);
@@ -662,7 +672,10 @@ fn nbd_read_only() {
     client.flush();
     client.disconnect();
     sleep(Duration::from_secs(1));
-    stop_server(child);
+    // Shut down gracefully (SIGINT) rather than SIGKILL so the writable holder
+    // releases its blob lease; otherwise the stale lease would block Phase 3
+    // reopening the same blob writable (the blob lock is on by default).
+    stop_server_graceful(child);
 
     wait_for_port_release(NBD_ADDR_READ_ONLY);
 
@@ -932,4 +945,130 @@ fn nbd_graceful_shutdown_flush() {
     stop_server(child);
 
     log("nbd graceful shutdown e2e PASSED ✓");
+}
+
+/// Spawn a second `ublk-azblob run --nbd` against a blob whose lock is already
+/// held by a live server and assert it **refuses to start**: the blob lock is
+/// on by default, so `acquire_lock` gets `LockError::Held`, and the process
+/// exits non-zero before ever binding its NBD port.  Returns the captured
+/// stderr so the caller can assert on the failure message.
+///
+/// stderr is drained on a helper thread so a chatty child can never fill the
+/// pipe buffer and deadlock before it exits.
+///
+/// The child is always reaped: the success path observes its exit via
+/// `try_wait()`, and every early-return panic path `kill()`s then `wait()`s it,
+/// so the `zombie_processes` lint does not apply.
+#[allow(clippy::zombie_processes)]
+fn expect_blob_lock_conflict(addr: &str, container: &str, blob: &str) -> String {
+    log(&format!(
+        "starting a second NBD server on {addr} for the *same* blob (expecting a lock conflict)"
+    ));
+    let bin = std::env::var("UBLK_AZBLOB_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
+    let mut cmd = Command::new(&bin);
+    // Reuse the existing blob (no --create): the lock is what must reject us.
+    cmd.arg("run")
+        .arg("--size")
+        .arg(BLOB_SIZE.to_string())
+        .arg("--nbd")
+        .arg(addr)
+        .stderr(Stdio::piped());
+    azure_env(&mut cmd, container, blob);
+
+    let mut child = cmd.spawn().expect("failed to spawn ublk-azblob");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        s
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait on conflicting server") {
+            break status;
+        }
+        // It must never reach the NBD listener: the lock is acquired first.
+        if TcpStream::connect(addr).is_ok() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the second server bound {addr} despite the blob lock being held");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the conflicting NBD server did not exit within the timeout; \
+                 it should have failed to acquire the already-held blob lock"
+            );
+        }
+        sleep(Duration::from_millis(200));
+    };
+
+    assert!(
+        !status.success(),
+        "the second server exited successfully ({status}); \
+         it should have failed to acquire the already-held blob lock"
+    );
+
+    reader.join().unwrap_or_default()
+}
+
+/// Blob-lock conflict e2e for the NBD target: prove the default blob lease
+/// ("blob lock") makes a blob single-writer.  While one server holds the lock,
+/// a second `run` against the same blob must refuse to start; once the holder
+/// shuts down cleanly (releasing the lease), a fresh server can take the lock.
+///
+/// This validates the blob-lock-only (no `--coordination`) startup path in
+/// `coordination::Coordinator::acquire`: a held lease with no liveness arbiter
+/// is refused rather than broken.
+#[test]
+fn nbd_blob_lock_conflict() {
+    if !azurite_available() {
+        eprintln!(
+            "skipping nbd_blob_lock_conflict: Azurite is not reachable at {} \
+             (set AZURE_STORAGE_ENDPOINT and start Azurite to run this test)",
+            endpoint_authority()
+        );
+        return;
+    }
+    assert!(
+        TcpStream::connect(NBD_ADDR_LOCK_HOLDER).is_err(),
+        "{NBD_ADDR_LOCK_HOLDER} is already in use; another NBD server is running"
+    );
+    assert!(
+        TcpStream::connect(NBD_ADDR_LOCK_TAKER).is_err(),
+        "{NBD_ADDR_LOCK_TAKER} is already in use; another NBD server is running"
+    );
+
+    let container = env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER);
+    // Distinct blob so this test never collides with the other NBD tests.
+    let blob = format!("{}-lock", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB));
+
+    // ── Phase 1: a first server provisions the blob and holds the blob lock ────
+    let holder = start_server(NBD_ADDR_LOCK_HOLDER, &container, &blob, true);
+    // Sanity: the holder really is serving (and thus owns the lease).
+    NbdClient::connect(NBD_ADDR_LOCK_HOLDER).disconnect();
+
+    // ── Phase 2: a second server for the same blob must refuse to start ────────
+    let stderr = expect_blob_lock_conflict(NBD_ADDR_LOCK_TAKER, &container, &blob);
+    assert!(
+        stderr.contains("blob lease is already held"),
+        "the second server failed, but not with the expected blob-lock error; stderr was:\n{stderr}"
+    );
+    log("second server correctly refused to start while the blob lock was held ✓");
+
+    // ── Phase 3: release the lock (clean shutdown), then a fresh server can take it ─
+    log("SIGINT the holder so it releases the blob lease");
+    stop_server_graceful(holder);
+    wait_for_port_release(NBD_ADDR_LOCK_HOLDER);
+
+    let taker = start_server(NBD_ADDR_LOCK_HOLDER, &container, &blob, false);
+    NbdClient::connect(NBD_ADDR_LOCK_HOLDER).disconnect();
+    log("a fresh server acquired the blob lock after it was released ✓");
+    sleep(Duration::from_secs(1));
+    stop_server(taker);
+
+    log("nbd blob lock conflict e2e PASSED ✓");
 }
