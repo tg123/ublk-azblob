@@ -85,10 +85,12 @@ pub trait BlobBackend: Send + Sync {
     /// Warm `[0, limit_bytes)` into the local cache (if any), best-effort.
     ///
     /// `page_size` is the fetch granularity and `concurrency` bounds the number
-    /// of in-flight page fetches. A read error logs and stops (the device keeps
-    /// serving on demand). The default is a sequential `prefetch` scan (no
-    /// concurrency); cache-backed backends override it to fetch pages from the
-    /// blob in parallel so warm-up is bandwidth- rather than latency-bound.
+    /// of in-flight page fetches. The default implementation is a sequential
+    /// `prefetch` scan (no concurrency) that stops on the first read error;
+    /// cache-backed backends override it to fetch pages from the blob in
+    /// parallel (bandwidth- rather than latency-bound) and, being best-effort,
+    /// log and skip individual failed pages while continuing the warm-up — the
+    /// device keeps serving any missed regions on demand.
     async fn warmup(&self, dev_size: u64, page_size: u64, limit_bytes: u64, concurrency: usize) {
         let _ = concurrency; // honoured only by cache-backed backends
         let limit = limit_bytes.min(dev_size);

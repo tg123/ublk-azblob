@@ -332,7 +332,7 @@ enum Command {
         #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_BYTES")]
         cache_warmup_bytes: u64,
 
-        /// Number of blob pages warm-up fetches concurrently.
+        /// Number of blob pages the warm-up fetches concurrently.
         ///
         /// Warm-up is otherwise latency-bound (one page in flight at a time);
         /// raising this makes it bandwidth-bound. Peak transient memory is
