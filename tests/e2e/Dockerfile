@@ -16,7 +16,10 @@ ARG DOCKER_VERSION=27.5.1
 ARG KUBECTL_VERSION=v1.32.3
 ARG HELM_VERSION=v3.17.3
 
-# - e2fsprogs / util-linux : mkfs.ext4, mount/umount (run by mount_e2e directly)
+# - e2fsprogs / util-linux : mkfs.ext4, mount/umount, losetup (run by mount_e2e
+#                            and the mount-module unit tests directly)
+# - xfsprogs / btrfs-progs  : mkfs.xfs / mkfs.btrfs, so the profile-driven
+#                            format+mount unit test covers every formattable type
 # - libclang-dev           : bindgen for libublk-rs-sys (ublk feature)
 # - protobuf-compiler + libprotobuf-dev : protoc + well-known types (csi feature)
 # (nbd_e2e uses an in-process TCP client and the node plugin's mkfs/mount/
@@ -24,6 +27,8 @@ ARG HELM_VERSION=v3.17.3
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
         util-linux \
         ca-certificates \
         curl \

@@ -333,7 +333,11 @@ pub fn fs_profile(fs_type: &str) -> FsProfile {
             // nodiscard` avoids a full TRIM pass (faster, and discard maps onto
             // Clear Pages); lazy_itable_init / lazy_journal_init speed up mkfs on
             // large devices (no zeroing of inode tables and journal).
-            mkfs_options: Some(&["-F", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1"]),
+            mkfs_options: Some(&[
+                "-F",
+                "-E",
+                "nodiscard,lazy_itable_init=1,lazy_journal_init=1",
+            ]),
             mount_options: &[],
         },
         // `-f` forces formatting even when an old signature is present.
@@ -459,4 +463,142 @@ fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Filesystems whose built-in profile must be able to format a fresh blob.
+    const FORMATTABLE: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs"];
+    /// Mount-only image / pool filesystems: never freshly formatted on a live
+    /// device (squashfs/zfs are read-only images; ntfs has no reliable
+    /// read-write mkfs we ship), so their profile must reject `mkfs`.
+    const MOUNT_ONLY: &[&str] = &["squashfs", "zfs", "ntfs"];
+
+    #[test]
+    fn fs_profile_formattable_types_have_mkfs_options() {
+        for fs in FORMATTABLE {
+            assert!(
+                fs_profile(fs).mkfs_options.is_some(),
+                "formattable filesystem {fs:?} must have built-in mkfs options"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_profile_mount_only_and_unknown_types_have_no_mkfs_options() {
+        for fs in MOUNT_ONLY.iter().chain(["not-a-fs", ""].iter()) {
+            assert!(
+                fs_profile(fs).mkfs_options.is_none(),
+                "mount-only / unknown filesystem {fs:?} must not advertise mkfs options"
+            );
+        }
+    }
+
+    /// `mkfs` returns a "format not supported" error (instead of shelling out to
+    /// a missing `mkfs.<fs>`) for every filesystem that cannot be created on a
+    /// live device.
+    #[test]
+    fn mkfs_rejects_unformattable_filesystems() {
+        for fs in MOUNT_ONLY.iter().chain(["not-a-fs"].iter()) {
+            let err = mkfs("/dev/null", fs).expect_err(&format!(
+                "mkfs({fs:?}) must fail for an unformattable filesystem"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not support mkfs"),
+                "unexpected error for {fs:?}: {msg}"
+            );
+        }
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: `geteuid` has no preconditions and never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn have_tool(bin: &str) -> bool {
+        Command::new(bin)
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// End-to-end check that every formattable profile actually formats and
+    /// mounts: back a loop device with a sparse image, run the real
+    /// [`mkfs`]/[`mount`]/[`umount`] (which source their flags from the built-in
+    /// profile), and round-trip a file through the mounted filesystem.
+    ///
+    /// Needs root + loop devices + the per-filesystem `mkfs.<fs>` tool; it skips
+    /// (rather than fails) when the environment cannot provide them, so it is a
+    /// no-op on the unprivileged unit-test runner and exercises the full path on
+    /// the privileged e2e runner.
+    #[test]
+    fn formattable_profiles_format_and_mount() {
+        if !is_root() || !have_tool("losetup") {
+            eprintln!("skipping formattable_profiles_format_and_mount: needs root + losetup");
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("ublk-mkfs-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        for fs in FORMATTABLE {
+            // ext2/ext3/ext4 all share `mkfs.ext*`; xfs needs ~300 MiB minimum,
+            // so size every image generously at 512 MiB (sparse, so cheap).
+            if !have_tool(&format!("mkfs.{fs}")) {
+                eprintln!("skipping {fs}: mkfs.{fs} not installed");
+                continue;
+            }
+
+            let img = tmp.join(format!("{fs}.img"));
+            {
+                let f = std::fs::File::create(&img).expect("create image file");
+                f.set_len(512 * 1024 * 1024).expect("size image file");
+            }
+            let img_str = img.to_str().unwrap();
+
+            // Attach a loop device for the image.
+            let out = Command::new("losetup")
+                .args(["--find", "--show", img_str])
+                .output()
+                .expect("spawn losetup");
+            assert!(
+                out.status.success(),
+                "losetup failed for {fs}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let dev = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+            let mount_point = tmp.join(format!("{fs}.mnt"));
+            let mount_point_str = mount_point.to_str().unwrap();
+
+            // Format and mount via the real profile-driven helpers.
+            mkfs(&dev, fs).unwrap_or_else(|e| panic!("mkfs.{fs} failed: {e}"));
+            let mount_opts: Vec<String> = fs_profile(fs)
+                .mount_options
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            mount(&dev, mount_point_str, fs, &mount_opts, false)
+                .unwrap_or_else(|e| panic!("mount {fs} failed: {e}"));
+
+            // Round-trip a file through the mounted filesystem.
+            let payload = b"precooked-fs-roundtrip";
+            let file = mount_point.join("probe");
+            std::fs::write(&file, payload).expect("write probe file");
+            let read = std::fs::read(&file).expect("read probe file");
+            assert_eq!(read, payload, "{fs} round-trip mismatch");
+
+            umount(mount_point_str).unwrap_or_else(|e| panic!("umount {fs} failed: {e}"));
+            let _ = Command::new("losetup").args(["-d", &dev]).status();
+            let _ = std::fs::remove_file(&img);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
