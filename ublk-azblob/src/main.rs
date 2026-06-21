@@ -149,6 +149,9 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// `Run` carries many clap args and is far larger than the other subcommands;
+// the size difference is irrelevant for a CLI enum parsed once at startup.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Provision a new page blob and start the ublk device.
     Run {
@@ -331,6 +334,16 @@ enum Command {
         #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_BYTES")]
         cache_warmup_bytes: u64,
 
+        /// Number of blob pages the warm-up fetches concurrently.
+        ///
+        /// Warm-up is otherwise latency-bound (one page in flight at a time);
+        /// raising this makes it bandwidth-bound. Peak transient memory is
+        /// roughly `concurrency × --cache-page-size`, so lower it when using
+        /// large cache pages. Only used when `--cache-dir` and `--cache-warmup`
+        /// are set. `0` (the default) auto-sizes to the logical CPU count.
+        #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_CONCURRENCY")]
+        cache_warmup_concurrency: usize,
+
         /// Idle flush timeout in seconds: automatically flush dirty pages after N
         /// seconds of write inactivity.  Set to 0 to disable idle flushing.
         ///
@@ -355,6 +368,16 @@ enum Command {
         /// `--force-flush-timeout-secs` (which only schedules background flushes).
         #[arg(long, default_value = "0", env = "UBLK_FLUSH_IO_TIMEOUT_SECS")]
         flush_io_timeout_secs: u64,
+
+        /// Maximum number of dirty pages flushed concurrently to the backend.
+        ///
+        /// Flushing is latency-bound when the backend is remote (e.g. Azure in a
+        /// distant region), so issuing several page writes in flight at once is
+        /// the key throughput lever. Transient extra memory is bounded by
+        /// `page_size × this value`. Set to 1 for fully sequential flushing.
+        /// `0` (the default) auto-sizes to the logical CPU count.
+        #[arg(long, default_value = "0", env = "UBLK_FLUSH_CONCURRENCY")]
+        flush_concurrency: usize,
 
         /// Serve over the NBD protocol instead of ublk (compatibility mode).
         ///
@@ -514,9 +537,11 @@ async fn main() -> anyhow::Result<()> {
             ref cache_instance,
             cache_warmup,
             cache_warmup_bytes,
+            cache_warmup_concurrency,
             idle_flush_secs,
             force_flush_timeout_secs,
             flush_io_timeout_secs,
+            flush_concurrency,
             ref nbd,
         } => {
             // Read-only is derived solely from selecting a snapshot: a snapshot
@@ -641,8 +666,8 @@ async fn main() -> anyhow::Result<()> {
                         .await
                         .context("flush recovered dirty cache pages")?;
                 }
-                // Optional background cache warm-up: sequentially prefetch the
-                // blob into the cache so reads are served locally. Spawned
+                // Optional background cache warm-up: prefetch the blob into the
+                // cache (concurrently) so reads are served locally. Spawned
                 // detached so the device comes online immediately. (Sharing is
                 // disabled, so warm-up populates only this process's own cache.)
                 if cache_warmup {
@@ -655,12 +680,20 @@ async fn main() -> anyhow::Result<()> {
                     }
                     .min(actual_size);
                     let warm_backend = cache.clone();
+                    let conc = if cache_warmup_concurrency == 0 {
+                        crate::backend::cpu_count()
+                    } else {
+                        cache_warmup_concurrency
+                    };
                     info!(
                         warmup_limit_bytes = limit,
+                        warmup_concurrency = conc,
                         "cache warm-up started (background)"
                     );
                     tokio::spawn(async move {
-                        warmup_cache(warm_backend, actual_size, cache_page_size, limit).await;
+                        warm_backend
+                            .warmup(actual_size, cache_page_size, limit, conc)
+                            .await;
                     });
                 }
                 cache
@@ -678,12 +711,18 @@ async fn main() -> anyhow::Result<()> {
                 info!("write-through mode (read-only)");
                 backend
             } else if page_size > 0 {
+                let flush_concurrency = if flush_concurrency == 0 {
+                    crate::backend::cpu_count()
+                } else {
+                    flush_concurrency
+                };
                 info!(
                     page_size,
                     max_dirty_pages,
                     idle_flush_secs,
                     force_flush_timeout_secs,
                     flush_io_timeout_secs,
+                    flush_concurrency,
                     "write-back buffer enabled"
                 );
                 BufferedBackend::new(
@@ -694,6 +733,7 @@ async fn main() -> anyhow::Result<()> {
                         idle_flush_secs,
                         force_flush_timeout_secs,
                         flush_io_timeout_secs,
+                        flush_concurrency,
                     },
                 )
                 .context("configure write-back buffer")?
@@ -1030,41 +1070,6 @@ fn cache_file_name(container: &str, blob: &str) -> String {
     sanitize_cache_component(&format!("{container}-{blob}"))
 }
 
-/// Background cache warm-up: sequentially populate `[0, limit_bytes)` of the
-/// device through `backend` (the cache layer) so those pages become resident
-/// locally — served from a peer when one already holds them, else fetched from
-/// the blob and stored as clean pages in the local cache.
-///
-/// Best-effort: a read error stops the warm-up (the device keeps serving on
-/// demand). Yields between pages so it doesn't starve live I/O.
-async fn warmup_cache(
-    backend: Arc<dyn BlobBackend>,
-    dev_size: u64,
-    page_size: u64,
-    limit_bytes: u64,
-) {
-    let limit = limit_bytes.min(dev_size);
-    let mut offset = 0u64;
-    let mut warmed = 0u64;
-    while offset < limit {
-        let len = page_size.min(dev_size - offset);
-        match backend.prefetch(offset, len).await {
-            Ok(()) => warmed += len,
-            Err(err) => {
-                warn!(offset, %err, "cache warm-up read failed; stopping early");
-                break;
-            }
-        }
-        offset += len;
-        tokio::task::yield_now().await;
-    }
-    info!(
-        warmed_bytes = warmed,
-        limit_bytes = limit,
-        "cache warm-up complete"
-    );
-}
-
 /// Sanitize a single string to the cache file-name alphabet (alphanumerics plus
 /// `-` and `_`), so an operator-supplied `--cache-instance` / blob identity
 /// stays inside `--cache-dir` and cannot traverse paths.
@@ -1219,7 +1224,7 @@ mod warmup_tests {
             size: 8192,
             ..Default::default()
         });
-        warmup_cache(b.clone(), 8192, 4096, 8192).await;
+        b.warmup(8192, 4096, 8192, 1).await;
         assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (4096, 4096)]);
     }
 
@@ -1230,7 +1235,7 @@ mod warmup_tests {
             ..Default::default()
         });
         // limit = one page
-        warmup_cache(b.clone(), 8192, 4096, 4096).await;
+        b.warmup(8192, 4096, 4096, 1).await;
         assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096)]);
     }
 
@@ -1241,7 +1246,7 @@ mod warmup_tests {
             ..Default::default()
         });
         // limit > dev_size is clamped; last chunk is the partial tail.
-        warmup_cache(b.clone(), 6144, 4096, u64::MAX).await;
+        b.warmup(6144, 4096, u64::MAX, 1).await;
         assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (4096, 2048)]);
     }
 }
