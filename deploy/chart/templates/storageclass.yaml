@@ -42,6 +42,9 @@ parameters:
   {{- if .fsType }}
   fsType: {{ .fsType }}
   {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
+  {{- end }}
   {{- if .templateBlobUrl }}
   templateBlobUrl: {{ .templateBlobUrl | quote }}
   {{- end }}
@@ -81,6 +84,9 @@ parameters:
   {{- end }}
   {{- if .fsType }}
   fsType: {{ .fsType }}
+  {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
   {{- end }}
   {{- if .templateBlobUrl }}
   templateBlobUrl: {{ .templateBlobUrl | quote }}
