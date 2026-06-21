@@ -91,25 +91,11 @@ sudo mount /dev/ublkb0 /mnt/azblob
 
 A device is exposed **read-only** by mounting an immutable **point-in-time
 snapshot** of the blob: pass `--snapshot <SNAPSHOT>` (the `x-ms-snapshot`
-timestamp returned when the snapshot was created). There is no separate
-read-only flag — a snapshot is immutable, so the ublk device (or NBD export) is
-advertised read-only and every write, discard, and write-zeroes request is
-rejected, and (because the content can never change) the local cache is safe to
-reuse.
-
-```bash
-# Mount the live blob read-only
-sudo ./target/release/ublk-azblob \
-  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
-  --msi \
-  run --size 10737418240 --read-only
-```
-
-To mount an immutable **point-in-time snapshot** of the blob, pass
-`--snapshot <SNAPSHOT>` (the `x-ms-snapshot` timestamp returned when the
-snapshot was created) — or append `?snapshot=<SNAPSHOT>` to `--blob-url`.
-Selecting a snapshot **implies `--read-only`** — the snapshot is immutable, so
-writes are always rejected:
+timestamp returned when the snapshot was created), or append
+`?snapshot=<SNAPSHOT>` to `--blob-url`. There is no separate read-only flag — a
+snapshot is immutable, so the ublk device (or NBD export) is advertised
+read-only and every write, discard, and write-zeroes request is rejected, and
+(because the content can never change) the local cache is safe to reuse.
 
 ```bash
 # Mount a specific blob snapshot (read-only is implied)
@@ -158,13 +144,12 @@ in NBD mode. The local-disk / write-back cache options behave identically.
 
 ## Environment variables
 
-All CLI flags have environment-variable equivalents:
+Common CLI flags have environment-variable equivalents:
 
 | Flag | Env var |
 |------|---------|
 | `--blob-url` | `AZURE_STORAGE_BLOB_URL` |
 | `--account-key` | `AZURE_STORAGE_KEY` |
-| `--snapshot` | `AZURE_STORAGE_SNAPSHOT` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
 | `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
