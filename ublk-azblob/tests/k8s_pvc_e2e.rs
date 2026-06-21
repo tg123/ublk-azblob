@@ -890,7 +890,7 @@ spec:
 /// container across all node pods.  The child `run` process forwards its own
 /// stdout/stderr to the node container (see `csi::mount::spawn_device`), so the
 /// local-disk cache's reuse/invalidation messages surface here.
-fn node_plugin_logs(extra: &[&str]) -> String {
+fn node_plugin_logs(extra_args: &[&str]) -> String {
     let mut args = vec![
         "-n",
         NS,
@@ -901,7 +901,7 @@ fn node_plugin_logs(extra: &[&str]) -> String {
         "azblob",
         "--prefix",
     ];
-    args.extend_from_slice(extra);
+    args.extend_from_slice(extra_args);
     let out = Command::new("kubectl")
         .args(&args)
         .output()

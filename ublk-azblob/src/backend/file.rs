@@ -1425,6 +1425,27 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    #[test]
+    fn count_clean_pages_counts_present_and_clean_only() {
+        let num_pages = 8u64;
+        let mut present = vec![0u8; bitmap_bytes(num_pages)];
+        let mut dirty = vec![0u8; bitmap_bytes(num_pages)];
+
+        // No pages present yet → nothing clean.
+        assert_eq!(count_clean_pages(&present, &dirty, num_pages), 0);
+
+        // Pages 0,1,2 present; page 1 is dirty → only 0 and 2 are clean.
+        bit_set(&mut present, 0, true);
+        bit_set(&mut present, 1, true);
+        bit_set(&mut present, 2, true);
+        bit_set(&mut dirty, 1, true);
+        assert_eq!(count_clean_pages(&present, &dirty, num_pages), 2);
+
+        // A dirty bit without the present bit is not counted.
+        bit_set(&mut dirty, 5, true);
+        assert_eq!(count_clean_pages(&present, &dirty, num_pages), 2);
+    }
+
     fn tmp_dir(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         let uniq = format!(
