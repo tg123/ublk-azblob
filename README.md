@@ -99,28 +99,16 @@ sudo mount /dev/ublkb0 /mnt/azblob
 
 ## Read-only mode and blob snapshots
 
-Pass `--read-only` to the `run` subcommand to expose the device read-only. The
-ublk device (or NBD export) is advertised read-only and every write, discard,
-and write-zeroes request is rejected, so the underlying blob can never be
-modified through the device.
+A device is exposed **read-only** by mounting an immutable **point-in-time
+snapshot** of the blob: pass `--snapshot <SNAPSHOT>` (the `x-ms-snapshot`
+timestamp returned when the snapshot was created). There is no separate
+read-only flag — a snapshot is immutable, so the ublk device (or NBD export) is
+advertised read-only and every write, discard, and write-zeroes request is
+rejected, and (because the content can never change) the local cache is safe to
+reuse.
 
 ```bash
-# Mount the live blob read-only
-sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
-  --msi \
-  run --size 10737418240 --read-only
-```
-
-To mount an immutable **point-in-time snapshot** of the blob, pass
-`--snapshot <SNAPSHOT>` (the `x-ms-snapshot` timestamp returned when the
-snapshot was created). Selecting a snapshot **implies `--read-only`** — the
-snapshot is immutable, so writes are always rejected:
-
-```bash
-# Mount a specific blob snapshot (read-only is implied)
+# Mount a specific blob snapshot (read-only)
 sudo ./target/release/ublk-azblob \
   --account mystorageaccount \
   --container mydisks \
@@ -130,8 +118,8 @@ sudo ./target/release/ublk-azblob \
   run --size 10737418240
 ```
 
-`--create` cannot be combined with `--read-only` or `--snapshot`. The
-read-only mount skips the write-back buffer entirely (there are no writes to
+`--create` cannot be combined with `--snapshot` (a snapshot is immutable). A
+snapshot mount skips the write-back buffer entirely (there are no writes to
 batch); read caching via `--cache-dir` still works.
 
 ---
