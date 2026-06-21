@@ -1,7 +1,7 @@
-//! Node-side OS helpers: ublk device discovery, `mkfs`, `mount` / `umount`.
+//! Node-side OS helpers: ublk device discovery, `mkfs`, `fsck`, `mount` / `umount`.
 //!
-//! These are blocking operations (they shell out to `mkfs`, `mount`, `blkid`,
-//! `umount` and poll `/dev`); the node service runs them on a blocking thread.
+//! These are blocking operations (they shell out to `mkfs`, `fsck`, `mount`,
+//! `blkid`, `umount` and poll `/dev`); the node service runs them on a blocking thread.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -326,6 +326,80 @@ pub fn mkfs(dev: &str, fs_type: &str) -> anyhow::Result<()> {
     run(&mkfs_bin, &args)
 }
 
+/// How to run `fsck` on a device before mounting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsckMode {
+    /// Don't run `fsck` (default).
+    Off,
+    /// `fsck -a`: automatically repair (preen) the filesystem; only minor,
+    /// safe-to-fix problems are corrected without prompting.
+    Preen,
+    /// `fsck -f -y`: force a full check even on a clean filesystem and answer
+    /// "yes" to every repair prompt.
+    Force,
+}
+
+impl FsckMode {
+    /// Parse a volume-context `fsck` value. Recognised values (case-insensitive):
+    /// `""`/`false`/`off`/`no`/`none`/`0` ⇒ [`FsckMode::Off`];
+    /// `true`/`auto`/`preen`/`yes`/`on`/`1` ⇒ [`FsckMode::Preen`];
+    /// `force`/`full` ⇒ [`FsckMode::Force`].
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "false" | "off" | "no" | "none" | "0" => Ok(FsckMode::Off),
+            "true" | "auto" | "preen" | "yes" | "on" | "1" => Ok(FsckMode::Preen),
+            "force" | "full" => Ok(FsckMode::Force),
+            other => bail!(
+                "invalid fsck value {other:?}; expected one of \
+                 false/off, true/preen/auto, or force"
+            ),
+        }
+    }
+}
+
+/// Run `fsck` on `dev` according to `mode` before mounting.
+///
+/// Only call this on a writable device that already carries a filesystem.
+/// `fsck` repairs in place, so the backing device must be read-write. Exit
+/// codes are interpreted per the `fsck(8)` bitmask: `0` (clean) and `1`
+/// (errors corrected) are treated as success; anything else — including `2`
+/// (corrected, reboot recommended), `4` (errors left uncorrected) and operational
+/// failures — is an error.
+pub fn fsck(dev: &str, fs_type: &str, mode: FsckMode) -> anyhow::Result<()> {
+    let args: Vec<&str> = match mode {
+        FsckMode::Off => return Ok(()),
+        // `-a` preens (auto-repair without prompting); non-interactive.
+        FsckMode::Preen => vec!["-t", fs_type, "-a", dev],
+        // `-f` forces a full check, `-y` answers yes to every prompt.
+        FsckMode::Force => vec!["-t", fs_type, "-f", "-y", dev],
+    };
+    info!(dev, fs_type, ?mode, "running fsck");
+    let output = Command::new("fsck")
+        .args(&args)
+        .output()
+        .with_context(|| format!("spawn `fsck {}`", args.join(" ")))?;
+    // `fsck` returns a bitmask: bit 0 (1) = errors corrected, bit 1 (2) = reboot
+    // recommended, bit 2 (4) = errors left uncorrected, bit 3 (8) = operational
+    // error, etc. Treat 0 (clean) and 1 (corrected) as success.
+    if let Some(code) = output.status.code() {
+        if code == 0 || code == 1 {
+            if code == 1 {
+                warn!(dev, "fsck corrected filesystem errors");
+            }
+            return Ok(());
+        }
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "`fsck {}` failed ({}): {} {}",
+        args.join(" "),
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    );
+}
+
 /// Mount `dev` at `target`, creating the mount point if needed.
 pub fn mount(
     dev: &str,
@@ -407,4 +481,35 @@ fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FsckMode;
+
+    #[test]
+    fn fsck_mode_parses_off_values() {
+        for v in ["", "  ", "false", "OFF", "No", "none", "0"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Off, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_parses_preen_values() {
+        for v in ["true", "TRUE", "auto", "preen", "yes", "on", "1"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Preen, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_parses_force_values() {
+        for v in ["force", "Full"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Force, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_rejects_unknown_values() {
+        assert!(FsckMode::parse("maybe").is_err());
+    }
 }
