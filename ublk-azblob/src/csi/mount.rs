@@ -311,8 +311,10 @@ pub fn has_filesystem(dev: &str) -> bool {
 /// only has to pick a type (`newBlobFsType` / `templateBlobFsType`) instead of
 /// hand-rolling `mkfs`/mount flags.
 pub struct FsProfile {
-    /// Options passed to `mkfs.<fs>` before the device argument.
-    pub mkfs_options: &'static [&'static str],
+    /// Options passed to `mkfs.<fs>` before the device argument, or `None` when
+    /// the filesystem cannot be created on a live device (mount-only image /
+    /// pool filesystems and unknown types).
+    pub mkfs_options: Option<&'static [&'static str]>,
     /// Default mount `-o` options applied when mounting the filesystem.
     pub mount_options: &'static [&'static str],
 }
@@ -321,8 +323,9 @@ pub struct FsProfile {
 ///
 /// Supported profiles cover ext2/3/4, xfs, btrfs, squashfs, zfs and ntfs.
 /// squashfs and zfs are read-only image / pool filesystems that are never
-/// created on a live device, so they carry no `mkfs` options. Unknown types
-/// fall back to an empty profile (plain `mkfs.<fs> <dev>` and a bare mount).
+/// created on a live device, so they have no `mkfs` options (`None`). Unknown
+/// types also map to `None`, so [`mkfs`] rejects them instead of shelling out
+/// to a non-existent `mkfs.<fs>`.
 pub fn fs_profile(fs_type: &str) -> FsProfile {
     match fs_type {
         "ext2" | "ext3" | "ext4" => FsProfile {
@@ -330,32 +333,32 @@ pub fn fs_profile(fs_type: &str) -> FsProfile {
             // nodiscard` avoids a full TRIM pass (faster, and discard maps onto
             // Clear Pages); lazy_itable_init / lazy_journal_init speed up mkfs on
             // large devices (no zeroing of inode tables and journal).
-            mkfs_options: &["-F", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1"],
+            mkfs_options: Some(&["-F", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1"]),
             mount_options: &[],
         },
         // `-f` forces formatting even when an old signature is present.
         "xfs" => FsProfile {
-            mkfs_options: &["-f"],
+            mkfs_options: Some(&["-f"]),
             mount_options: &[],
         },
         "btrfs" => FsProfile {
-            mkfs_options: &["-f"],
+            mkfs_options: Some(&["-f"]),
             mount_options: &[],
         },
         // Read-only image / pool filesystems: only ever mounted from a template,
         // never formatted on a freshly-provisioned device.
         "squashfs" | "zfs" => FsProfile {
-            mkfs_options: &[],
+            mkfs_options: None,
             mount_options: &[],
         },
         "ntfs" => FsProfile {
             // `-F` forces, `-Q` does a quick format (skip zeroing and the
             // bad-block scan).
-            mkfs_options: &["-F", "-Q"],
+            mkfs_options: Some(&["-F", "-Q"]),
             mount_options: &[],
         },
         _ => FsProfile {
-            mkfs_options: &[],
+            mkfs_options: None,
             mount_options: &[],
         },
     }
@@ -363,11 +366,17 @@ pub fn fs_profile(fs_type: &str) -> FsProfile {
 
 /// Create a filesystem of type `fs_type` on `dev` (only call on a blank device).
 ///
-/// The built-in `mkfs` options come from the filesystem [`fs_profile`].
+/// The built-in `mkfs` options come from the filesystem [`fs_profile`]. Returns
+/// an error for filesystem types that cannot be created on a live device
+/// (mount-only image / pool filesystems such as squashfs/zfs, and unknown
+/// types).
 pub fn mkfs(dev: &str, fs_type: &str) -> anyhow::Result<()> {
+    let mkfs_options = fs_profile(fs_type).mkfs_options.ok_or_else(|| {
+        anyhow::anyhow!("filesystem type {fs_type:?} does not support mkfs (cannot format {dev})")
+    })?;
     let mkfs_bin = format!("mkfs.{fs_type}");
     info!(dev, fs_type, "creating filesystem");
-    let mut args: Vec<&str> = fs_profile(fs_type).mkfs_options.to_vec();
+    let mut args: Vec<&str> = mkfs_options.to_vec();
     args.push(dev);
     run(&mkfs_bin, &args)
 }
