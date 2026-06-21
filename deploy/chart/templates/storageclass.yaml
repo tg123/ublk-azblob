@@ -48,6 +48,9 @@ parameters:
   {{- if .templateBlobMountArgs }}
   templateBlobMountArgs: {{ .templateBlobMountArgs | quote }}
   {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
+  {{- end }}
   {{- if .templateBlobUrl }}
   templateBlobUrl: {{ .templateBlobUrl | quote }}
   {{- end }}
@@ -93,6 +96,9 @@ parameters:
   {{- end }}
   {{- if .templateBlobMountArgs }}
   templateBlobMountArgs: {{ .templateBlobMountArgs | quote }}
+  {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
   {{- end }}
   {{- if .templateBlobUrl }}
   templateBlobUrl: {{ .templateBlobUrl | quote }}

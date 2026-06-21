@@ -297,6 +297,17 @@ impl Node for NodeService {
             .get("fromTemplate")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
+        // Optional `fsck` pass before mounting an already-formatted, writable
+        // device. Defaults to off; `true`/`preen` preens, `force` runs a full
+        // check. A read-only device can't be repaired in place, so fsck is
+        // skipped there (see below).
+        let fsck_mode = mount::FsckMode::parse(
+            req.volume_context
+                .get("fsck")
+                .map(String::as_str)
+                .unwrap_or(""),
+        )
+        .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
         let volumes = self.volumes.clone();
         let publish_lock = self.publish_lock.clone();
         let use_nbd = self.config.use_nbd;
@@ -366,6 +377,7 @@ impl Node for NodeService {
 
             // Make a filesystem only on a blank device, then mount.
             let outcome = (|| -> anyhow::Result<()> {
+                let mut formatted = false;
                 if mount::has_filesystem(&device) {
                     info!(device = %device, "existing filesystem detected; skipping mkfs");
                 } else if from_template {
@@ -381,6 +393,13 @@ impl Node for NodeService {
                     );
                 } else {
                     mount::mkfs(&device, &fs_type)?;
+                    formatted = true;
+                }
+                // Optionally fsck an existing filesystem before mounting. A
+                // freshly `mkfs`'d device is already clean, and a read-only
+                // device can't be repaired in place, so skip fsck in both cases.
+                if fsck_mode != mount::FsckMode::Off && !formatted && !readonly {
+                    mount::fsck(&device, &fs_type, fsck_mode)?;
                 }
                 mount::mount(&device, &target, &fs_type, &mount_flags, readonly)?;
                 Ok(())
