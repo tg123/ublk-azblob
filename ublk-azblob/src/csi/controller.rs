@@ -62,18 +62,11 @@ const PARAM_LEASE_DURATION_SECS: &str = "leaseDurationSecs";
 /// `templateBlobUrl` that includes a `?snapshot=<timestamp>` query, and read by
 /// the node to mount the immutable snapshot read-only.
 const PARAM_SNAPSHOT: &str = "snapshot";
-/// Parameter key exposing the volume read-only (no writes reach the blob).
-const PARAM_READ_ONLY: &str = "readOnly";
 /// Parameter key: a full Azure blob URL to use as a golden-image template.
-/// Read-only/snapshot volumes mount it directly (no lock/lease); read-write
-/// volumes copy it into a fresh per-PVC blob and skip formatting.
+/// A template URL that targets a **snapshot** (`?snapshot=`) is mounted directly
+/// read-only (no lock/lease); a non-snapshot template is copied into a fresh
+/// per-PVC blob (read-write) and formatting is skipped.
 const PARAM_TEMPLATE_BLOB_URL: &str = "templateBlobUrl";
-
-/// Parse a `"true"`/`"1"`/`"yes"` style flag value.
-fn is_truthy(v: Option<&String>) -> bool {
-    v.map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
-}
 
 /// Default blob path template
 const DEFAULT_BLOB_PATH_TEMPLATE: &str = "ublk-azblob-disk/${pv.name}";
@@ -221,11 +214,9 @@ impl Controller for ControllerService {
         ));
 
         // `templateBlobUrl` provisions the volume from a golden-image blob.
-        // Read-only when the StorageClass opts in via `readOnly`, or when the
-        // template URL targets a snapshot — such volumes mount the template
-        // directly with no copy, no lock and no lease; read-write volumes copy
-        // the template into the per-PVC blob.
-        let read_only_mode = is_truthy(req.parameters.get(PARAM_READ_ONLY));
+        // Read-only exactly when the template URL targets a snapshot — such
+        // volumes mount the template directly with no copy, no lock and no lease;
+        // a non-snapshot template is copied into the per-PVC blob (read-write).
 
         // Tracks state when provisioning from a template (see below).
         let mut size = size;
@@ -239,7 +230,7 @@ impl Controller for ControllerService {
         {
             let tmpl = parse_blob_url(template_url)
                 .map_err(|e| Status::invalid_argument(format!("templateBlobUrl: {e:#}")))?;
-            let read_only_mode = read_only_mode || tmpl.snapshot.is_some();
+            let read_only_mode = tmpl.snapshot.is_some();
             let source = build_template_backend(&self.config, &tmpl, &req.secrets)
                 .map_err(|e| Status::internal(format!("build template backend: {e:#}")))?;
             let source_size = source
@@ -263,7 +254,6 @@ impl Controller for ControllerService {
                     format!("{}/", tmpl.service_url.trim_end_matches('/')),
                 );
                 volume_context.insert("size".to_string(), source_size.to_string());
-                volume_context.insert(PARAM_READ_ONLY.to_string(), "true".to_string());
                 if let Some(snapshot) = &tmpl.snapshot {
                     volume_context.insert(PARAM_SNAPSHOT.to_string(), snapshot.clone());
                 }
@@ -377,7 +367,6 @@ impl Controller for ControllerService {
             PARAM_LEASE_NAMESPACE,
             PARAM_RECOVERY_TIMEOUT_SECS,
             PARAM_LEASE_DURATION_SECS,
-            PARAM_READ_ONLY,
         ] {
             if let Some(v) = req.parameters.get(key) {
                 volume_context.insert(key.to_string(), v.clone());
