@@ -67,7 +67,7 @@ struct Cli {
     /// local cache safe to reuse: there is no separate `--read-only` flag.
     /// May also be supplied as a `?snapshot=` query on `--blob-url`; `--snapshot`
     /// takes precedence when both are provided.
-    #[arg(long, env = "AZURE_STORAGE_SNAPSHOT")]
+    #[arg(long)]
     snapshot: Option<String>,
 
     /// Storage account key (base64).  Enables SharedKey auth mode.
@@ -755,6 +755,12 @@ struct Location {
 }
 
 impl Cli {
+    fn snapshot_from_env() -> Option<String> {
+        std::env::var("AZURE_STORAGE_SNAPSHOT")
+            .ok()
+            .filter(|s| !s.is_empty())
+    }
+
     /// Resolve the target blob for the single-device subcommands.
     ///
     /// The user-facing path parses the global `--blob-url` into its components,
@@ -772,7 +778,11 @@ impl Cli {
                 account: parsed.account,
                 container: parsed.container,
                 blob: parsed.blob,
-                snapshot: self.snapshot.clone().or(parsed.snapshot),
+                snapshot: self
+                    .snapshot
+                    .clone()
+                    .or(parsed.snapshot)
+                    .or_else(Self::snapshot_from_env),
                 sas: self.sas_token.clone().or(parsed.sas),
             });
         }
@@ -807,7 +817,7 @@ impl Cli {
             account,
             container,
             blob,
-            snapshot: self.snapshot.clone(),
+            snapshot: self.snapshot.clone().or_else(Self::snapshot_from_env),
             sas: self.sas_token.clone(),
         })
     }
