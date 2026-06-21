@@ -240,11 +240,12 @@ fn test_basic_mount_and_recovery() {
 
     // ── Deploy CSI driver using Helm ──────────────────────────────────────────
     // Azurite runs as the docker-compose `azurite` service (shared with the
-    // mount/NBD e2e); the CSI pods reach it via hostAliases (see e2e.values.yaml)
-    // pointing `azurite.<ns>.svc.cluster.local` at its fixed compose IP. The
-    // endpoint is path-style (`%s` account placeholder in the path) so it
-    // collapses into a single parseable `AZURE_STORAGE_BLOB_URL` for the child.
-    let endpoint = format!("http://azurite.{NS}.svc.cluster.local:10000/%s");
+    // mount/NBD e2e) at the fixed compose IP 172.30.0.10. The CSI pods reach it
+    // by IP directly: a literal-IP host makes Azurite use path-style URLs
+    // (account in the path), so the endpoint collapses into a single parseable
+    // `AZURE_STORAGE_BLOB_URL` (a multi-label DNS host would instead trigger
+    // Azurite's production/subdomain style and mis-parse the account).
+    let endpoint = "http://172.30.0.10:10000/%s".to_string();
     deploy_csi_driver_helm(&repo, &here, &endpoint);
 
     // ── Create secret in default namespace for PVC provisioning ───────────────
