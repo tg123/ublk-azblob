@@ -1053,7 +1053,7 @@ fn nbd_blob_lock_conflict() {
     // ── Phase 2: a second server for the same blob must refuse to start ────────
     let stderr = expect_blob_lock_conflict(NBD_ADDR_LOCK_TAKER, &container, &blob);
     assert!(
-        stderr.contains("blob lease is already held") || stderr.contains("acquire blob lock"),
+        stderr.contains("blob lease is already held"),
         "the second server failed, but not with the expected blob-lock error; stderr was:\n{stderr}"
     );
     log("second server correctly refused to start while the blob lock was held ✓");

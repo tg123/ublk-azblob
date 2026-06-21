@@ -152,7 +152,7 @@ sudo ./target/release/ublk-azblob \
   run --size 10737418240 --disable-blob-lock
 ```
 
-Read-only mounts (`--read-only` / `--snapshot`) never take the lock, since they
+Read-only mounts (`--snapshot`) never take the lock, since they
 never write. In Kubernetes, the CSI driver layers a cluster-wide lease on top of
 this blob lock via `--coordination` so a dead node's volume can be safely taken
 over; see [`docs/cluster-testing.md`](docs/cluster-testing.md). `--coordination`
