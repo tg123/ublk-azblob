@@ -323,6 +323,18 @@ impl FileCacheBackend {
                         "backing blob changed since last run; discarded stale clean cache pages"
                     );
                 }
+            } else {
+                // The recorded token matches the live blob, so the resident clean
+                // pages are still valid: reuse them rather than re-fetching from
+                // the backing store (e.g. across a process/pod restart).
+                let reused = count_clean_pages(&present, &dirty, num_pages);
+                if reused > 0 {
+                    info!(
+                        dir = %cfg.dir.display(),
+                        reused,
+                        "validated local disk cache against backing blob; reusing clean cache pages"
+                    );
+                }
             }
             // Record the live token so the next restart can validate against it.
             write_recorded_etag(&etag_path, current);
@@ -1307,6 +1319,19 @@ fn drop_clean_pages(
             .context("fsync cache metadata after invalidation")?;
     }
     Ok(dropped)
+}
+
+/// Count the pages that are present **and clean** (not dirty).  Used to report
+/// how many valid clean pages are reused from the local cache after the backing
+/// blob's validity token is confirmed unchanged.
+fn count_clean_pages(present: &[u8], dirty: &[u8], num_pages: u64) -> u64 {
+    let mut clean = 0u64;
+    for i in 0..num_pages {
+        if bit_get(present, i) && !bit_get(dirty, i) {
+            clean += 1;
+        }
+    }
+    clean
 }
 
 /// Load the metadata bitmaps from `meta`, validating the header.  If the file is

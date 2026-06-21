@@ -12,6 +12,11 @@
 //!   4. run a reader Job that mounts the *same* PVC on a fresh device over
 //!      the existing page blob and verifies the SHA-256 still matches
 //!
+//! It then layers on three further checks: pod migration between nodes, two
+//! disks co-located on one node, and — with the persistent local-disk cache
+//! enabled — that the host-path cache survives a node-plugin pod restart and is
+//! revalidated (via the blob ETag) and reused rather than re-fetched.
+//!
 //! This is the Kubernetes counterpart of `mount_e2e.rs` and proves the data
 //! survives provision → write → unmount → remount through the page blob.
 //!
@@ -341,6 +346,9 @@ stringData:
 
     // ── Test 3: Two disks mounted on the same node, no conflict ────────────────
     test_multi_disk_same_node(&here);
+
+    // ── Test 4: Local-disk cache survives a node-plugin pod restart ────────────
+    test_local_cache_reload(&here);
 
     log("k8s PVC e2e PASSED ✓");
 }
@@ -875,6 +883,240 @@ spec:
             "azblob-pvc-multi-b",
             "--wait=true",
         ],
+    );
+}
+
+/// Capture the combined stdout/stderr logs of the node plugin's `azblob`
+/// container across all node pods.  The child `run` process forwards its own
+/// stdout/stderr to the node container (see `csi::mount::spawn_device`), so the
+/// local-disk cache's reuse/invalidation messages surface here.
+fn node_plugin_logs(extra: &[&str]) -> String {
+    let mut args = vec![
+        "-n",
+        NS,
+        "logs",
+        "-l",
+        "app=csi-ublk-azblob-node",
+        "-c",
+        "azblob",
+        "--prefix",
+    ];
+    args.extend_from_slice(extra);
+    let out = Command::new("kubectl")
+        .args(&args)
+        .output()
+        .expect("kubectl logs node plugin");
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    s
+}
+
+/// Test 4: the persistent local-disk cache survives a node-plugin pod restart.
+///
+/// A writer populates the host-path cache (clean pages + the blob ETag validity
+/// token), then the node plugin DaemonSet is restarted so a *fresh* node pod
+/// (with empty logs) takes over while the on-disk cache persists.  A reader then
+/// remounts the same PVC: `FileCacheBackend::open` revalidates the recorded ETag
+/// against the unchanged blob and reuses the cached clean pages instead of
+/// re-fetching them.  We assert both the data round-trips *and* the node logs
+/// report reusing (not discarding) the cached pages.
+fn test_local_cache_reload(_here: &Path) {
+    log("TEST 4: local-disk cache reload across a node-plugin pod restart");
+
+    // Pin writer and reader to the same node so they share one host-path cache.
+    let nodes_out = Command::new("kubectl")
+        .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+        .output()
+        .expect("get nodes");
+    let nodes_str = String::from_utf8_lossy(&nodes_out.stdout);
+    let node = match nodes_str.split_whitespace().next() {
+        Some(n) => n.to_string(),
+        None => panic!("local-cache test: no nodes found"),
+    };
+    log(&format!("pinning cache writer/reader to node {node}"));
+
+    // Dedicated PVC → dedicated page blob → dedicated cache entry, so this test
+    // never races the earlier sub-tests' blobs/cache files.
+    let pvc = r#"apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azblob-pvc-cache
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: azblob-ublk
+  resources:
+    requests:
+      storage: 256Mi
+"#;
+    log("creating PVC azblob-pvc-cache");
+    kubectl_apply_stdin(pvc);
+
+    // ── Writer: populate the host-path cache and flush the blob ───────────────
+    let writer_yaml = format!(
+        r#"apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azblob-cache-writer
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: azblob-cache-writer
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: {node}
+      containers:
+        - name: writer
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "writing payload to /data (populates the node local cache)"
+              dd if=/dev/urandom of=/data/payload bs=1M count=8
+              sha256sum /data/payload | tee /data/payload.sha256
+              sync
+              echo "cache-writer done"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: azblob-pvc-cache
+"#
+    );
+    log("running cache writer Job");
+    kubectl_apply_stdin(&writer_yaml);
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=complete",
+            "job/azblob-cache-writer",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-cache-writer");
+        panic!("cache writer Job did not complete");
+    }
+
+    log("deleting cache writer (tears down device, flushes blob, leaves clean cache pages)");
+    run(
+        "kubectl",
+        &["delete", "job", "azblob-cache-writer", "--wait=true"],
+    );
+
+    // ── Restart the node plugin so a fresh pod (empty logs) takes over while the
+    //    host-path cache directory persists across the restart. ───────────────
+    log("restarting the node plugin DaemonSet (host-path cache must survive)");
+    run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "rollout",
+            "restart",
+            "daemonset/csi-ublk-azblob-node",
+        ],
+    );
+    run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "rollout",
+            "status",
+            "daemonset/csi-ublk-azblob-node",
+            "--timeout=180s",
+        ],
+    );
+
+    // ── Reader: remount the same PVC; reads must be served from the reused cache.
+    let reader_yaml = format!(
+        r#"apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azblob-cache-reader
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: azblob-cache-reader
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: {node}
+      containers:
+        - name: reader
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "verifying payload checksum on /data after node-plugin restart"
+              cd /data
+              sha256sum -c payload.sha256
+              echo "cache-reader verified OK"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: azblob-pvc-cache
+"#
+    );
+    log("running cache reader Job (remounts same PVC after the restart)");
+    kubectl_apply_stdin(&reader_yaml);
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=complete",
+            "job/azblob-cache-reader",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-cache-reader");
+        panic!("cache reader Job did not complete — data did not survive the cache reload");
+    }
+    let _ = try_run(
+        "kubectl",
+        &["logs", "-l", "app=azblob-cache-reader", "--tail=50"],
+    );
+
+    // ── Verify the cache was reloaded (reused), not invalidated.  Only the reader
+    //    mounts after the restart, so any reuse/invalidation line in the fresh
+    //    node-plugin logs is this volume's. ────────────────────────────────────
+    let logs = node_plugin_logs(&["--tail=400"]);
+    if logs.contains("discarded stale clean cache pages") {
+        eprintln!("--- node plugin logs ---\n{logs}\n--- end ---");
+        panic!(
+            "local cache was invalidated after the restart; the host-path cache \
+             should have been revalidated and reused"
+        );
+    }
+    if !logs.contains("reusing clean cache pages") {
+        eprintln!("--- node plugin logs ---\n{logs}\n--- end ---");
+        panic!(
+            "node plugin did not report reusing the local cache after the restart; \
+             expected the ETag-validated cache pages to be reloaded"
+        );
+    }
+    log("✓ Local-cache reload test PASSED: cache survived the restart and was reused");
+
+    // Cleanup
+    run(
+        "kubectl",
+        &["delete", "job", "azblob-cache-reader", "--wait=true"],
+    );
+    run(
+        "kubectl",
+        &["delete", "pvc", "azblob-pvc-cache", "--wait=true"],
     );
 }
 
