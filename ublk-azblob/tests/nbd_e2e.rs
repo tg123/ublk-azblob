@@ -990,10 +990,11 @@ fn expect_blob_lock_conflict(addr: &str, container: &str, blob: &str) -> String 
             break status;
         }
         // It must never reach the NBD listener: the lock is acquired first.
-        assert!(
-            TcpStream::connect(addr).is_err(),
-            "the second server bound {addr} despite the blob lock being held"
-        );
+        if TcpStream::connect(addr).is_ok() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the second server bound {addr} despite the blob lock being held");
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
