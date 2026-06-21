@@ -514,6 +514,7 @@ fn mount_warmup_sparse_image() {
 
     let cache_dir = tempdir("ublk-azblob-cache-warmup");
     let mut spec = DeviceSpec {
+        // 46 avoids collision with mount_fsck's device 45 and the other tests' ids (40–44).
         dev_id: "46".to_string(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-warmup", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),

@@ -602,7 +602,7 @@ impl FileCacheBackend {
         offset: u64,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        // Option C: an all-zero page is left as a sparse hole in the data file
+        // An all-zero page is left as a sparse hole in the data file
         // (which reads back as zeros) instead of being written, so zero regions
         // of the blob — e.g. an ext4 image's free space — consume no local disk.
         // This is always safe here: this function is called only for a
@@ -1598,7 +1598,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_zero_page_leaves_sparse_hole() {
-        // Option C: an all-zero page is marked present and reads back as zeros,
+        // An all-zero page is marked present and reads back as zeros,
         // but is left as a sparse hole in the data file (no blocks allocated).
         use std::os::unix::fs::MetadataExt;
         let dir = tmp_dir("zerohole");
