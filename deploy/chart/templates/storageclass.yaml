@@ -39,8 +39,8 @@ parameters:
   {{- if .blobPathTemplate }}
   blobPathTemplate: {{ .blobPathTemplate | quote }}
   {{- end }}
-  {{- if .newBlobFormatType }}
-  newBlobFormatType: {{ .newBlobFormatType }}
+  {{- if .newBlobFsType }}
+  newBlobFsType: {{ .newBlobFsType }}
   {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}
@@ -82,8 +82,8 @@ parameters:
   {{- if .blobPathTemplate }}
   blobPathTemplate: {{ .blobPathTemplate | quote }}
   {{- end }}
-  {{- if .newBlobFormatType }}
-  newBlobFormatType: {{ .newBlobFormatType }}
+  {{- if .newBlobFsType }}
+  newBlobFsType: {{ .newBlobFsType }}
   {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}

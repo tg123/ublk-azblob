@@ -126,8 +126,7 @@ storageClass:
     blobPathTemplate: '${pvc.namespace}/volumes/${pv.name}'
     
     # Filesystem type to format a freshly-provisioned blob with: ext4, xfs, btrfs, etc.
-    # (the parameter may also be spelled `newBlobFsType`).
-    newBlobFormatType: ext4
+    newBlobFsType: ext4
 
     # Expose the volume read-only ("true"/"false"). The device rejects every
     # write/discard and is mounted read-only; the blob must already be formatted.
@@ -216,7 +215,7 @@ additionalStorageClasses: []
   #   parameters:
   #     container: "database-volumes"
   #     blobPathTemplate: '${pvc.namespace}/db/${pv.name}'
-  #     newBlobFormatType: xfs
+  #     newBlobFsType: xfs
   #
   # - name: azblob-per-tenant
   #   isDefault: false
@@ -227,7 +226,7 @@ additionalStorageClasses: []
   #     storageAccount: '${pvc.namespace}storage'
   #     container: '${pvc.namespace}'
   #     blobPathTemplate: 'volumes/${pv.name}'
-  #     newBlobFormatType: ext4
+  #     newBlobFsType: ext4
   #
   # ── Golden-image (templateBlobUrl) StorageClasses ───────────────────────────
   #
@@ -257,7 +256,7 @@ additionalStorageClasses: []
   #     storageAccount: 'mydeststorage'
   #     container: '${pvc.namespace}'
   #     blobPathTemplate: '${pvc.namespace}/tmpl/${pv.name}'
-  #     newBlobFormatType: ext4
+  #     newBlobFsType: ext4
   #     templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd'
 
 # Namespace where CSI driver components are deployed
