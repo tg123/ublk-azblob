@@ -373,7 +373,8 @@ enum Command {
         /// distant region), so issuing several page writes in flight at once is
         /// the key throughput lever. Transient extra memory is bounded by
         /// `page_size × this value`. Set to 1 for fully sequential flushing.
-        #[arg(long, default_value = "16", env = "UBLK_FLUSH_CONCURRENCY")]
+        /// `0` (the default) auto-sizes to the logical CPU count.
+        #[arg(long, default_value = "0", env = "UBLK_FLUSH_CONCURRENCY")]
         flush_concurrency: usize,
 
         /// Serve over the NBD protocol instead of ublk (compatibility mode).
@@ -680,6 +681,11 @@ async fn main() -> anyhow::Result<()> {
                 info!("write-through mode (read-only)");
                 backend
             } else if page_size > 0 {
+                let flush_concurrency = if flush_concurrency == 0 {
+                    crate::backend::cpu_count()
+                } else {
+                    flush_concurrency
+                };
                 info!(
                     page_size,
                     max_dirty_pages,
