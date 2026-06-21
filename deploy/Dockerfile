@@ -86,12 +86,13 @@ cat /cross-env.sh
 EOF
 
 # Use BuildKit cache mounts for faster builds:
-# - Cache cargo registry (crates.io index and downloads)
-# - Cache cargo build artifacts in /build/target
+# - Cache cargo registry (crates.io index and downloads), keyed per target
+#   architecture to avoid concurrent unpack races during multi-platform builds
+# - Cache cargo build artifacts in /build/target, keyed per target architecture
 # - Mount source code instead of copying (avoids layer invalidation)
 RUN --mount=type=bind,source=.,target=/src,readonly \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/build/target \
     . /cross-env.sh && \
     cd /src && \
     CARGO_TARGET_DIR=/build/target cargo build --release -p ublk-azblob && \
