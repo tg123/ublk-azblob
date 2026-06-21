@@ -179,25 +179,43 @@ fn start_server(addr: &str, container: &str, blob: &str, create: bool) -> Child 
     )
 }
 
-/// Create a snapshot of the test blob via the `snapshot` subcommand and return
-/// its `x-ms-snapshot` id (the only way to expose the export read-only).
+/// Create a snapshot of the test blob with the Azure CLI (`az storage blob
+/// snapshot`) and return its `x-ms-snapshot` id (the only way to expose the
+/// export read-only).
 fn create_snapshot(container: &str, blob: &str) -> String {
-    let bin = std::env::var("UBLK_AZBLOB_BIN")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
-    let mut cmd = Command::new(&bin);
-    cmd.arg("snapshot");
-    azure_env(&mut cmd, container, blob);
-    log(&format!("creating snapshot of blob {blob}"));
-    let out = cmd
+    let account = env_or("AZURE_STORAGE_ACCOUNT", DEFAULT_ACCOUNT);
+    let key = env_or("AZURE_STORAGE_KEY", DEFAULT_KEY);
+    let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
+    log(&format!("creating snapshot of blob {blob} via az"));
+    let out = Command::new("az")
+        .args([
+            "storage",
+            "blob",
+            "snapshot",
+            "--account-name",
+            &account,
+            "--account-key",
+            &key,
+            "--blob-endpoint",
+            &endpoint,
+            "--container-name",
+            container,
+            "--name",
+            blob,
+            "--query",
+            "snapshot",
+            "--output",
+            "tsv",
+        ])
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn `snapshot`: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn `az`: {e}"));
     assert!(
         out.status.success(),
-        "snapshot subcommand failed: {}",
+        "az storage blob snapshot failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(!id.is_empty(), "snapshot subcommand printed no id");
+    assert!(!id.is_empty(), "az returned an empty snapshot id");
     log(&format!("created snapshot {id}"));
     id
 }

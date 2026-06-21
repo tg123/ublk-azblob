@@ -354,13 +354,6 @@ enum Command {
         size: u64,
     },
 
-    /// Create a snapshot of the target blob (`--container` / `--blob`) and print
-    /// its `x-ms-snapshot` timestamp to stdout, then exit.
-    ///
-    /// The printed id can be passed back as `--snapshot` (or
-    /// `AZURE_STORAGE_SNAPSHOT`) to mount that immutable, read-only view.
-    Snapshot {},
-
     /// Copy a golden-image *template* blob into the configured target blob
     /// (`--container` / `--blob`), then exit.
     ///
@@ -419,9 +412,6 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        // Diagnostics go to stderr so stdout carries only program output (e.g.
-        // the `snapshot` subcommand prints the bare snapshot id to stdout).
-        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("ublk_azblob=info".parse().unwrap()),
@@ -681,17 +671,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Test { size } => {
             let backend: Arc<dyn BlobBackend> = build_azure_backend(&cli, &endpoint)?;
             run_smoke_test(backend, size).await?;
-        }
-
-        Command::Snapshot {} => {
-            let backend = build_azure_backend(&cli, &endpoint)?;
-            let snapshot = backend
-                .create_snapshot()
-                .await
-                .context("create blob snapshot")?;
-            info!(%snapshot, "created blob snapshot");
-            // Print the bare id to stdout so callers can capture it.
-            println!("{snapshot}");
         }
 
         #[cfg(feature = "csi")]

@@ -11,10 +11,10 @@ use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use azure_storage_blob::{
     models::{
-        BlobClientAcquireLeaseResultHeaders, BlobClientCreateSnapshotResultHeaders,
-        BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders, HttpRange,
-        PageBlobClientClearPagesOptions, PageBlobClientCreateOptions,
-        PageBlobClientUploadPagesFromUrlOptions, PageBlobClientUploadPagesOptions,
+        BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
+        BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
+        PageBlobClientCreateOptions, PageBlobClientUploadPagesFromUrlOptions,
+        PageBlobClientUploadPagesOptions,
     },
     BlobClient, BlobContainerClient,
 };
@@ -71,29 +71,6 @@ impl AzurePageBlobBackend {
     pub fn with_snapshot(mut self, snapshot: impl Into<String>) -> Self {
         self.snapshot = Some(snapshot.into());
         self
-    }
-
-    /// Create a snapshot of the (live) blob and return its `x-ms-snapshot`
-    /// timestamp.
-    ///
-    /// The returned id can be passed to [`with_snapshot`](Self::with_snapshot)
-    /// (or `--snapshot`) to mount that immutable, read-only point-in-time view.
-    pub async fn create_snapshot(&self) -> anyhow::Result<String> {
-        // Snapshot the live blob, never a snapshot of a snapshot.
-        let client = self.container.blob_client(&self.blob_name);
-        let result = client
-            .create_snapshot(None)
-            .await
-            .with_context(|| format!("create snapshot of blob '{}'", self.blob_name))?;
-        result
-            .snapshot()
-            .with_context(|| format!("read snapshot id for blob '{}'", self.blob_name))?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "blob '{}': snapshot response missing x-ms-snapshot header",
-                    self.blob_name
-                )
-            })
     }
 
     /// Build a `BlobClient` for the target blob, scoped to the configured
