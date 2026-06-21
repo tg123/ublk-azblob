@@ -204,17 +204,104 @@ pub fn make_volume_id(account: &str, container: &str, blob: &str) -> String {
     format!("{account}/{container}/{blob}")
 }
 
-/// Decode a CSI volume id produced by [`make_volume_id`] into
-/// `(account, container, blob)`.
-pub fn parse_volume_id(volume_id: &str) -> anyhow::Result<(String, String, String)> {
-    let mut parts = volume_id.splitn(3, '/');
+/// Prefix marking a read-only *template* volume id (see [`make_volume_id_ro`]).
+const RO_VOLUME_ID_PREFIX: &str = "ro:";
+
+/// Encode a read-only **template** volume id.
+///
+/// Read-only/snapshot volumes provisioned from a `templateBlobUrl` point many
+/// PVCs at one shared golden-image blob. The `ro:` marker lets `DeleteVolume`
+/// recognise them and skip deletion, so removing a PVC never deletes the shared
+/// template.
+pub fn make_volume_id_ro(account: &str, container: &str, blob: &str) -> String {
+    format!("{RO_VOLUME_ID_PREFIX}{account}/{container}/{blob}")
+}
+
+/// Decode a CSI volume id produced by [`make_volume_id`] / [`make_volume_id_ro`]
+/// into `(read_only, account, container, blob)`.
+pub fn parse_volume_id(volume_id: &str) -> anyhow::Result<(bool, String, String, String)> {
+    let (read_only, rest) = match volume_id.strip_prefix(RO_VOLUME_ID_PREFIX) {
+        Some(rest) => (true, rest),
+        None => (false, volume_id),
+    };
+    let mut parts = rest.splitn(3, '/');
     let account = parts.next().unwrap_or("");
     let container = parts.next().unwrap_or("");
     let blob = parts.next().unwrap_or("");
     if account.is_empty() || container.is_empty() || blob.is_empty() {
-        anyhow::bail!("malformed volume id '{volume_id}' (expected 'account/container/blob')");
+        anyhow::bail!("malformed volume id '{volume_id}' (expected '[ro:]account/container/blob')");
     }
-    Ok((account.to_string(), container.to_string(), blob.to_string()))
+    Ok((
+        read_only,
+        account.to_string(),
+        container.to_string(),
+        blob.to_string(),
+    ))
+}
+
+/// Select the driver's auth config for `account`, honouring per-request secrets
+/// (e.g. a SharedKey `accountKey`) the same way [`build_backend`] does.
+pub fn select_driver_auth(
+    config: &DriverConfig,
+    account: &str,
+    secrets: &HashMap<String, String>,
+) -> anyhow::Result<AuthConfig> {
+    let account_key = secrets
+        .get("accountKey")
+        .cloned()
+        .or_else(|| config.account_key.clone());
+
+    if let Some(key) = account_key {
+        Ok(AuthConfig::SharedKey {
+            account_name: account.to_string(),
+            account_key: key,
+        })
+    } else if config.use_workload_identity {
+        Ok(AuthConfig::WorkloadIdentity {
+            client_id: config.workload_identity_client_id.clone(),
+            tenant_id: config.workload_identity_tenant_id.clone(),
+            token_file: config.workload_identity_token_file.clone(),
+        })
+    } else if config.use_msi || config.msi_client_id.is_some() {
+        Ok(AuthConfig::Msi(
+            config
+                .msi_client_id
+                .clone()
+                .map(UserAssignedIdentity::ClientId),
+        ))
+    } else if let (Some(tenant_id), Some(client_id), Some(client_secret)) = (
+        secrets
+            .get("AZURE_TENANT_ID")
+            .or(config.sp_tenant_id.as_ref()),
+        secrets
+            .get("AZURE_CLIENT_ID")
+            .or(config.sp_client_id.as_ref()),
+        secrets
+            .get("AZURE_CLIENT_SECRET")
+            .or(config.sp_client_secret.as_ref()),
+    ) {
+        Ok(AuthConfig::ServicePrincipal {
+            tenant_id: tenant_id.clone(),
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+        })
+    } else {
+        anyhow::bail!(
+            "no auth configured: provide an account key (secret 'accountKey' or \
+             --account-key), enable Workload Identity (--workload-identity), \
+             enable Managed Identity (--msi / --msi-client-id), \
+             or a service principal (AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET)"
+        );
+    }
+}
+
+/// The subdomain-style endpoint URL for `account` under the driver config.
+fn account_endpoint(config: &DriverConfig, account: &str) -> String {
+    if config.endpoint.contains("%s") {
+        config.endpoint.replace("%s", account)
+    } else {
+        format!("https://{account}.blob.core.windows.net/")
+    }
 }
 
 /// Build an Azure Page Blob backend for `container`/`blob` using the driver
@@ -227,70 +314,147 @@ pub fn build_backend(
     blob: &str,
     secrets: &HashMap<String, String>,
 ) -> anyhow::Result<Arc<dyn BlobBackend>> {
-    let account_key = secrets
-        .get("accountKey")
-        .cloned()
-        .or_else(|| config.account_key.clone());
-
-    let auth = if let Some(key) = account_key {
-        AuthConfig::SharedKey {
-            account_name: account.to_string(),
-            account_key: key,
-        }
-    } else if config.use_workload_identity {
-        AuthConfig::WorkloadIdentity {
-            client_id: config.workload_identity_client_id.clone(),
-            tenant_id: config.workload_identity_tenant_id.clone(),
-            token_file: config.workload_identity_token_file.clone(),
-        }
-    } else if config.use_msi || config.msi_client_id.is_some() {
-        AuthConfig::Msi(
-            config
-                .msi_client_id
-                .clone()
-                .map(UserAssignedIdentity::ClientId),
-        )
-    } else if let (Some(tenant_id), Some(client_id), Some(client_secret)) = (
-        secrets
-            .get("AZURE_TENANT_ID")
-            .or(config.sp_tenant_id.as_ref()),
-        secrets
-            .get("AZURE_CLIENT_ID")
-            .or(config.sp_client_id.as_ref()),
-        secrets
-            .get("AZURE_CLIENT_SECRET")
-            .or(config.sp_client_secret.as_ref()),
-    ) {
-        AuthConfig::ServicePrincipal {
-            tenant_id: tenant_id.clone(),
-            client_id: client_id.clone(),
-            client_secret: client_secret.clone(),
-        }
-    } else {
-        anyhow::bail!(
-            "no auth configured: provide an account key (secret 'accountKey' or \
-             --account-key), enable Workload Identity (--workload-identity), \
-             enable Managed Identity (--msi / --msi-client-id), \
-             or a service principal (AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET)"
-        );
-    };
-
-    // Build the account-specific endpoint URL.
-    // - Template form `http://%s.host/` → substitute `%s` with the account name
-    //   (subdomain-style; covers Azurite and sovereign clouds).
-    // - Otherwise build the standard Azure endpoint from the account.
-    let endpoint = if config.endpoint.contains("%s") {
-        config.endpoint.replace("%s", account)
-    } else {
-        format!("https://{account}.blob.core.windows.net/")
-    };
-
+    let auth = select_driver_auth(config, account, secrets)?;
+    let endpoint = account_endpoint(config, account);
     let container_client = auth::build_container_client(&endpoint, container, &auth)
         .context("build container client")?;
     Ok(Arc::new(AzurePageBlobBackend::new(
         container_client,
         blob.to_string(),
     )))
+}
+
+/// Build a read backend for a parsed `templateBlobUrl` source.
+///
+/// Authenticates with the URL's SAS token when present; otherwise falls back to
+/// the driver's own credentials (the source must then live in an account the
+/// driver can reach). The source snapshot, if any, is applied so the copy/mount
+/// reads the immutable point-in-time view.
+pub fn build_template_backend(
+    config: &DriverConfig,
+    tmpl: &TemplateBlobRef,
+    secrets: &HashMap<String, String>,
+) -> anyhow::Result<Arc<dyn BlobBackend>> {
+    let (service_url, auth) = if let Some(sas) = &tmpl.sas {
+        (
+            format!("{}/", tmpl.service_url.trim_end_matches('/')),
+            AuthConfig::Sas {
+                sas_token: sas.clone(),
+            },
+        )
+    } else {
+        let auth = select_driver_auth(config, &tmpl.account, secrets)?;
+        (account_endpoint(config, &tmpl.account), auth)
+    };
+    let container_client = auth::build_container_client(&service_url, &tmpl.container, &auth)
+        .context("build template container client")?;
+    let mut backend = AzurePageBlobBackend::new(container_client, tmpl.blob.clone());
+    if let Some(snapshot) = &tmpl.snapshot {
+        backend = backend.with_snapshot(snapshot.clone());
+    }
+    Ok(Arc::new(backend))
+}
+
+/// Like [`build_backend`] but returns the concrete [`AzurePageBlobBackend`] and
+/// the [`AuthConfig`] used, so the caller can issue server-side operations
+/// (e.g. [`copy_template`]) that need both.
+pub fn build_backend_concrete(
+    config: &DriverConfig,
+    account: &str,
+    container: &str,
+    blob: &str,
+    secrets: &HashMap<String, String>,
+) -> anyhow::Result<(AzurePageBlobBackend, AuthConfig)> {
+    let auth = select_driver_auth(config, account, secrets)?;
+    let endpoint = account_endpoint(config, account);
+    let container_client = auth::build_container_client(&endpoint, container, &auth)
+        .context("build container client")?;
+    Ok((
+        AzurePageBlobBackend::new(container_client, blob.to_string()),
+        auth,
+    ))
+}
+
+/// Copy a `templateBlobUrl` golden image into `dest`, preferring a true
+/// server-side copy.
+///
+/// - When the source carries a SAS, or the driver uses Entra auth (so a
+///   copy-source bearer token can be minted), the copy is done with
+///   `Put Page From URL` — the storage service fetches each range directly from
+///   the source, so **no bytes flow through this process** and it scales to any
+///   size (incl. cross-account sources).
+/// - Otherwise (SharedKey / account-key auth with no source SAS) the storage
+///   service can't authenticate the source read, so the copy falls back to a
+///   streamed copy through `source` (download → upload).
+///
+/// `source_url` is the raw `templateBlobUrl` (already carrying any `snapshot=` /
+/// SAS query). `dest` must already exist and be at least `total_size`.
+pub async fn copy_template(
+    dest: &AzurePageBlobBackend,
+    source: &dyn BlobBackend,
+    source_url: &str,
+    source_has_sas: bool,
+    dest_auth: &AuthConfig,
+    total_size: u64,
+) -> anyhow::Result<()> {
+    // A SAS in the URL authenticates the source itself; otherwise the storage
+    // service needs an Entra copy-source authorization (minted per batch inside
+    // `copy_pages_from_url`). SharedKey with no SAS can't authenticate a
+    // server-side source read, so we probe for a token and fall back to streaming.
+    let entra_token = if source_has_sas {
+        None
+    } else {
+        auth::storage_bearer_token(dest_auth)
+            .await
+            .context("mint copy-source authorization token")?
+    };
+    if source_has_sas {
+        info!(
+            total_size,
+            "server-side copy (Put Page From URL, SAS source)"
+        );
+        dest.copy_pages_from_url(source_url, total_size, None).await
+    } else if entra_token.is_some() {
+        info!(
+            total_size,
+            "server-side copy (Put Page From URL, Entra source)"
+        );
+        // Pass the auth (not the probe token) so the token is re-minted per batch.
+        dest.copy_pages_from_url(source_url, total_size, Some(dest_auth.clone()))
+            .await
+    } else {
+        info!(
+            total_size,
+            "no copy-source authorization (SharedKey, no SAS); streaming the copy"
+        );
+        copy_blob_streamed(source, dest, total_size).await
+    }
+}
+
+/// Streamed, chunked copy of `total_size` bytes from `source` into `dest` (the
+/// fallback used by [`copy_template`] when a server-side copy isn't possible).
+///
+/// Copies in 4 MiB page-aligned chunks; sparse source ranges read back as zeros.
+async fn copy_blob_streamed(
+    source: &dyn BlobBackend,
+    dest: &dyn BlobBackend,
+    total_size: u64,
+) -> anyhow::Result<()> {
+    let chunk = crate::backend::copy_chunk_bytes();
+    let mut offset = 0u64;
+    while offset < total_size {
+        let len = chunk.min(total_size - offset);
+        let data = source
+            .read(offset, len)
+            .await
+            .with_context(|| format!("read template offset={offset} len={len}"))?;
+        dest.write(offset, data)
+            .await
+            .with_context(|| format!("write copy offset={offset} len={len}"))?;
+        offset += len;
+    }
+    dest.flush().await.context("flush copied blob")?;
+    Ok(())
 }
 
 /// Round `n` up to the next multiple of 512 (the page-blob alignment), with a
@@ -300,6 +464,10 @@ pub fn round_up_512(n: u64) -> u64 {
     aligned.max(512)
 }
 
+/// Re-exported blob-URL parser (defined in the crate-root `bloburl` module,
+/// which is compiled only with the `csi` feature).
+pub use crate::bloburl::{parse_blob_url, TemplateBlobRef};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,10 +476,22 @@ mod tests {
     fn volume_id_roundtrip() {
         let id = make_volume_id("myaccount", "mycontainer", "pvc-abc/data.vhd");
         assert_eq!(id, "myaccount/mycontainer/pvc-abc/data.vhd");
-        let (a, c, b) = parse_volume_id(&id).unwrap();
+        let (ro, a, c, b) = parse_volume_id(&id).unwrap();
+        assert!(!ro);
         assert_eq!(a, "myaccount");
         assert_eq!(c, "mycontainer");
         assert_eq!(b, "pvc-abc/data.vhd");
+    }
+
+    #[test]
+    fn volume_id_ro_roundtrip() {
+        let id = make_volume_id_ro("acct", "cont", "golden/img.vhd");
+        assert_eq!(id, "ro:acct/cont/golden/img.vhd");
+        let (ro, a, c, b) = parse_volume_id(&id).unwrap();
+        assert!(ro);
+        assert_eq!(a, "acct");
+        assert_eq!(c, "cont");
+        assert_eq!(b, "golden/img.vhd");
     }
 
     #[test]

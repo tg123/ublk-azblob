@@ -42,6 +42,12 @@ parameters:
   {{- if .fsType }}
   fsType: {{ .fsType }}
   {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
+  {{- end }}
+  {{- if .templateBlobUrl }}
+  templateBlobUrl: {{ .templateBlobUrl | quote }}
+  {{- end }}
   {{- end }}
 reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
 volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
@@ -78,6 +84,12 @@ parameters:
   {{- end }}
   {{- if .fsType }}
   fsType: {{ .fsType }}
+  {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
+  {{- end }}
+  {{- if .templateBlobUrl }}
+  templateBlobUrl: {{ .templateBlobUrl | quote }}
   {{- end }}
   {{- end }}
 reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}

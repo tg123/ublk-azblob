@@ -5,11 +5,29 @@
 
 pub mod azure;
 pub mod buffered;
+pub mod cache_budget;
+pub mod cache_index;
 pub mod file;
 pub mod mem;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+
+/// Maximum bytes per Azure Put Page / Put Page From URL request (4 MiB).
+pub const MAX_PAGE_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Per-request chunk size used by the template copy paths, in bytes.
+///
+/// Overridable via `UBLK_COPY_CHUNK_BYTES`; the value is 512-aligned and clamped
+/// to `[512, MAX_PAGE_REQUEST_BYTES]` (Azure caps Put Page / Put Page From URL
+/// at 4 MiB). Defaults to the 4 MiB maximum.
+pub fn copy_chunk_bytes() -> u64 {
+    std::env::var("UBLK_COPY_CHUNK_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|n| (n / 512 * 512).clamp(512, MAX_PAGE_REQUEST_BYTES))
+        .unwrap_or(MAX_PAGE_REQUEST_BYTES)
+}
 
 /// Abstraction over a page-blob–like byte store.
 ///
@@ -42,6 +60,19 @@ pub trait BlobBackend: Send + Sync {
     ///
     /// Both `offset` and `len` must be multiples of 512.
     async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()>;
+
+    /// Warm the region `[offset, offset+len)` so it is resident locally.
+    ///
+    /// For cache-backed backends this fetches the region from the underlying
+    /// store and stores it in the local cache as *clean* (non-dirty) pages, so
+    /// it is safe in read-only mode and does not schedule any write-back.
+    /// Backends without a local cache fall back to a plain read so the region
+    /// is at least fetched once.  Used by the background warm-up.
+    ///
+    /// Both `offset` and `len` must be multiples of 512.
+    async fn prefetch(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+        self.read(offset, len).await.map(|_| ())
+    }
 
     /// Flush any pending writes to durable storage.
     ///

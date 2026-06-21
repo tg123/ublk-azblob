@@ -61,4 +61,16 @@ RUN ARCH=$(dpkg --print-architecture) \
       "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" \
     | tar -xzC /usr/local/bin --strip-components=1 "linux-${ARCH}/helm"
 
+# Azure CLI — used by the mount/NBD read-only e2e tests to snapshot the blob
+# (`az storage blob snapshot`) before reopening it read-only. The official
+# Debian install script sets up the Microsoft apt repo for the build arch
+# (amd64/arm64) and installs `azure-cli`.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        apt-transport-https \
+        lsb-release \
+        gnupg \
+ && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace

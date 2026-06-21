@@ -27,6 +27,9 @@ tokio = { version = "1.52.3", features = ["full"] }
 # Async traits
 async-trait = "0.1.89"
 
+# Stream combinators (bounded-concurrency template copy)
+futures = "0.3"
+
 # Byte buffers
 bytes = "1.11.1"
 
@@ -55,8 +58,11 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 # `--no-default-features` to stub out the I/O loop (e.g. on macOS).
 libublk = { version = "0.4.6", optional = true }
 
-# Raw libc bindings — only needed by the ublk I/O loop (errno constants, signals).
-libc = { version = "0.2.186", optional = true }
+# Raw libc bindings.  Used by the ublk I/O loop (errno constants, signals) and by
+# the local-disk cache (advisory `flock`, `fallocate` hole-punching for eviction,
+# and `kill(pid, 0)` liveness checks in the cross-process cache budget), so it is
+# a base dependency rather than feature-gated.
+libc = "0.2.186"
 
 # ── CSI (Kubernetes PersistentVolume) driver ────────────────────────────────
 # Gated behind the `csi` feature.  Pulls in a gRPC stack (tonic/prost) used to
@@ -87,8 +93,9 @@ tonic-build = "0.12.3"
 default = ["ublk", "csi"]
 
 # Enable the real ublk target (requires Linux ≥6.0 + ublk_drv loaded).
-# On by default; opt out with `--no-default-features`.
-ublk = ["dep:libublk", "dep:libc"]
+# On by default; opt out with `--no-default-features`.  `libc` is a base
+# dependency (also used by the local-disk cache), so it is not listed here.
+ublk = ["dep:libublk"]
 
 # Enable cluster coordination (Kubernetes coordination.k8s.io Lease + Azure blob
 # lease) so that at most one node mounts a given page blob at a time.  The Azure
@@ -100,7 +107,7 @@ coordination = ["dep:kube", "dep:k8s-openapi"]
 # implies both `coordination` and, via the default set, `ublk`) so the node
 # side can attach block devices and guard mounts with the cluster + blob locks.
 # Opt out with `--no-default-features`.
-csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "dep:libc", "coordination"]
+csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "coordination"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full", "test-util"] }

@@ -66,6 +66,7 @@ impl NodeService {
         &self,
         ctx: &HashMap<String, String>,
         secrets: &HashMap<String, String>,
+        volume_id: &str,
     ) -> anyhow::Result<Vec<(String, String)>> {
         let get = |k: &str| ctx.get(k).cloned();
         let account = get("account").unwrap_or_else(|| self.config.account.clone());
@@ -148,6 +149,34 @@ impl NodeService {
                 env.push(("UBLK_LEASE_DURATION_SECS".to_string(), secs));
             }
         }
+
+        // Read-only / snapshot: a volume is read-only exactly when it targets a
+        // blob snapshot (a `templateBlobUrl` with `?snapshot=<timestamp>`). A
+        // snapshot is immutable, so the child `run` process derives read-only
+        // from `AZURE_STORAGE_SNAPSHOT` alone — there is no separate readOnly
+        // flag.
+        if let Some(snapshot) = get("snapshot").filter(|s| !s.is_empty()) {
+            env.push(("AZURE_STORAGE_SNAPSHOT".to_string(), snapshot));
+        }
+        // SAS token from a `templateBlobUrl` that carries its own signature; the
+        // child `run` process authenticates the (possibly cross-account) template
+        // blob with it instead of the driver credentials.
+        if let Some(sas) = get("sasToken").filter(|s| !s.is_empty()) {
+            env.push(("AZURE_STORAGE_SAS".to_string(), sas));
+        }
+
+        // Cross-process page sharing: when the node enables a shared cache with
+        // `UBLK_CACHE_SHARE_PAGES` (inherited from the DaemonSet), give each
+        // volume a stable, unique cache instance name (its volume id) so peers
+        // caching the same blob get distinct data files and can share each
+        // other's clean pages off local disk.  The blob identity defaults to the
+        // container/blob, so concurrent mounts of the *same* blob share pages.
+        let share_pages = std::env::var("UBLK_CACHE_SHARE_PAGES")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        if share_pages {
+            env.push(("UBLK_CACHE_INSTANCE".to_string(), volume_id.to_string()));
+        }
         Ok(env)
     }
 }
@@ -209,12 +238,38 @@ impl Node for NodeService {
             .unwrap_or(0);
 
         let env = self
-            .child_env(&req.volume_context, &req.secrets)
+            .child_env(&req.volume_context, &req.secrets, &req.volume_id)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
 
         let volume_id = req.volume_id.clone();
         let target = req.target_path.clone();
-        let readonly = req.readonly;
+        // The device is read-only when the CSI request asks for it, or when the
+        // StorageClass selects a snapshot.  A snapshot is immutable, so mounting
+        // read-write over it would fail on first write; force a read-only mount
+        // (and skip mkfs) in that case.
+        let device_read_only = req
+            .volume_context
+            .get("snapshot")
+            .is_some_and(|s| !s.is_empty());
+        let readonly = req.readonly || device_read_only;
+        // A volume copied from a `templateBlobUrl` already carries a filesystem;
+        // never reformat it (the copy is the user's golden image).
+        let from_template = req
+            .volume_context
+            .get("fromTemplate")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        // Optional `fsck` pass before mounting an already-formatted, writable
+        // device. Defaults to off; `true`/`preen` preens, `force` runs a full
+        // check. A read-only device can't be repaired in place, so fsck is
+        // skipped there (see below).
+        let fsck_mode = mount::FsckMode::parse(
+            req.volume_context
+                .get("fsck")
+                .map(String::as_str)
+                .unwrap_or(""),
+        )
+        .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
         let volumes = self.volumes.clone();
         let publish_lock = self.publish_lock.clone();
         let use_nbd = self.config.use_nbd;
@@ -284,10 +339,29 @@ impl Node for NodeService {
 
             // Make a filesystem only on a blank device, then mount.
             let outcome = (|| -> anyhow::Result<()> {
+                let mut formatted = false;
                 if mount::has_filesystem(&device) {
                     info!(device = %device, "existing filesystem detected; skipping mkfs");
+                } else if from_template {
+                    // The blob was copied from a golden-image template, which is
+                    // already formatted; never reformat it.
+                    info!(device = %device, "volume copied from template; skipping mkfs");
+                } else if readonly {
+                    // A read-only device has no filesystem we can create; the
+                    // blob must already contain one.
+                    anyhow::bail!(
+                        "device {device} is read-only and has no filesystem; \
+                         a read-only/snapshot volume must already be formatted"
+                    );
                 } else {
                     mount::mkfs(&device, &fs_type)?;
+                    formatted = true;
+                }
+                // Optionally fsck an existing filesystem before mounting. A
+                // freshly `mkfs`'d device is already clean, and a read-only
+                // device can't be repaired in place, so skip fsck in both cases.
+                if fsck_mode != mount::FsckMode::Off && !formatted && !readonly {
+                    mount::fsck(&device, &fs_type, fsck_mode)?;
                 }
                 mount::mount(&device, &target, &fs_type, &mount_flags, readonly)?;
                 Ok(())

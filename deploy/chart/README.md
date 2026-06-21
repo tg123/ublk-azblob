@@ -124,6 +124,13 @@ A single image is shared by the controller and node plugins.
 |-----------|-------------|---------|
 | `node.useNbd` | Use NBD instead of ublk (for older kernels) | `false` |
 | `node.nbd.portStart` | NBD server port range start | `10809` |
+| `node.cache.enabled` | Enable the shared local-disk cache on each node | `false` |
+| `node.cache.hostPath` | Host directory used as the shared cache | `/var/lib/ublk-azblob/cache` |
+| `node.cache.maxBytes` | Max total cache bytes shared across volumes (0 = unlimited) | `0` |
+| `node.cache.pageSize` | Cache page size in bytes | `1048576` |
+| `node.cache.sharePages` | Share clean pages across volumes caching the same blob (cross-process page sharing). **Currently disabled / no-op** | `false` |
+| `node.cache.warmup` | Background cache warm-up: each volume prefetches its blob into the cache on start | `false` |
+| `node.cache.warmupBytes` | Cap in bytes for warm-up (0 = auto: the cache byte budget when set, else the whole device) | `0` |
 | `node.resources.limits.cpu` | Node CPU limit | `500m` |
 | `node.resources.limits.memory` | Node memory limit | `512Mi` |
 | `node.resources.requests.cpu` | Node CPU request | `100m` |
@@ -146,6 +153,8 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.container` | Container name (supports variables) | `ublk-azblob-volumes` |
 | `storageClass.parameters.blobPathTemplate` | Blob path template | `${pvc.namespace}/volumes/${pv.name}` |
 | `storageClass.parameters.fsType` | Filesystem type | `ext4` |
+| `storageClass.parameters.fsck` | Run `fsck` before mounting a writable, formatted volume: `"false"`/`"off"` (default, skip), `"true"`/`"preen"` (`fsck -a`), or `"force"` (`fsck -f -y`). Skipped for freshly-formatted and read-only volumes | `""` |
+| `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS; `?snapshot=` ⇒ mount the immutable snapshot directly read-only, no copy/lock/lease; non-snapshot ⇒ copy into the per-PVC blob read-write and skip format) | `""` |
 
 ### Global Secret Configuration (secretSearchMode: global)
 

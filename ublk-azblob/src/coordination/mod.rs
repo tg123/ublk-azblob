@@ -1,6 +1,15 @@
-//! Cluster coordination: combine an **Azure blob lease** ("blob lock") with a
-//! **Kubernetes `coordination.k8s.io` Lease** ("cluster lease") so that at most
-//! one node mounts a given page blob at a time.
+//! Cluster coordination: combine an **Azure blob lease** ("blob lock") with an
+//! optional **Kubernetes `coordination.k8s.io` Lease** ("cluster lease") so that
+//! at most one node mounts a given page blob at a time.
+//!
+//! The blob lease is the authoritative, storage-level lock and is used in **both**
+//! modes:
+//!
+//! * **Single-process mode** (no cluster lease): the [`Coordinator`] acquires and
+//!   renews only the blob lease.  If another process already holds it, mounting is
+//!   refused — there is no liveness arbiter, so a held lease is never broken.
+//! * **Cluster mode** (with a cluster lease): the blob lease is paired with the
+//!   Kubernetes lease, which adds the liveness-based take-over protocol below.
 //!
 //! ## Why two locks?
 //!
@@ -176,18 +185,26 @@ pub trait ClusterLease: Send + Sync {
 
 // ── Coordinator ───────────────────────────────────────────────────────────────
 
-/// Orchestrates acquisition of the cluster lease + blob lock and keeps them
-/// renewed for as long as the [`CoordinationGuard`] is held.
+/// Orchestrates acquisition of the blob lock — and, when a cluster lease is
+/// provided, the cluster lease too — and keeps them renewed for as long as the
+/// [`CoordinationGuard`] is held.
+///
+/// The cluster lease is **optional**: in single-process mode (no Kubernetes
+/// cluster to coordinate with) the coordinator acquires and renews only the
+/// authoritative blob lease.  Passing a cluster lease additionally layers the
+/// liveness-based take-over protocol on top (see the module docs).
 pub struct Coordinator {
-    cluster: Arc<dyn ClusterLease>,
+    cluster: Option<Arc<dyn ClusterLease>>,
     blob: Arc<dyn BlobLock>,
     config: CoordinationConfig,
 }
 
 impl Coordinator {
-    /// Create a coordinator over the given cluster lease and blob lock.
+    /// Create a coordinator over the given (optional) cluster lease and blob
+    /// lock.  Pass `None` for the cluster lease to run in single-process,
+    /// blob-lock-only mode.
     pub fn new(
-        cluster: Arc<dyn ClusterLease>,
+        cluster: Option<Arc<dyn ClusterLease>>,
         blob: Arc<dyn BlobLock>,
         config: CoordinationConfig,
     ) -> Self {
@@ -202,26 +219,28 @@ impl Coordinator {
     /// the renewal loop.  On success the returned guard owns the renewal task
     /// and releases both leases when dropped/awaited.
     pub async fn acquire(self) -> anyhow::Result<CoordinationGuard> {
-        // 1. Cluster lease — gates take-over and proves no live peer owns us.
-        match self
-            .cluster
-            .try_acquire()
-            .await
-            .context("acquire cluster lease")?
-        {
-            ClusterAcquire::Acquired => {
-                info!(holder = %self.config.holder_identity, "cluster lease acquired");
-            }
-            ClusterAcquire::HeldByLiveHolder {
-                holder,
-                since_renew,
-            } => {
-                return Err(anyhow!(
-                    "cluster lease is held by a live holder '{holder}' \
-                     (renewed {since_renew:?} ago, within the {:?} recovery timeout); \
-                     another node is still using this volume — refusing to mount",
-                    self.config.recovery_timeout
-                ));
+        // 1. Cluster lease (optional) — gates take-over and proves no live peer
+        //    owns us.  Skipped entirely in single-process blob-lock-only mode.
+        if let Some(cluster) = &self.cluster {
+            match cluster
+                .try_acquire()
+                .await
+                .context("acquire cluster lease")?
+            {
+                ClusterAcquire::Acquired => {
+                    info!(holder = %self.config.holder_identity, "cluster lease acquired");
+                }
+                ClusterAcquire::HeldByLiveHolder {
+                    holder,
+                    since_renew,
+                } => {
+                    return Err(anyhow!(
+                        "cluster lease is held by a live holder '{holder}' \
+                         (renewed {since_renew:?} ago, within the {:?} recovery timeout); \
+                         another node is still using this volume — refusing to mount",
+                        self.config.recovery_timeout
+                    ));
+                }
             }
         }
 
@@ -235,6 +254,18 @@ impl Coordinator {
                 id
             }
             Err(LockError::Held) => {
+                // Only break a held blob lease when a cluster lease arbitrates
+                // liveness: winning it proves the previous holder is past the
+                // recovery timeout.  In single-process blob-lock-only mode there
+                // is no liveness arbiter, so refuse rather than risk corrupting a
+                // blob that another live process may still be writing.
+                let Some(cluster) = &self.cluster else {
+                    return Err(anyhow!(
+                        "blob lease is already held by another process — refusing to mount; \
+                         if you are certain no other process is using this blob, \
+                         pass --disable-blob-lock"
+                    ));
+                };
                 warn!(
                     "blob lease is held but its holder is past the recovery timeout; \
                      breaking the stale blob lease to take the volume over"
@@ -250,20 +281,22 @@ impl Coordinator {
                     }
                     Err(LockError::Held) => {
                         // Roll back the cluster lease so we don't strand it.
-                        let _ = self.cluster.release().await;
+                        let _ = cluster.release().await;
                         return Err(anyhow!(
                             "blob lease is still held after breaking it — another \
                              node raced us for the take-over"
                         ));
                     }
                     Err(LockError::Other(e)) => {
-                        let _ = self.cluster.release().await;
+                        let _ = cluster.release().await;
                         return Err(e).context("re-acquire blob lease after break");
                     }
                 }
             }
             Err(LockError::Other(e)) => {
-                let _ = self.cluster.release().await;
+                if let Some(cluster) = &self.cluster {
+                    let _ = cluster.release().await;
+                }
                 return Err(e).context("acquire blob lease");
             }
         };
@@ -288,9 +321,10 @@ impl Coordinator {
     }
 }
 
-/// Background loop renewing both leases at `interval` until `stop` is notified.
+/// Background loop renewing the blob lease — and the cluster lease, when present
+/// — at `interval` until `stop` is notified.
 async fn renew_loop(
-    cluster: Arc<dyn ClusterLease>,
+    cluster: Option<Arc<dyn ClusterLease>>,
     blob: Arc<dyn BlobLock>,
     lease_id: String,
     interval: Duration,
@@ -303,19 +337,21 @@ async fn renew_loop(
                 if let Err(e) = blob.renew(&lease_id).await {
                     error!(err = %format!("{e:#}"), "failed to renew blob lease");
                 }
-                if let Err(e) = cluster.renew().await {
-                    error!(err = %format!("{e:#}"), "failed to renew cluster lease");
+                if let Some(cluster) = &cluster {
+                    if let Err(e) = cluster.renew().await {
+                        error!(err = %format!("{e:#}"), "failed to renew cluster lease");
+                    }
                 }
             }
         }
     }
 }
 
-/// Holds both leases for the lifetime of a mounted device.  Stops renewal and
-/// releases the leases on [`CoordinationGuard::release`] (or, best-effort, on
-/// drop).
+/// Holds the blob lease (and optional cluster lease) for the lifetime of a
+/// mounted device.  Stops renewal and releases the leases on
+/// [`CoordinationGuard::release`] (or, best-effort, on drop).
 pub struct CoordinationGuard {
-    cluster: Arc<dyn ClusterLease>,
+    cluster: Option<Arc<dyn ClusterLease>>,
     blob: Arc<dyn BlobLock>,
     lease_id: String,
     stop: Arc<Notify>,
@@ -332,8 +368,8 @@ impl CoordinationGuard {
         &self.lease_id
     }
 
-    /// Stop the renewal loop and release both leases so another node can take
-    /// the volume over immediately.
+    /// Stop the renewal loop and release the blob lease (and cluster lease, when
+    /// present) so another node can take the volume over immediately.
     pub async fn release(mut self) {
         self.stop.notify_one();
         if let Some(handle) = self.handle.take() {
@@ -342,10 +378,14 @@ impl CoordinationGuard {
         if let Err(e) = self.blob.release(&self.lease_id).await {
             warn!(err = %format!("{e:#}"), "failed to release blob lease on shutdown");
         }
-        if let Err(e) = self.cluster.release().await {
-            warn!(err = %format!("{e:#}"), "failed to release cluster lease on shutdown");
+        if let Some(cluster) = &self.cluster {
+            if let Err(e) = cluster.release().await {
+                warn!(err = %format!("{e:#}"), "failed to release cluster lease on shutdown");
+            }
+            info!("released cluster lease and blob lease");
+        } else {
+            info!("released blob lease");
         }
-        info!("released cluster lease and blob lease");
     }
 }
 
@@ -482,7 +522,7 @@ mod tests {
     async fn acquires_both_when_free() {
         let cluster = Arc::new(MemClusterLease::free());
         let blob = Arc::new(MemBlobLock::default());
-        let coord = Coordinator::new(cluster.clone(), blob.clone(), config());
+        let coord = Coordinator::new(Some(cluster.clone()), blob.clone(), config());
         let guard = coord.acquire().await.expect("should acquire");
         assert!(blob.current().is_some(), "blob lease should be held");
         guard.release().await;
@@ -494,7 +534,7 @@ mod tests {
     async fn refuses_when_peer_is_live() {
         let cluster = Arc::new(MemClusterLease::live());
         let blob = Arc::new(MemBlobLock::default());
-        let coord = Coordinator::new(cluster, blob.clone(), config());
+        let coord = Coordinator::new(Some(cluster), blob.clone(), config());
         let err = coord.acquire().await.expect_err("should refuse");
         assert!(
             err.to_string().contains("live holder"),
@@ -510,11 +550,40 @@ mod tests {
         // and acquire it for ourselves.
         let cluster = Arc::new(MemClusterLease::free());
         let blob = Arc::new(MemBlobLock::preheld());
-        let coord = Coordinator::new(cluster, blob.clone(), config());
+        let coord = Coordinator::new(Some(cluster), blob.clone(), config());
         let guard = coord.acquire().await.expect("should take over");
         let held = blob.current().expect("blob lease held after take-over");
         assert_ne!(held, "foreign-lease", "should be our fresh lease id");
         guard.release().await;
+    }
+
+    #[tokio::test]
+    async fn blob_only_acquires_and_releases_without_cluster_lease() {
+        // Single-process mode: no cluster lease, just the authoritative blob lock.
+        let blob = Arc::new(MemBlobLock::default());
+        let coord = Coordinator::new(None, blob.clone(), config());
+        let guard = coord.acquire().await.expect("should acquire blob lock");
+        assert!(blob.current().is_some(), "blob lease should be held");
+        guard.release().await;
+        assert!(blob.current().is_none(), "blob lease released on shutdown");
+    }
+
+    #[tokio::test]
+    async fn blob_only_refuses_held_lease_without_breaking() {
+        // Without a cluster lease there is no liveness arbiter, so a held blob
+        // lease must be respected (not broken) — another live process may own it.
+        let blob = Arc::new(MemBlobLock::preheld());
+        let coord = Coordinator::new(None, blob.clone(), config());
+        let err = coord.acquire().await.expect_err("should refuse");
+        assert!(
+            err.to_string().contains("already held"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            blob.current().as_deref(),
+            Some("foreign-lease"),
+            "foreign blob lease must not be broken"
+        );
     }
 
     #[test]
