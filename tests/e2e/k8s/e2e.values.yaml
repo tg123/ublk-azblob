@@ -11,8 +11,13 @@ image:
 
 controller:
   replicas: 1
-  # Controller reaches Azurite at its fixed docker-compose IP (172.30.0.10),
-  # set as a path-style endpoint by the test code below.
+  # Resolve <account>.azurite.kube-system.svc.cluster.local to the docker-compose
+  # Azurite's fixed IP (subdomain-style URL; pods egress to it via the node).
+  hostAliases:
+    - ip: "172.30.0.10"
+      hostnames:
+        - "devstoreaccount1.azurite.kube-system.svc.cluster.local"
+  # Controller needs endpoint too for provisioning
   # Note: endpoint will be patched by test code
   env:
     - name: RUST_LOG
@@ -23,7 +28,7 @@ controller:
       value: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
     # Azurite endpoint - will be set by test
     # - name: AZURE_STORAGE_ENDPOINT
-    #   value: "http://172.30.0.10:10000/%s"
+    #   value: "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/"
 
 node:
   # NBD mode for better portability
@@ -31,8 +36,14 @@ node:
   nbd:
     portStart: 10809
 
-  # Node plugin reaches Azurite at its fixed docker-compose IP (172.30.0.10),
-  # set as a path-style endpoint by the test code below.
+  # Resolve <account>.azurite.kube-system.svc.cluster.local to the docker-compose
+  # Azurite's fixed IP so the node plugin can reach blob storage to mount the volume.
+  hostAliases:
+    - ip: "172.30.0.10"
+      hostnames:
+        - "devstoreaccount1.azurite.kube-system.svc.cluster.local"
+
+  # Storage account credentials (Azurite well-known)
   # Note: endpoint will be patched by test code
   env:
     - name: AZURE_STORAGE_ACCOUNT
@@ -41,7 +52,7 @@ node:
       value: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
     # Azurite endpoint - will be set by test
     # - name: AZURE_STORAGE_ENDPOINT
-    #   value: "http://172.30.0.10:10000/%s"
+    #   value: "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/"
     
     # Enable caching for migration testing
     - name: UBLK_MAX_DIRTY_PAGES
