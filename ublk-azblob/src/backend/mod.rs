@@ -74,6 +74,20 @@ pub trait BlobBackend: Send + Sync {
         self.read(offset, len).await.map(|_| ())
     }
 
+    /// Report the byte ranges of the backing store that actually contain data.
+    ///
+    /// For a sparse page-blob–like store, every byte *not* covered by a returned
+    /// range reads back as zero, so callers (e.g. cache warm-up) can skip
+    /// downloading those regions entirely.  Ranges are returned sorted by offset,
+    /// non-overlapping, and 512-byte aligned.
+    ///
+    /// Returns `Ok(None)` when the backend cannot report sparseness (the caller
+    /// must then assume every byte may contain data).  The default implementation
+    /// returns `None`; only backends with a sparse-aware source override it.
+    async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        Ok(None)
+    }
+
     /// Flush any pending writes to durable storage.
     ///
     /// For write-through backends this is a no-op; for write-back caches it

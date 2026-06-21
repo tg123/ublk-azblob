@@ -265,7 +265,9 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 - Write coalescing (merge adjacent pages before `upload_pages`)
 - Multiple queues / true async (one Tokio task per queue)
 - FLUSH / FUA handling (drain write buffer before responding)
-- `list_page_ranges` sparse map to skip zero reads
+- ✅ `list_page_ranges` sparse map to skip zero reads — warm-up queries
+  `Get Page Ranges` (`?comp=pagelist`) and skips downloading pages that fall in
+  a zero gap; all-zero pages are also left as holes in the local `.dat`
 
 ### Phase 3 — Hardening
 - MSI live testing on Azure VM / AKS

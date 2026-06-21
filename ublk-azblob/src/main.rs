@@ -766,7 +766,17 @@ fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<AzurePag
     let auth = build_auth(cli)?;
     let container_client = auth::build_container_client(endpoint, &cli.container, &auth)
         .context("build container client")?;
+    // Auth-wired pipeline for `Get Page Ranges` (sparseness query used to skip
+    // downloading zero regions during cache warm-up); best-effort, so a failure
+    // to build it just disables the optimization rather than the whole backend.
     let backend = AzurePageBlobBackend::new(container_client, blob);
+    let backend = match auth::build_pipeline(&auth) {
+        Ok(pipeline) => backend.with_page_list(pipeline),
+        Err(err) => {
+            warn!(%err, "page-ranges query disabled (could not build auth pipeline)");
+            backend
+        }
+    };
     let backend = match &cli.snapshot {
         Some(snapshot) => {
             info!(snapshot = %snapshot, "targeting blob snapshot (read-only)");
@@ -980,6 +990,11 @@ fn cache_file_name(container: &str, blob: &str) -> String {
 /// locally — served from a peer when one already holds them, else fetched from
 /// the blob and stored as clean pages in the local cache.
 ///
+/// When the backing blob can report its data ranges (a sparse page blob), pages
+/// that fall entirely in a zero gap are skipped — they are never downloaded, so
+/// an ext4 image's free space costs no transfer. Backends that cannot report
+/// sparseness fall back to a full sweep.
+///
 /// Best-effort: a read error stops the warm-up (the device keeps serving on
 /// demand). Yields between pages so it doesn't starve live I/O.
 async fn warmup_cache(
@@ -989,10 +1004,37 @@ async fn warmup_cache(
     limit_bytes: u64,
 ) {
     let limit = limit_bytes.min(dev_size);
+    // Sparseness map of the backing blob (sorted, non-overlapping data ranges).
+    // `None` => unavailable, so warm every page. A query error is non-fatal: log
+    // and fall back to a full sweep.
+    let data_ranges = match backend.data_ranges().await {
+        Ok(ranges) => ranges,
+        Err(err) => {
+            warn!(%err, "data-ranges query failed; warming the whole device");
+            None
+        }
+    };
+    if let Some(ranges) = &data_ranges {
+        let data_bytes: u64 = ranges.iter().map(|&(_, len)| len).sum();
+        info!(
+            data_ranges = ranges.len(),
+            data_bytes, "warm-up using blob sparseness map (skipping zero regions)"
+        );
+    }
     let mut offset = 0u64;
     let mut warmed = 0u64;
+    let mut skipped = 0u64;
     while offset < limit {
         let len = page_size.min(dev_size - offset);
+        // Skip pages that hold no data (a zero gap); they read back as zeros
+        // without ever being downloaded.
+        if let Some(ranges) = &data_ranges {
+            if !range_intersects(ranges, offset, len) {
+                skipped += len;
+                offset += len;
+                continue;
+            }
+        }
         match backend.prefetch(offset, len).await {
             Ok(()) => warmed += len,
             Err(err) => {
@@ -1005,9 +1047,29 @@ async fn warmup_cache(
     }
     info!(
         warmed_bytes = warmed,
+        skipped_bytes = skipped,
         limit_bytes = limit,
         "cache warm-up complete"
     );
+}
+
+/// Whether `[offset, offset+len)` intersects any `(start, len)` data range.
+///
+/// `ranges` must be sorted by start offset (as returned by
+/// [`BlobBackend::data_ranges`]); uses a binary search so warm-up stays cheap on
+/// blobs with many ranges.
+fn range_intersects(ranges: &[(u64, u64)], offset: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = offset + len;
+    // First range whose start is >= `end` cannot intersect; check the one before.
+    let idx = ranges.partition_point(|&(start, _)| start < end);
+    if idx == 0 {
+        return false;
+    }
+    let (start, rlen) = ranges[idx - 1];
+    start + rlen > offset
 }
 
 /// Sanitize a single string to the cache file-name alphabet (alphanumerics plus
@@ -1130,6 +1192,9 @@ mod warmup_tests {
     struct RecordingBackend {
         size: u64,
         reads: Mutex<Vec<(u64, u64)>>,
+        /// Sparseness map returned by `data_ranges`. `None` => report no map
+        /// (warm the whole device).
+        data_ranges: Option<Vec<(u64, u64)>>,
     }
 
     #[async_trait]
@@ -1146,6 +1211,9 @@ mod warmup_tests {
         }
         async fn clear(&self, _offset: u64, _len: u64) -> anyhow::Result<()> {
             Ok(())
+        }
+        async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+            Ok(self.data_ranges.clone())
         }
         async fn flush(&self) -> anyhow::Result<()> {
             Ok(())
@@ -1188,5 +1256,59 @@ mod warmup_tests {
         // limit > dev_size is clamped; last chunk is the partial tail.
         warmup_cache(b.clone(), 6144, 4096, u64::MAX).await;
         assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (4096, 2048)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_skips_pages_in_zero_gaps() {
+        // Device of 4 pages; only pages 0 and 3 hold data.
+        let b = Arc::new(RecordingBackend {
+            size: 16384,
+            data_ranges: Some(vec![(0, 4096), (12288, 4096)]),
+            ..Default::default()
+        });
+        warmup_cache(b.clone(), 16384, 4096, u64::MAX).await;
+        // Pages 1 and 2 (the zero gap) are never read.
+        assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (12288, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_reads_page_partially_covered_by_data() {
+        // A data range that touches only the first byte of page 1 still forces
+        // that page to be warmed.
+        let b = Arc::new(RecordingBackend {
+            size: 8192,
+            data_ranges: Some(vec![(4096, 512)]),
+            ..Default::default()
+        });
+        warmup_cache(b.clone(), 8192, 4096, u64::MAX).await;
+        assert_eq!(*b.reads.lock().unwrap(), vec![(4096, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_empty_data_ranges_reads_nothing() {
+        let b = Arc::new(RecordingBackend {
+            size: 8192,
+            data_ranges: Some(vec![]),
+            ..Default::default()
+        });
+        warmup_cache(b.clone(), 8192, 4096, u64::MAX).await;
+        assert!(b.reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn range_intersects_detects_overlap_and_gaps() {
+        let ranges = [(0u64, 512u64), (4096, 1024)];
+        // Overlaps first range.
+        assert!(range_intersects(&ranges, 0, 4096));
+        // Page fully inside the [512, 4096) gap.
+        assert!(!range_intersects(&ranges, 1024, 1024));
+        // Touches the start of the second range.
+        assert!(range_intersects(&ranges, 4096, 4096));
+        // Just past the end of the second range.
+        assert!(!range_intersects(&ranges, 5120, 512));
+        // Zero-length probe never intersects.
+        assert!(!range_intersects(&ranges, 0, 0));
+        // No ranges at all.
+        assert!(!range_intersects(&[], 0, 4096));
     }
 }

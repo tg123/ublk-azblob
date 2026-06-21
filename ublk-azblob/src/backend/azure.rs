@@ -18,6 +18,7 @@ use azure_storage_blob::{
     },
     BlobClient, BlobContainerClient,
 };
+use azure_core::http::{Context, Method, Pipeline, Request, Url};
 use bytes::Bytes;
 use futures::stream::{StreamExt as _, TryStreamExt as _};
 use std::sync::RwLock;
@@ -46,6 +47,11 @@ pub struct AzurePageBlobBackend {
     /// before any I/O is served. `None` means no lease is held (coordination
     /// disabled), and requests are sent without a lease condition.
     lease_id: RwLock<Option<String>>,
+    /// Optional auth-wired pipeline for `Get Page Ranges` (`?comp=pagelist`),
+    /// which the typed SDK 1.0 client no longer exposes.  `None` disables the
+    /// [`BlobBackend::data_ranges`] sparseness query (callers then assume every
+    /// byte may contain data).  Built by [`crate::auth::build_pipeline`].
+    page_list_pipeline: Option<Pipeline>,
 }
 
 impl AzurePageBlobBackend {
@@ -60,7 +66,18 @@ impl AzurePageBlobBackend {
             blob_name: blob_name.into(),
             snapshot: None,
             lease_id: RwLock::new(None),
+            page_list_pipeline: None,
         }
+    }
+
+    /// Attach an auth-wired pipeline used to issue `Get Page Ranges`
+    /// (`?comp=pagelist`) requests, enabling [`BlobBackend::data_ranges`].
+    ///
+    /// Build the pipeline with [`crate::auth::build_pipeline`] so it carries the
+    /// same credential as the backend's container client.
+    pub fn with_page_list(mut self, pipeline: Pipeline) -> Self {
+        self.page_list_pipeline = Some(pipeline);
+        self
     }
 
     /// Target a specific blob snapshot.
@@ -188,6 +205,96 @@ impl AzurePageBlobBackend {
         }
         Ok(())
     }
+
+    /// Query Azure `Get Page Ranges` (`?comp=pagelist`) for the byte ranges of
+    /// the blob that actually contain data.
+    ///
+    /// The typed `azure_storage_blob` 1.0 client no longer exposes this
+    /// operation, so it is issued as a raw GET through the auth-wired
+    /// [`page_list_pipeline`](Self::page_list_pipeline).  Returns `Ok(None)` when
+    /// no pipeline was attached (capability disabled).  Returned ranges are
+    /// `(offset, len)` pairs, 512-byte aligned, sorted by offset; every byte not
+    /// covered reads back as zero.
+    async fn list_page_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        let Some(pipeline) = &self.page_list_pipeline else {
+            return Ok(None);
+        };
+        // Blob URL, encoded identically to every other request this backend makes.
+        let mut url: Url = self.container.blob_client(&self.blob_name).url().clone();
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("comp", "pagelist");
+            if let Some(snapshot) = &self.snapshot {
+                q.append_pair("snapshot", snapshot);
+            }
+        }
+        let mut request = Request::new(url, Method::Get);
+        request.insert_header("x-ms-version", PAGE_LIST_API_VERSION);
+        let ctx = Context::new();
+        trace!("querying page ranges");
+        let response = pipeline
+            .send(&ctx, &mut request, None)
+            .await
+            .with_context(|| format!("Get Page Ranges for blob '{}'", self.blob_name))?;
+        let body = response
+            .into_body()
+            .into_string()
+            .with_context(|| format!("read Get Page Ranges body for blob '{}'", self.blob_name))?;
+        let ranges = parse_page_ranges(&body)
+            .with_context(|| format!("parse Get Page Ranges body for blob '{}'", self.blob_name))?;
+        Ok(Some(ranges))
+    }
+}
+
+/// Azure Storage REST API version used for the raw `Get Page Ranges` request.
+/// Kept in sync with the `azure_storage_blob` SDK's default service version.
+const PAGE_LIST_API_VERSION: &str = "2026-04-06";
+
+/// Parse a `Get Page Ranges` XML body into `(offset, len)` data ranges.
+///
+/// The body looks like
+/// `<PageList><PageRange><Start>0</Start><End>511</End></PageRange>...</PageList>`,
+/// where `Start`/`End` are **inclusive** 512-aligned byte offsets.  `ClearRange`
+/// elements (present only in a diff response) are ignored.  Ranges are returned
+/// sorted by offset.
+fn parse_page_ranges(body: &str) -> anyhow::Result<Vec<(u64, u64)>> {
+    let mut ranges = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find("<PageRange>") {
+        let after = &rest[open + "<PageRange>".len()..];
+        let Some(close) = after.find("</PageRange>") else {
+            bail!("unterminated <PageRange> element in Get Page Ranges response");
+        };
+        let segment = &after[..close];
+        let start = extract_tag_u64(segment, "Start")
+            .context("missing <Start> in <PageRange>")?;
+        let end = extract_tag_u64(segment, "End").context("missing <End> in <PageRange>")?;
+        if end < start {
+            bail!("invalid page range: End ({end}) < Start ({start})");
+        }
+        ranges.push((start, end - start + 1));
+        rest = &after[close + "</PageRange>".len()..];
+    }
+    ranges.sort_by_key(|&(start, _)| start);
+    Ok(ranges)
+}
+
+/// Extract the unsigned integer value of `<tag>NNN</tag>` from `segment`.
+fn extract_tag_u64(segment: &str, tag: &str) -> anyhow::Result<u64> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = segment
+        .find(&open)
+        .with_context(|| format!("missing <{tag}>"))?
+        + open.len();
+    let end = segment[start..]
+        .find(&close)
+        .with_context(|| format!("missing </{tag}>"))?
+        + start;
+    segment[start..end]
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("parse <{tag}> value"))
 }
 
 #[async_trait]
@@ -347,6 +454,10 @@ impl BlobBackend for AzurePageBlobBackend {
         Ok(())
     }
 
+    async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        self.list_page_ranges().await
+    }
+
     async fn flush(&self) -> anyhow::Result<()> {
         // Page blobs are write-through by design — every upload_pages call is
         // durable once it returns 201.  Nothing to do here for Phase 1.
@@ -485,5 +596,53 @@ impl BlobLock for AzureBlobLock {
             .await
             .with_context(|| format!("break blob lease '{}'", self.blob_name))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_tag_u64, parse_page_ranges};
+
+    #[test]
+    fn parse_empty_page_list() {
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><PageList />"#;
+        assert!(parse_page_ranges(body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_single_range_inclusive_to_len() {
+        let body = "<PageList><PageRange><Start>0</Start><End>511</End></PageRange></PageList>";
+        // Inclusive [0, 511] => offset 0, len 512.
+        assert_eq!(parse_page_ranges(body).unwrap(), vec![(0, 512)]);
+    }
+
+    #[test]
+    fn parse_multiple_ranges_sorted() {
+        let body = "<PageList>\
+            <PageRange><Start>1024</Start><End>2047</End></PageRange>\
+            <PageRange><Start>0</Start><End>511</End></PageRange>\
+            </PageList>";
+        assert_eq!(parse_page_ranges(body).unwrap(), vec![(0, 512), (1024, 1024)]);
+    }
+
+    #[test]
+    fn parse_ignores_clear_ranges() {
+        let body = "<PageList>\
+            <PageRange><Start>0</Start><End>511</End></PageRange>\
+            <ClearRange><Start>512</Start><End>1023</End></ClearRange>\
+            </PageList>";
+        assert_eq!(parse_page_ranges(body).unwrap(), vec![(0, 512)]);
+    }
+
+    #[test]
+    fn parse_rejects_inverted_range() {
+        let body = "<PageList><PageRange><Start>512</Start><End>0</End></PageRange></PageList>";
+        assert!(parse_page_ranges(body).is_err());
+    }
+
+    #[test]
+    fn extract_tag_handles_whitespace() {
+        assert_eq!(extract_tag_u64("<Start> 42 </Start>", "Start").unwrap(), 42);
+        assert!(extract_tag_u64("<Start>42</Start>", "End").is_err());
     }
 }

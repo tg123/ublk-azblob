@@ -587,10 +587,18 @@ impl FileCacheBackend {
                 data.to_vec()
             }
         };
-        state
-            .data
-            .write_all_at(&data, offset)
-            .with_context(|| format!("write page {page_idx} to cache file"))?;
+        // Option C: an all-zero page is left as a sparse hole in the data file
+        // (which reads back as zeros) instead of being written, so zero regions
+        // of the blob — e.g. an ext4 image's free space — consume no local disk.
+        // This is always safe here: `ensure_page` only runs for a not-yet-present
+        // page, whose data-file region is still a hole, so skipping the write
+        // preserves the correct (zero) contents.
+        if data.iter().any(|&b| b != 0) {
+            state
+                .data
+                .write_all_at(&data, offset)
+                .with_context(|| format!("write page {page_idx} to cache file"))?;
+        }
 
         bit_set(&mut state.present, page_idx, true);
         // A freshly loaded clean page does not need an fsync: if the present bit
@@ -1004,6 +1012,11 @@ impl BlobBackend for FileCacheBackend {
         }
 
         Ok(())
+    }
+
+    async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        // Sparseness is a property of the backing blob, not the local cache.
+        self.inner.data_ranges().await
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
@@ -1447,6 +1460,35 @@ mod tests {
         assert_eq!(
             b.read(0, 2048).await.unwrap(),
             Bytes::from(vec![0xAB; 2048])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn prefetch_zero_page_leaves_sparse_hole() {
+        // Option C: an all-zero page is marked present and reads back as zeros,
+        // but is left as a sparse hole in the data file (no blocks allocated).
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmp_dir("zerohole");
+        // Inner backend is all zeros (MemBackend starts zero-filled).
+        let inner = Arc::new(MemBackend::new(1 << 20).unwrap());
+        let (b, _) = open(inner, &dir, 65536, 1 << 20);
+
+        b.prefetch(0, 1 << 20).await.unwrap();
+
+        // Every page is resident (so reads never hit the inner backend again)...
+        assert_eq!(b.present_count().await, 16);
+        // ...and reads back as zeros.
+        assert_eq!(b.read(0, 4096).await.unwrap(), Bytes::from(vec![0u8; 4096]));
+
+        // The data file is logically 1 MiB but allocates ~no blocks (a hole).
+        let meta = std::fs::metadata(dir.join("test.dat")).unwrap();
+        assert_eq!(meta.len(), 1 << 20);
+        // 512-byte blocks; a fully written 1 MiB file would be ~2048 blocks.
+        assert!(
+            meta.blocks() < 64,
+            "expected a sparse data file, got {} blocks",
+            meta.blocks()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
