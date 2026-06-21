@@ -128,16 +128,13 @@ impl AzurePageBlobBackend {
         // Per-request size (override with `UBLK_COPY_CHUNK_BYTES`); `Put Page From
         // URL` caps it at 4 MiB.
         let chunk = crate::backend::copy_chunk_bytes();
-        // Server-side copy is a latency-bound, Azure→Azure transfer (no local CPU
-        // work), so default to a fixed concurrency that hides HTTP round-trip
-        // latency rather than matching CPU count; override with
-        // `UBLK_COPY_CONCURRENCY`.
-        const DEFAULT_COPY_CONCURRENCY: usize = 32;
+        // Default concurrency to the logical CPU count (same auto-sizing as the
+        // cache warm-up path), overridable with `UBLK_COPY_CONCURRENCY`.
         let concurrency = std::env::var("UBLK_COPY_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_COPY_CONCURRENCY);
+            .unwrap_or_else(crate::backend::cpu_count);
 
         let blob_client = self.container.blob_client(&self.blob_name);
         let page_client = blob_client.page_blob_client();
