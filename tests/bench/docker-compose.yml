@@ -8,6 +8,12 @@
 #   * `azurite`  — local Azure Storage emulator (the page-blob backend).
 #   * `runner`   — builds the binary and runs tests/bench/bench.sh.
 #
+# The `runner` reuses the e2e runner image (tests/e2e/Dockerfile, same
+# `ublk-azblob-e2e-runner:local` tag) so there is a single runner environment to
+# maintain; the only extra tools the benchmark needs on top of it are `fio` and
+# `jq`, which the command installs at start-up (losetup/mount come from the e2e
+# image's util-linux).
+#
 # The `runner` shares the host kernel: it is `privileged` and bind-mounts `/dev`
 # and `/lib/modules`, so the ublk device plus the loopback (losetup) raw disk
 # work inside the container.  The `ublk_drv` kernel module must already be loaded
@@ -35,9 +41,12 @@ services:
       retries: 30
 
   runner:
+    # Reuse the unified e2e runner image (tests/e2e/Dockerfile) instead of a
+    # bench-specific Dockerfile — same build environment, one place to maintain.
+    image: ublk-azblob-e2e-runner:local
     build:
       context: ../..
-      dockerfile: tests/bench/Dockerfile
+      dockerfile: tests/e2e/Dockerfile
     depends_on:
       azurite:
         condition: service_healthy
@@ -70,5 +79,9 @@ services:
       - -c
       - |
         set -euo pipefail
+        # The e2e runner image already carries the build toolchain + util-linux
+        # (losetup/mount); the benchmark additionally needs fio and jq.
+        apt-get update && apt-get install -y --no-install-recommends fio jq
+        rm -rf /var/lib/apt/lists/*
         cargo build --release --no-default-features --features ublk -p ublk-azblob
         bash tests/bench/bench.sh
