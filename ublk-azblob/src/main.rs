@@ -785,9 +785,15 @@ impl Cli {
         let blob = std::env::var("AZURE_STORAGE_BLOB")
             .ok()
             .filter(|s| !s.is_empty())
-            .context("--blob-url (AZURE_STORAGE_BLOB_URL) is required for this subcommand")?;
-        let account = std::env::var("AZURE_STORAGE_ACCOUNT").unwrap_or_default();
-        let container = std::env::var("AZURE_STORAGE_CONTAINER").unwrap_or_default();
+            .context("AZURE_STORAGE_BLOB is required when --blob-url is not set")?;
+        let account = std::env::var("AZURE_STORAGE_ACCOUNT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context("AZURE_STORAGE_ACCOUNT is required when --blob-url is not set")?;
+        let container = std::env::var("AZURE_STORAGE_CONTAINER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context("AZURE_STORAGE_CONTAINER is required when --blob-url is not set")?;
         // The endpoint template may carry a `%s` placeholder for the account
         // (subdomain style, e.g. `http://%s.blob.localhost:10000/`); the
         // single-device child knows its account up-front and substitutes it.
