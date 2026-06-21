@@ -75,7 +75,7 @@ impl NodeService {
         let blob = get("blob").ok_or_else(|| anyhow::anyhow!("volume context missing 'blob'"))?;
 
         // Collapse the account / endpoint / container / blob (+ optional
-        // read-only snapshot) into a single `AZURE_STORAGE_BLOB_URL` for the
+        // read-only snapshot) into a single `UBLK_BLOB_URL` for the
         // child `run` process. A volume is read-only exactly when it targets a
         // blob snapshot (a `templateBlobUrl` with `?snapshot=<timestamp>`); the
         // child derives read-only from the URL's `?snapshot=` alone — there is
@@ -83,7 +83,7 @@ impl NodeService {
         // placeholder is substituted here so the child sees a resolved URL.
         let snapshot = get("snapshot").filter(|s| !s.is_empty());
         let blob_url = child_blob_url(&endpoint, &account, &container, &blob, snapshot.as_deref());
-        let mut env = vec![("AZURE_STORAGE_BLOB_URL".to_string(), blob_url)];
+        let mut env = vec![("UBLK_BLOB_URL".to_string(), blob_url)];
 
         let account_key = secrets
             .get("accountKey")
@@ -154,7 +154,7 @@ impl NodeService {
             }
         }
 
-        // Read-only / snapshot is carried by `AZURE_STORAGE_BLOB_URL`'s
+        // Read-only / snapshot is carried by `UBLK_BLOB_URL`'s
         // `?snapshot=` query (assembled above), so nothing to add here.
         // SAS token from a `templateBlobUrl` that carries its own signature; the
         // child `run` process authenticates the (possibly cross-account) template
@@ -179,7 +179,7 @@ impl NodeService {
     }
 }
 
-/// Assemble a single `AZURE_STORAGE_BLOB_URL` for the child `run` process from
+/// Assemble a single `UBLK_BLOB_URL` for the child `run` process from
 /// the per-volume endpoint template, account, container, blob and optional
 /// read-only snapshot.
 ///

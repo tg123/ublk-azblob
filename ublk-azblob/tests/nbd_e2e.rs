@@ -156,7 +156,7 @@ fn azurite_available() -> bool {
 /// Common Azure environment passed to the `ublk-azblob` child process.
 ///
 /// The account, container and blob are collapsed into a single
-/// `AZURE_STORAGE_BLOB_URL` (Azurite path-style, so the account is the first
+/// `UBLK_BLOB_URL` (Azurite path-style, so the account is the first
 /// path segment of the URL); only the SharedKey is passed separately.
 fn azure_env(cmd: &mut Command, container: &str, blob: &str, snapshot: Option<&str>) {
     let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
@@ -171,7 +171,7 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str, snapshot: Option<&s
         "AZURE_STORAGE_KEY",
         env_or("AZURE_STORAGE_KEY", DEFAULT_KEY),
     )
-    .env("AZURE_STORAGE_BLOB_URL", blob_url);
+    .env("UBLK_BLOB_URL", blob_url);
 }
 
 /// Start the NBD server as a child process and wait until it accepts a TCP

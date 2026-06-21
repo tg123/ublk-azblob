@@ -182,7 +182,7 @@ Common CLI flags have environment-variable equivalents:
 
 | Flag | Env var |
 |------|---------|
-| `--blob-url` | `AZURE_STORAGE_BLOB_URL` |
+| `--blob-url` | `UBLK_BLOB_URL` |
 | `--account-key` | `AZURE_STORAGE_KEY` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |

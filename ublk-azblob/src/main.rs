@@ -61,7 +61,7 @@ struct Cli {
     ///
     /// Required by the `run`, `test` and `copy` subcommands.  Not used in `csi`
     /// mode (values come from StorageClass parameters / secrets).
-    #[arg(long, env = "AZURE_STORAGE_BLOB_URL")]
+    #[arg(long, env = "UBLK_BLOB_URL")]
     blob_url: Option<String>,
 
     /// Storage account key (base64).  Enables SharedKey auth mode.
@@ -819,18 +819,18 @@ struct Location {
 
 impl Cli {
     /// Resolve the target blob for the single-device subcommands from the
-    /// global `--blob-url` (env `AZURE_STORAGE_BLOB_URL`).
+    /// global `--blob-url` (env `UBLK_BLOB_URL`).
     ///
     /// The account, container, blob, endpoint, snapshot and SAS are all carried
     /// by the URL; the CSI node plugin spawns this `run` child with a single
-    /// `AZURE_STORAGE_BLOB_URL` (substituting any `%s` account placeholder and
+    /// `UBLK_BLOB_URL` (substituting any `%s` account placeholder and
     /// appending `?snapshot=` for read-only snapshot volumes). `--sas-token`
     /// still overrides the URL's SAS query.
     fn location(&self) -> anyhow::Result<Location> {
         let url = self
             .blob_url
             .as_deref()
-            .context("--blob-url (or AZURE_STORAGE_BLOB_URL) is required")?;
+            .context("--blob-url (or UBLK_BLOB_URL) is required")?;
         let parsed = bloburl::parse_blob_url(url).context("parse --blob-url")?;
         Ok(Location {
             endpoint: format!("{}/", parsed.service_url.trim_end_matches('/')),
