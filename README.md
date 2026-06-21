@@ -185,7 +185,7 @@ loop mount**:
 virt-make-fs --type=ext4 --format=raw --size=+1G ./mydir image.raw
 
 # From a Docker image's root filesystem (stream its export straight in)
-cid=$(docker create iridiumsdc.example.com/org/myimage:tag)
+cid=$(docker create registry.example.com/org/myimage:tag)
 docker export "$cid" | virt-make-fs --type=ext4 --format=raw --size=+2G - image.raw
 docker rm "$cid"
 ```
