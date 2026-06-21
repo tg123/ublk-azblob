@@ -74,6 +74,35 @@ pub trait BlobBackend: Send + Sync {
         self.read(offset, len).await.map(|_| ())
     }
 
+    /// Warm `[0, limit_bytes)` into the local cache (if any), best-effort.
+    ///
+    /// `page_size` is the fetch granularity and `concurrency` bounds the number
+    /// of in-flight page fetches. A read error logs and stops (the device keeps
+    /// serving on demand). The default is a sequential `prefetch` scan (no
+    /// concurrency); cache-backed backends override it to fetch pages from the
+    /// blob in parallel so warm-up is bandwidth- rather than latency-bound.
+    async fn warmup(&self, dev_size: u64, page_size: u64, limit_bytes: u64, concurrency: usize) {
+        let _ = concurrency; // honoured only by cache-backed backends
+        let limit = limit_bytes.min(dev_size);
+        let mut offset = 0u64;
+        let mut warmed = 0u64;
+        while offset < limit {
+            let len = page_size.min(dev_size - offset);
+            if let Err(err) = self.prefetch(offset, len).await {
+                tracing::warn!(offset, %err, "cache warm-up read failed; stopping early");
+                break;
+            }
+            warmed += len;
+            offset += len;
+            tokio::task::yield_now().await;
+        }
+        tracing::info!(
+            warmed_bytes = warmed,
+            limit_bytes = limit,
+            "cache warm-up complete"
+        );
+    }
+
     /// Flush any pending writes to durable storage.
     ///
     /// For write-through backends this is a no-op; for write-back caches it
