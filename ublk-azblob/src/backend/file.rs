@@ -1969,8 +1969,15 @@ mod tests {
         // Reopen: same etag → clean page stays resident, read served locally.
         let reads_before = backend.read_count();
         let (b, recovered) = open_validated(backend.clone(), &dir, page, page).await;
-        assert_eq!(recovered, 0, "flushed pages are clean, none recovered dirty");
-        assert_eq!(b.present_count().await, 1, "clean page reused after restart");
+        assert_eq!(
+            recovered, 0,
+            "flushed pages are clean, none recovered dirty"
+        );
+        assert_eq!(
+            b.present_count().await,
+            1,
+            "clean page reused after restart"
+        );
         let got = b.read(0, page).await.unwrap();
         assert_eq!(got, Bytes::from(vec![0xAB; page as usize]));
         assert_eq!(
