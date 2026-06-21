@@ -23,6 +23,12 @@ services:
     extends:
       file: ../e2e/docker-compose.yml
       service: runner
+    # `extends` does not propagate `depends_on`, so re-declare the Azurite
+    # dependency here to ensure the runner waits for Azurite to be healthy
+    # before bench.sh starts `ublk-azblob run --create`.
+    depends_on:
+      azurite:
+        condition: service_healthy
     environment:
       # Benchmark tunables (override on the `docker compose` command line).
       DEV_SIZE_MIB: "${DEV_SIZE_MIB:-512}"
