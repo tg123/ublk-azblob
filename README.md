@@ -99,28 +99,16 @@ sudo mount /dev/ublkb0 /mnt/azblob
 
 ## Read-only mode and blob snapshots
 
-Pass `--read-only` to the `run` subcommand to expose the device read-only. The
-ublk device (or NBD export) is advertised read-only and every write, discard,
-and write-zeroes request is rejected, so the underlying blob can never be
-modified through the device.
+A device is exposed **read-only** by mounting an immutable **point-in-time
+snapshot** of the blob: pass `--snapshot <SNAPSHOT>` (the `x-ms-snapshot`
+timestamp returned when the snapshot was created). There is no separate
+read-only flag — a snapshot is immutable, so the ublk device (or NBD export) is
+advertised read-only and every write, discard, and write-zeroes request is
+rejected, and (because the content can never change) the local cache is safe to
+reuse.
 
 ```bash
-# Mount the live blob read-only
-sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
-  --msi \
-  run --size 10737418240 --read-only
-```
-
-To mount an immutable **point-in-time snapshot** of the blob, pass
-`--snapshot <SNAPSHOT>` (the `x-ms-snapshot` timestamp returned when the
-snapshot was created). Selecting a snapshot **implies `--read-only`** — the
-snapshot is immutable, so writes are always rejected:
-
-```bash
-# Mount a specific blob snapshot (read-only is implied)
+# Mount a specific blob snapshot (read-only)
 sudo ./target/release/ublk-azblob \
   --account mystorageaccount \
   --container mydisks \
@@ -130,8 +118,8 @@ sudo ./target/release/ublk-azblob \
   run --size 10737418240
 ```
 
-`--create` cannot be combined with `--read-only` or `--snapshot`. The
-read-only mount skips the write-back buffer entirely (there are no writes to
+`--create` cannot be combined with `--snapshot` (a snapshot is immutable). A
+snapshot mount skips the write-back buffer entirely (there are no writes to
 batch); read caching via `--cache-dir` still works.
 
 ---
@@ -218,9 +206,12 @@ All CLI flags have environment-variable equivalents:
 | `--container` | `AZURE_STORAGE_CONTAINER` |
 | `--blob` | `AZURE_STORAGE_BLOB` |
 | `--snapshot` | `AZURE_STORAGE_SNAPSHOT` |
-| `--read-only` | `UBLK_READ_ONLY` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
+| `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
+| `--cache-share-pages` | `UBLK_CACHE_SHARE_PAGES` |
+| `--cache-warmup` | `UBLK_CACHE_WARMUP` |
+| `--cache-warmup-bytes` | `UBLK_CACHE_WARMUP_BYTES` |
 | `--nbd` | `NBD_LISTEN` |
 
 ---
@@ -253,6 +244,87 @@ before a page is marked dirty, and the dirty bitmap is `fsync`ed on every change
 so **unflushed dirty data survives a crash or restart**. On startup the cache is
 recovered from disk and any recovered dirty pages are flushed to the blob, so
 in-flight writes are never silently lost.
+
+### Bounding the cache size (shared LRU byte budget)
+
+By default the local-disk cache grows without bound. Set `--cache-max-bytes`
+(or `UBLK_CACHE_MAX_BYTES`) to cap how much disk the cache may consume:
+
+```bash
+  --cache-dir /var/cache/ublk-azblob \
+  --cache-max-bytes 10737418240   # 10 GiB
+```
+
+When the cache exceeds the limit, the least-recently-used **clean** pages are
+evicted by punching holes in the sparse `.dat` file (reclaiming the disk
+blocks); the data is transparently re-fetched from the blob on the next access.
+Dirty (unflushed) pages are never evicted, so no write is ever lost — if every
+resident page is dirty the cache may temporarily exceed the limit until a flush
+makes pages clean again. `0` (the default) means unlimited.
+
+The budget is **shared across every `ublk-azblob` process that points at the
+same `--cache-dir`**, coordinated through a small `.cache-budget` file in that
+directory (locked with `flock`). This makes the cap meaningful in CSI / multi-volume
+scenarios where many per-volume processes share one node's cache disk: a single
+noisy volume cannot fill the disk at the expense of its neighbours. The shared
+total is crash-safe — entries for processes that died are pruned automatically.
+
+> **Eviction scope:** each process only ever evicts *its own* clean pages, so it
+> never touches a peer's cache files. The budget therefore bounds the aggregate
+> resident set of the *active* processes; a fully idle peer keeps its pages until
+> it next does I/O or exits.
+
+### Cross-process page sharing (`--cache-share-pages`)
+
+> **Currently disabled.** Cross-process page sharing is implemented (the
+> `.cache-index` machinery below) but **forced off in the shipped binary**:
+> `--cache-share-pages` / `UBLK_CACHE_SHARE_PAGES` are accepted but ignored (a
+> warning is logged), so every cache is single-process. Read caching for an
+> immutable snapshot and the pre-upload write cache are both single-owner and do
+> not need sharing. The description below documents the (gated-off) design; it is
+> expected to be re-enabled in a later iteration.
+
+With `--cache-share-pages` (or `UBLK_CACHE_SHARE_PAGES=1`), processes that cache
+the **same blob** in the same `--cache-dir` serve each other's clean pages off
+local disk instead of re-fetching from Azure. A shared `.cache-index` file
+(locked with `flock`, alongside `.cache-budget`) maps each cached `(blob, page)`
+to the owning process's `.dat` file and offset. On a read miss, a process first
+consults the index: if a live peer holds the page clean, it copies the bytes from
+the peer's file (read-only) and only falls back to the blob if the page is
+absent, stale, or the peer has died. Shared reads are served directly and are
+**not** double-counted against the budget — every resident page still has exactly
+one on-disk owner.
+
+Writes use **copy-on-write** to preserve the single-writer-per-file invariant:
+before mutating a page that a peer owns, the writer withdraws it from the index
+and writes into its *own* `.dat`, marking it dirty locally. Dirty pages are never
+evicted and never served cross-process; once flushed and clean again the new
+owner re-publishes the page so subsequent peer reads resolve to it. As with the
+budget, a crashed peer's index entries are pruned automatically (`kill(pid, 0)`),
+and losing the index only forgoes sharing — correctness falls back to the blob.
+
+In CSI deployments enable this through the Helm chart's `node.cache.sharePages`;
+the node plugin assigns each volume a unique cache instance so concurrent mounts
+of the same blob transparently share clean pages.
+
+### Cache warm-up (`--cache-warmup`)
+
+By default there is no warm-up: the local cache is populated **on demand by
+writes** (copy-on-write). A pure read miss is served straight from a live peer
+or the blob and is **not** stored in the local `.dat`, so a read-only blob that
+is never warmed keeps reading through to its source. With `--cache-warmup` (or
+`UBLK_CACHE_WARMUP=1`) the process instead **prefetches the blob into the cache
+on start**, sequentially, in the **background** (the device comes online
+immediately). Each prefetched page is stored locally as a clean, resident page.
+(While sharing is disabled, warm-up populates only this process's own cache.)
+
+Prefetch stops after `--cache-warmup-bytes` (or `UBLK_CACHE_WARMUP_BYTES`); `0`
+(the default) means auto — the cache byte budget (`--cache-max-bytes`) when set,
+otherwise the whole device. Warm-up is best for **read-only / read-mostly
+datasets that fit the cache budget** (e.g. an immutable snapshot golden image).
+For large, write-heavy, or sparsely-accessed blobs, leave it off — the cache
+only fetches what's actually used. In CSI deployments toggle it via the Helm
+chart's `node.cache.warmup`.
 
 ---
 
