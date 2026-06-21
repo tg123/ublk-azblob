@@ -125,17 +125,10 @@ storageClass:
     # Use single quotes to preserve ${...} variables literally
     blobPathTemplate: '${pvc.namespace}/volumes/${pv.name}'
     
-    # Filesystem type to format a freshly-provisioned blob with: ext4, xfs, btrfs, etc.
+    # Filesystem type to format a freshly-provisioned blob with. Each supported
+    # type carries a built-in profile of mkfs + mount options: ext2/ext3/ext4,
+    # xfs, btrfs, squashfs, zfs, ntfs.
     newBlobFsType: ext4
-
-    # Extra options passed to `mkfs` when formatting a freshly-provisioned blob.
-    # Filesystem-specific; comma- or space-separated. Ignored for template/copied
-    # or already-formatted blobs.
-    # newBlobMkfsOptions: "-b 4096"
-
-    # Extra mount options applied when the node mounts the device, in addition to
-    # any the PVC/StorageClass already carries. Comma- or space-separated.
-    # mountOptions: "noatime,nodiratime"
 
     # Expose the volume read-only ("true"/"false"). The device rejects every
     # write/discard and is mounted read-only; the blob must already be formatted.
@@ -151,6 +144,15 @@ storageClass:
     #   - read-write volumes copy the template into a fresh per-PVC blob and skip
     #     formatting (the copy is already a filesystem).
     # templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd?sv=...&sig=...'
+
+    # Filesystem the node mounts a `templateBlobUrl` image as. The template is
+    # never reformatted, so this is the type it already carries (defaults to
+    # newBlobFsType). Only meaningful together with templateBlobUrl.
+    # templateBlobFsType: squashfs
+
+    # Advanced: override the built-in mount options of the templateBlobFsType
+    # profile. Comma- or space-separated. Only meaningful with templateBlobUrl.
+    # templateBlobMountArgs: "noatime,nodiratime"
 
 # Secret configuration for global mode
 # Only used when secretSearchMode: global

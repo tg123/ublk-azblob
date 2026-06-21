@@ -42,11 +42,11 @@ parameters:
   {{- if .newBlobFsType }}
   newBlobFsType: {{ .newBlobFsType }}
   {{- end }}
-  {{- if .newBlobMkfsOptions }}
-  newBlobMkfsOptions: {{ .newBlobMkfsOptions | quote }}
+  {{- if .templateBlobFsType }}
+  templateBlobFsType: {{ .templateBlobFsType | quote }}
   {{- end }}
-  {{- if .mountOptions }}
-  mountOptions: {{ .mountOptions | quote }}
+  {{- if .templateBlobMountArgs }}
+  templateBlobMountArgs: {{ .templateBlobMountArgs | quote }}
   {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}
@@ -91,11 +91,11 @@ parameters:
   {{- if .newBlobFsType }}
   newBlobFsType: {{ .newBlobFsType }}
   {{- end }}
-  {{- if .newBlobMkfsOptions }}
-  newBlobMkfsOptions: {{ .newBlobMkfsOptions | quote }}
+  {{- if .templateBlobFsType }}
+  templateBlobFsType: {{ .templateBlobFsType | quote }}
   {{- end }}
-  {{- if .mountOptions }}
-  mountOptions: {{ .mountOptions | quote }}
+  {{- if .templateBlobMountArgs }}
+  templateBlobMountArgs: {{ .templateBlobMountArgs | quote }}
   {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}

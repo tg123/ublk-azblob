@@ -41,12 +41,15 @@ const PARAM_BLOB_PATH_TEMPLATE: &str = "blobPathTemplate";
 /// the node should create when formatting a freshly-provisioned (non-template)
 /// blob.
 const PARAM_NEW_BLOB_FS_TYPE: &str = "newBlobFsType";
-/// Parameter key (StorageClass `parameters`) carrying extra options passed to
-/// `mkfs` when formatting a freshly-provisioned (non-template) blob.
-const PARAM_NEW_BLOB_MKFS_OPTIONS: &str = "newBlobMkfsOptions";
-/// Parameter key (StorageClass `parameters`) carrying extra mount options
-/// applied when the node mounts the device.
-const PARAM_MOUNT_OPTIONS: &str = "mountOptions";
+/// Parameter key (StorageClass `parameters`) selecting the filesystem the node
+/// should mount when provisioning from a golden-image template (`templateBlobUrl`).
+/// The template is never reformatted, so this is the type it already carries.
+/// Only meaningful when `templateBlobUrl` is set.
+const PARAM_TEMPLATE_BLOB_FS_TYPE: &str = "templateBlobFsType";
+/// Advanced parameter key (StorageClass `parameters`) overriding the built-in
+/// mount options that the `templateBlobFsType` profile would otherwise apply.
+/// Only meaningful when `templateBlobUrl` is set.
+const PARAM_TEMPLATE_BLOB_MOUNT_ARGS: &str = "templateBlobMountArgs";
 /// Parameter keys for the optional cluster-lease coordination, forwarded to the
 /// node via the volume context (the node's `child_env` reads them).
 const PARAM_COORDINATION: &str = "coordination";
@@ -270,10 +273,14 @@ impl Controller for ControllerService {
                 if let Some(fs) = req.parameters.get(PARAM_NEW_BLOB_FS_TYPE) {
                     volume_context.insert(PARAM_NEW_BLOB_FS_TYPE.to_string(), fs.clone());
                 }
-                // A read-only template is mounted (never formatted), so forward
-                // mount options but not mkfs options.
-                if let Some(opts) = req.parameters.get(PARAM_MOUNT_OPTIONS) {
-                    volume_context.insert(PARAM_MOUNT_OPTIONS.to_string(), opts.clone());
+                // A read-only template is mounted (never formatted), so the node
+                // mounts it as `templateBlobFsType`; `templateBlobMountArgs` lets
+                // an advanced user override the profile's built-in mount options.
+                if let Some(fs) = req.parameters.get(PARAM_TEMPLATE_BLOB_FS_TYPE) {
+                    volume_context.insert(PARAM_TEMPLATE_BLOB_FS_TYPE.to_string(), fs.clone());
+                }
+                if let Some(args) = req.parameters.get(PARAM_TEMPLATE_BLOB_MOUNT_ARGS) {
+                    volume_context.insert(PARAM_TEMPLATE_BLOB_MOUNT_ARGS.to_string(), args.clone());
                 }
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
@@ -350,15 +357,16 @@ impl Controller for ControllerService {
         if let Some(fs) = req.parameters.get(PARAM_NEW_BLOB_FS_TYPE) {
             volume_context.insert(PARAM_NEW_BLOB_FS_TYPE.to_string(), fs.clone());
         }
-        // Extra mkfs options only matter when the node actually formats the blob
-        // (i.e. not a copy of a golden-image template).
-        if !from_template {
-            if let Some(opts) = req.parameters.get(PARAM_NEW_BLOB_MKFS_OPTIONS) {
-                volume_context.insert(PARAM_NEW_BLOB_MKFS_OPTIONS.to_string(), opts.clone());
+        // `templateBlobFsType` / `templateBlobMountArgs` only apply when the
+        // volume is provisioned from a golden-image template (it is copied, not
+        // formatted, so the node mounts it as the template's existing filesystem).
+        if from_template {
+            if let Some(fs) = req.parameters.get(PARAM_TEMPLATE_BLOB_FS_TYPE) {
+                volume_context.insert(PARAM_TEMPLATE_BLOB_FS_TYPE.to_string(), fs.clone());
             }
-        }
-        if let Some(opts) = req.parameters.get(PARAM_MOUNT_OPTIONS) {
-            volume_context.insert(PARAM_MOUNT_OPTIONS.to_string(), opts.clone());
+            if let Some(args) = req.parameters.get(PARAM_TEMPLATE_BLOB_MOUNT_ARGS) {
+                volume_context.insert(PARAM_TEMPLATE_BLOB_MOUNT_ARGS.to_string(), args.clone());
+            }
         }
         // Forward the coordination opt-in (and its tuning) from the StorageClass
         // parameters into the volume context, since CSI only hands the node the

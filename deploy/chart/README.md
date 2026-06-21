@@ -127,9 +127,9 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.storageAccount` | Storage account (supports variables) | `""` |
 | `storageClass.parameters.container` | Container name (supports variables) | `ublk-azblob-volumes` |
 | `storageClass.parameters.blobPathTemplate` | Blob path template | `${pvc.namespace}/volumes/${pv.name}` |
-| `storageClass.parameters.newBlobFsType` | Filesystem type to format a freshly-provisioned blob | `ext4` |
-| `storageClass.parameters.newBlobMkfsOptions` | Extra options passed to `mkfs` when formatting a freshly-provisioned blob (comma/space-separated) | `""` |
-| `storageClass.parameters.mountOptions` | Extra mount options applied when mounting the device (comma/space-separated) | `""` |
+| `storageClass.parameters.newBlobFsType` | Filesystem to format a freshly-provisioned blob (built-in profile: ext2/3/4, xfs, btrfs, squashfs, zfs, ntfs) | `ext4` |
+| `storageClass.parameters.templateBlobFsType` | Filesystem the node mounts a `templateBlobUrl` image as (template only; never reformatted) | `""` |
+| `storageClass.parameters.templateBlobMountArgs` | Advanced: override the built-in mount options of the `templateBlobFsType` profile (template only; comma/space-separated) | `""` |
 | `storageClass.parameters.readOnly` | Expose the volume read-only (`"true"`/`"false"`) | `""` |
 | `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS and/or `?snapshot=`). Read-only (or a snapshot URL) ⇒ mount directly (no copy, no lock/lease); read-write ⇒ copy into the per-PVC blob and skip format | `""` |
 

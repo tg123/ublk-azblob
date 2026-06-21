@@ -305,30 +305,71 @@ pub fn has_filesystem(dev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Built-in `mkfs` and mount options for a supported filesystem type.
+///
+/// A profile bundles the sensible defaults for a filesystem so a StorageClass
+/// only has to pick a type (`newBlobFsType` / `templateBlobFsType`) instead of
+/// hand-rolling `mkfs`/mount flags.
+pub struct FsProfile {
+    /// Options passed to `mkfs.<fs>` before the device argument.
+    pub mkfs_options: &'static [&'static str],
+    /// Default mount `-o` options applied when mounting the filesystem.
+    pub mount_options: &'static [&'static str],
+}
+
+/// Return the built-in formatting/mount profile for `fs_type`.
+///
+/// Supported profiles cover ext2/3/4, xfs, btrfs, squashfs, zfs and ntfs.
+/// squashfs and zfs are read-only image / pool filesystems that are never
+/// created on a live device, so they carry no `mkfs` options. Unknown types
+/// fall back to an empty profile (plain `mkfs.<fs> <dev>` and a bare mount).
+pub fn fs_profile(fs_type: &str) -> FsProfile {
+    match fs_type {
+        "ext2" | "ext3" | "ext4" => FsProfile {
+            // `-F` forces creation without interactive confirmation; `-E
+            // nodiscard` avoids a full TRIM pass (faster, and discard maps onto
+            // Clear Pages); lazy_itable_init / lazy_journal_init speed up mkfs on
+            // large devices (no zeroing of inode tables and journal).
+            mkfs_options: &["-F", "-E", "nodiscard,lazy_itable_init=1,lazy_journal_init=1"],
+            mount_options: &[],
+        },
+        // `-f` forces formatting even when an old signature is present.
+        "xfs" => FsProfile {
+            mkfs_options: &["-f"],
+            mount_options: &[],
+        },
+        "btrfs" => FsProfile {
+            mkfs_options: &["-f"],
+            mount_options: &[],
+        },
+        // Read-only image / pool filesystems: only ever mounted from a template,
+        // never formatted on a freshly-provisioned device.
+        "squashfs" | "zfs" => FsProfile {
+            mkfs_options: &[],
+            mount_options: &[],
+        },
+        "ntfs" => FsProfile {
+            // `-F` forces, `-Q` does a quick format (skip zeroing and the
+            // bad-block scan).
+            mkfs_options: &["-F", "-Q"],
+            mount_options: &[],
+        },
+        _ => FsProfile {
+            mkfs_options: &[],
+            mount_options: &[],
+        },
+    }
+}
+
 /// Create a filesystem of type `fs_type` on `dev` (only call on a blank device).
 ///
-/// `extra_options` are appended verbatim after the built-in defaults, letting a
-/// StorageClass pass filesystem-specific `mkfs` flags.
-pub fn mkfs(dev: &str, fs_type: &str, extra_options: &[String]) -> anyhow::Result<()> {
+/// The built-in `mkfs` options come from the filesystem [`fs_profile`].
+pub fn mkfs(dev: &str, fs_type: &str) -> anyhow::Result<()> {
     let mkfs_bin = format!("mkfs.{fs_type}");
     info!(dev, fs_type, "creating filesystem");
-    // `-F` forces creation without interactive confirmation; `-E nodiscard`
-    // avoids a full TRIM pass (faster, and discard maps onto Clear Pages).
-    // For ext4, use lazy_itable_init and lazy_journal_init to speed up mkfs
-    // on large devices (avoids writing zeros to entire inode tables and journal).
-    let mut args: Vec<String> = if fs_type == "ext4" || fs_type == "ext3" || fs_type == "ext2" {
-        vec![
-            "-F".into(),
-            "-E".into(),
-            "nodiscard,lazy_itable_init=1,lazy_journal_init=1".into(),
-        ]
-    } else {
-        Vec::new()
-    };
-    args.extend(extra_options.iter().cloned());
-    args.push(dev.into());
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run(&mkfs_bin, &arg_refs)
+    let mut args: Vec<&str> = fs_profile(fs_type).mkfs_options.to_vec();
+    args.push(dev);
+    run(&mkfs_bin, &args)
 }
 
 /// Mount `dev` at `target`, creating the mount point if needed.

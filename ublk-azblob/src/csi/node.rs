@@ -31,6 +31,16 @@ const DEFAULT_FS_TYPE: &str = "ext4";
 /// How long to wait for the ublk device node to appear after spawning the child.
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Split a comma- or whitespace-separated option string into trimmed,
+/// non-empty tokens (used to parse mount-option StorageClass parameters).
+fn split_opts(opts: &str) -> Vec<String> {
+    opts.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// A currently-published volume and the resources backing it.
 struct Published {
     child: Child,
@@ -200,11 +210,20 @@ impl Node for NodeService {
         }
 
         // Resolve filesystem type and mount flags. The controller forwards the
-        // StorageClass `newBlobFsType` parameter into the volume context; the
-        // CSI `volume_capability` mount fs_type (when set) overrides it.
+        // StorageClass `newBlobFsType` (fresh blob) and, when provisioning from a
+        // golden-image template, `templateBlobFsType` (the template's existing
+        // filesystem). The template type takes precedence — a templated volume is
+        // mounted, never formatted. The CSI `volume_capability` mount fs_type
+        // (when set) overrides either.
         let mut fs_type = req
             .volume_context
-            .get("newBlobFsType")
+            .get("templateBlobFsType")
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                req.volume_context
+                    .get("newBlobFsType")
+                    .filter(|s| !s.is_empty())
+            })
             .cloned()
             .unwrap_or_else(|| DEFAULT_FS_TYPE.to_string());
         let mut mount_flags: Vec<String> = Vec::new();
@@ -224,30 +243,23 @@ impl Node for NodeService {
                 None => {}
             }
         }
-        // Extra mount options from the StorageClass `mountOptions` parameter, in
-        // addition to whatever the CSI volume capability carries. Comma- or
-        // whitespace-separated.
-        if let Some(opts) = req.volume_context.get("mountOptions") {
-            mount_flags.extend(
-                opts.split([',', ' ', '\t', '\n'])
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
-            );
-        }
-        // Extra mkfs options from the StorageClass `newBlobMkfsOptions` parameter,
-        // applied only when the node formats a freshly-provisioned blob.
-        let mkfs_options: Vec<String> = req
+        // Built-in mount options from the filesystem profile. The advanced
+        // `templateBlobMountArgs` parameter (template volumes only) overwrites
+        // these precooked defaults when set.
+        match req
             .volume_context
-            .get("newBlobMkfsOptions")
-            .map(|opts| {
-                opts.split([',', ' ', '\t', '\n'])
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+            .get("templateBlobMountArgs")
+            .map(|opts| split_opts(opts))
+            .filter(|over| !over.is_empty())
+        {
+            Some(over) => mount_flags.extend(over),
+            None => mount_flags.extend(
+                mount::fs_profile(&fs_type)
+                    .mount_options
+                    .iter()
+                    .map(|s| s.to_string()),
+            ),
+        }
 
         let size: u64 = req
             .volume_context
@@ -365,7 +377,7 @@ impl Node for NodeService {
                          a read-only/snapshot volume must already be formatted"
                     );
                 } else {
-                    mount::mkfs(&device, &fs_type, &mkfs_options)?;
+                    mount::mkfs(&device, &fs_type)?;
                 }
                 mount::mount(&device, &target, &fs_type, &mount_flags, readonly)?;
                 Ok(())
