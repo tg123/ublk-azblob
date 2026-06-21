@@ -61,6 +61,34 @@ jobs:
           sudo modprobe ublk_drv
           ls -l /dev/ublk-control
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build e2e runner image (BuildKit + GHA cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/e2e/Dockerfile
+          tags: ublk-azblob-e2e-runner:local
+          load: true
+          cache-from: type=gha,scope=bench-runner
+          cache-to: type=gha,mode=max,scope=bench-runner
+
+      - name: Cache cargo registry and target
+        # The benchmark compile happens inside the runner container, which writes
+        # CARGO_HOME to /workspace/.cargo-home and target/ to /workspace/target
+        # (both on the bind-mounted checkout).
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry/index
+            .cargo-home/registry/cache
+            .cargo-home/git/db
+            target
+          key: bench-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            bench-cargo-${{ runner.os }}-
+
       - name: Run benchmark (build + fio in docker compose runner)
         env:
           DEV_SIZE_MIB: ${{ inputs.dev_size_mib }}
@@ -76,7 +104,11 @@ jobs:
           FIO_NUMJOBS_LIST: ${{ inputs.fio_numjobs_list }}
         run: |
           docker compose -f tests/bench/docker-compose.yml up \
-            --build --abort-on-container-exit --exit-code-from runner
+            --abort-on-container-exit --exit-code-from runner
+
+      - name: Normalize cache ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .cargo-home target || true
 
       - name: Publish results to job summary
         if: always()

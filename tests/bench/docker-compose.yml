@@ -1,66 +1,29 @@
-# docker-compose for the ublk-azblob I/O benchmark.
+# docker-compose override for the ublk-azblob I/O benchmark.
 #
-# Mirrors tests/e2e/docker-compose.yml, but instead of the mount/checksum test
-# the `runner` builds `ublk-azblob` (`--no-default-features --features ublk`)
-# and runs the fio benchmark comparing the ublk-azblob block device against a
-# raw local disk.
-#
-#   * `azurite`  — local Azure Storage emulator (the page-blob backend).
-#   * `runner`   — builds the binary and runs tests/bench/bench.sh.
-#
-# The `runner` reuses the e2e runner image (tests/e2e/Dockerfile, same
-# `ublk-azblob-e2e-runner:local` tag) so there is a single runner environment to
-# maintain; the only extra tools the benchmark needs on top of it are `fio` and
-# `jq`, which the command installs at start-up (losetup/mount come from the e2e
-# image's util-linux).
-#
-# The `runner` shares the host kernel: it is `privileged` and bind-mounts `/dev`
-# and `/lib/modules`, so the ublk device plus the loopback (losetup) raw disk
-# work inside the container.  The `ublk_drv` kernel module must already be loaded
-# on the *host* (`sudo modprobe ublk_drv`).
+# Reuses the Azurite + runner service definitions from tests/e2e/docker-compose.yml
+# so the benchmark and e2e flows share the same compose wiring and runner image.
+# This file only keeps the bench-specific deltas: published Azurite port, benchmark
+# tunables, and the runner command that builds `ublk-azblob` for `--features ublk`
+# and executes tests/bench/bench.sh.
 #
 # Usage (after `sudo modprobe ublk_drv` on the host):
-#   docker compose -f tests/bench/docker-compose.yml up --build \
+#   docker compose -f tests/bench/docker-compose.yml up \
 #     --abort-on-container-exit --exit-code-from runner
 #   docker compose -f tests/bench/docker-compose.yml down -v
 
 services:
   azurite:
-    image: mcr.microsoft.com/azure-storage/azurite:3.34.0
-    command: azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+    extends:
+      file: ../e2e/docker-compose.yml
+      service: azurite
     ports:
       - "10000:10000"
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - "require('net').connect(10000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
-      interval: 2s
-      timeout: 5s
-      retries: 30
 
   runner:
-    # Reuse the unified e2e runner image (tests/e2e/Dockerfile) instead of a
-    # bench-specific Dockerfile — same build environment, one place to maintain.
-    image: ublk-azblob-e2e-runner:local
-    build:
-      context: ../..
-      dockerfile: tests/e2e/Dockerfile
-    depends_on:
-      azurite:
-        condition: service_healthy
-    # Needs a real kernel with ublk_drv (loaded on the host) plus the ability to
-    # create the ublk device and set up loopback devices — hence privileged.
-    privileged: true
-    volumes:
-      - ../..:/workspace
-      - /dev:/dev
-      - /lib/modules:/lib/modules:ro
-    working_dir: /workspace
+    extends:
+      file: ../e2e/docker-compose.yml
+      service: runner
     environment:
-      AZURE_STORAGE_ENDPOINT: "http://azurite:10000/devstoreaccount1"
-      CARGO_TERM_COLOR: "always"
       # Benchmark tunables (override on the `docker compose` command line).
       DEV_SIZE_MIB: "${DEV_SIZE_MIB:-512}"
       FIO_SIZE: "${FIO_SIZE:-256M}"
@@ -76,12 +39,20 @@ services:
       FIO_NUMJOBS_LIST: "${FIO_NUMJOBS_LIST:-1 4 16 64}"
     command:
       - bash
-      - -c
+      - -ec
       - |
-        set -euo pipefail
-        # The e2e runner image already carries the build toolchain + util-linux
-        # (losetup/mount); the benchmark additionally needs fio and jq.
-        apt-get update && apt-get install -y --no-install-recommends fio jq
+        apt-get update
+        apt-get install -y --no-install-recommends fio jq
         rm -rf /var/lib/apt/lists/*
         cargo build --release --no-default-features --features ublk -p ublk-azblob
         bash tests/bench/bench.sh
+
+volumes:
+  kubeconfig:
+
+networks:
+  k3s:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

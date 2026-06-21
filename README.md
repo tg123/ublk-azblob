@@ -575,7 +575,6 @@ ublk-azblob/
 │   │   └── k8s/                # k8s manifests for the PVC e2e (helm values, writer/reader jobs)
 │   └── bench/
 │       ├── bench.sh            # fio benchmark: ublk-azblob vs. raw local disk
-│       ├── docker-compose.yml  # Azurite + benchmark runner
-│       └── Dockerfile          # build + benchmark runner image (rust + fio + jq)
+│       └── docker-compose.yml  # benchmark override reusing tests/e2e/docker-compose.yml
 └── LICENSE.md                  # MIT license
 ```
