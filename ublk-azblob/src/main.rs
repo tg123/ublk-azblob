@@ -16,7 +16,7 @@
 
 mod auth;
 mod backend;
-mod blob_url;
+mod bloburl;
 #[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 mod coordination;
 #[cfg(feature = "csi")]
@@ -765,7 +765,7 @@ impl Cli {
     /// parseable `--blob-url`).
     fn location(&self) -> anyhow::Result<Location> {
         if let Some(url) = self.blob_url.as_deref() {
-            let parsed = blob_url::parse_blob_url(url).context("parse --blob-url")?;
+            let parsed = bloburl::parse_blob_url(url).context("parse --blob-url")?;
             return Ok(Location {
                 endpoint: format!("{}/", parsed.service_url.trim_end_matches('/')),
                 account: parsed.account,
