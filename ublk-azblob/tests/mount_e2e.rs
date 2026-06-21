@@ -273,7 +273,8 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
     if let Some(path) = &spec.log_path {
         let file =
             fs::File::create(path).unwrap_or_else(|e| panic!("create log file {path:?}: {e}"));
-        cmd.stderr(std::process::Stdio::from(file));
+        // tracing-subscriber writes to stdout by default; capture that.
+        cmd.stdout(std::process::Stdio::from(file));
     }
 
     let mut child = cmd.spawn().expect("failed to spawn ublk-azblob");
@@ -513,8 +514,7 @@ fn mount_warmup_sparse_image() {
 
     let cache_dir = tempdir("ublk-azblob-cache-warmup");
     let mut spec = DeviceSpec {
-        // 45 avoids the other tests' device ids (40,41,42,43,44).
-        dev_id: "45".to_string(),
+        dev_id: "46".to_string(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-warmup", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: Some(cache_dir.clone()),
