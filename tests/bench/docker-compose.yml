@@ -1,8 +1,9 @@
 # docker-compose for the ublk-azblob I/O benchmark.
 #
 # Mirrors tests/e2e/docker-compose.yml, but instead of the mount/checksum test
-# the `runner` builds `ublk-azblob` (`--features ublk`) and runs the fio
-# benchmark comparing the ublk-azblob block device against a raw local disk.
+# the `runner` builds `ublk-azblob` (`--no-default-features --features ublk`)
+# and runs the fio benchmark comparing the ublk-azblob block device against a
+# raw local disk.
 #
 #   * `azurite`  — local Azure Storage emulator (the page-blob backend).
 #   * `runner`   — builds the binary and runs tests/bench/bench.sh.
@@ -69,5 +70,5 @@ services:
       - -c
       - |
         set -euo pipefail
-        cargo build --release --features ublk -p ublk-azblob
+        cargo build --release --no-default-features --features ublk -p ublk-azblob
         bash tests/bench/bench.sh
