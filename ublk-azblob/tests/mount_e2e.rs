@@ -483,7 +483,7 @@ fn run_mount_roundtrip(spec: DeviceSpec) {
     if let Some(dir) = &spec.cache_dir {
         fs::remove_dir_all(dir).unwrap_or_else(|e| panic!("clear cache dir {dir:?}: {e}"));
     }
-    let child = start_device(&spec, false);
+    let child = start_device(&spec, true);
 
     log(&format!("remounting {dev} at {}", mnt.display()));
     run("mount", &[&dev, mnt.to_str().unwrap()]);
