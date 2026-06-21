@@ -638,21 +638,54 @@ struct Location {
 }
 
 impl Cli {
-    /// Parse the global `--blob-url` into its components for the single-device
-    /// subcommands, applying the `--snapshot` / `--sas-token` overrides.
+    /// Resolve the target blob for the single-device subcommands.
+    ///
+    /// The user-facing path parses the global `--blob-url` into its components,
+    /// applying the `--snapshot` / `--sas-token` overrides.  When `--blob-url`
+    /// is absent the explicit `AZURE_STORAGE_{ACCOUNT,CONTAINER,BLOB,ENDPOINT}`
+    /// environment is used instead: this is the internal contract the CSI node
+    /// plugin relies on, which spawns this `run` child with those variables (a
+    /// per-volume `%s` subdomain endpoint template cannot be encoded in a single
+    /// parseable `--blob-url`).
     fn location(&self) -> anyhow::Result<Location> {
-        let url = self
-            .blob_url
-            .as_deref()
+        if let Some(url) = self.blob_url.as_deref() {
+            let parsed = blob_url::parse_blob_url(url).context("parse --blob-url")?;
+            return Ok(Location {
+                endpoint: format!("{}/", parsed.service_url.trim_end_matches('/')),
+                account: parsed.account,
+                container: parsed.container,
+                blob: parsed.blob,
+                snapshot: self.snapshot.clone().or(parsed.snapshot),
+                sas: self.sas_token.clone().or(parsed.sas),
+            });
+        }
+        self.location_from_env()
+    }
+
+    /// Build a [`Location`] from the explicit `AZURE_STORAGE_*` selectors set by
+    /// the CSI node plugin on the spawned `run` child.
+    fn location_from_env(&self) -> anyhow::Result<Location> {
+        let blob = std::env::var("AZURE_STORAGE_BLOB")
+            .ok()
+            .filter(|s| !s.is_empty())
             .context("--blob-url (AZURE_STORAGE_BLOB_URL) is required for this subcommand")?;
-        let parsed = blob_url::parse_blob_url(url).context("parse --blob-url")?;
+        let account = std::env::var("AZURE_STORAGE_ACCOUNT").unwrap_or_default();
+        let container = std::env::var("AZURE_STORAGE_CONTAINER").unwrap_or_default();
+        // The endpoint template may carry a `%s` placeholder for the account
+        // (subdomain style, e.g. `http://%s.blob.localhost:10000/`); the
+        // single-device child knows its account up-front and substitutes it.
+        let endpoint_template = std::env::var("AZURE_STORAGE_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("https://{account}.blob.core.windows.net/"));
+        let endpoint = endpoint_template.replace("%s", &account);
         Ok(Location {
-            endpoint: format!("{}/", parsed.service_url.trim_end_matches('/')),
-            account: parsed.account,
-            container: parsed.container,
-            blob: parsed.blob,
-            snapshot: self.snapshot.clone().or(parsed.snapshot),
-            sas: self.sas_token.clone().or(parsed.sas),
+            endpoint: format!("{}/", endpoint.trim_end_matches('/')),
+            account,
+            container,
+            blob,
+            snapshot: self.snapshot.clone(),
+            sas: self.sas_token.clone(),
         })
     }
 }
