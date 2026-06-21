@@ -169,6 +169,13 @@ storageClass:
     # Filesystem type: ext4, xfs, btrfs, etc.
     fsType: ext4
 
+    # Run fsck before mounting an already-formatted, writable volume.
+    #   - "false"/"off" (default): never run fsck
+    #   - "true"/"preen":          `fsck -a` (auto-repair safe problems)
+    #   - "force":                 `fsck -f -y` (force a full check, repair all)
+    # Skipped for freshly-formatted and read-only volumes (which can't be
+    # repaired in place).
+    # fsck: "preen"
     # Provision the volume from a golden-image *template* blob. Full Azure blob
     # URL, optionally carrying a SAS token and/or a `?snapshot=` query. With no
     # SAS, the driver authenticates the template with its own credentials (the
