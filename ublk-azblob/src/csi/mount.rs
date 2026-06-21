@@ -341,8 +341,8 @@ pub enum FsckMode {
 
 impl FsckMode {
     /// Parse a volume-context `fsck` value. Recognised values (case-insensitive):
-    /// `""`/`false`/`off`/`no`/`none` ⇒ [`FsckMode::Off`];
-    /// `true`/`auto`/`preen`/`yes`/`on` ⇒ [`FsckMode::Preen`];
+    /// `""`/`false`/`off`/`no`/`none`/`0` ⇒ [`FsckMode::Off`];
+    /// `true`/`auto`/`preen`/`yes`/`on`/`1` ⇒ [`FsckMode::Preen`];
     /// `force`/`full` ⇒ [`FsckMode::Force`].
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
