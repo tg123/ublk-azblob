@@ -232,6 +232,15 @@ impl Node for NodeService {
                     .get("newBlobFsType")
                     .filter(|s| !s.is_empty())
             })
+            .or_else(|| {
+                // Backward compatibility: volumes provisioned by an earlier
+                // driver version stored their filesystem under the legacy
+                // `fsType` key. Fall back to it so previously-provisioned
+                // non-ext4 volumes can still be remounted after an upgrade.
+                req.volume_context
+                    .get("fsType")
+                    .filter(|s| !s.is_empty())
+            })
             .cloned()
             .unwrap_or_else(|| DEFAULT_FS_TYPE.to_string());
         let mut mount_flags: Vec<String> = Vec::new();
