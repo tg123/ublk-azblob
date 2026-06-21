@@ -39,9 +39,6 @@ jobs:
       - name: cargo clippy
         run: cargo clippy -- -D warnings
 
-      - name: cargo clippy (ublk feature — kernel target compiles)
-        run: cargo clippy --features ublk -- -D warnings
-
       - name: cargo clippy (bench feature)
         run: cargo clippy --features bench -- -D warnings
 

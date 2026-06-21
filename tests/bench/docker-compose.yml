@@ -41,9 +41,6 @@ services:
       - bash
       - -ec
       - |
-        apt-get update
-        apt-get install -y --no-install-recommends fio jq
-        rm -rf /var/lib/apt/lists/*
         cargo build --release --no-default-features --features ublk -p ublk-azblob
         bash tests/bench/bench.sh
 
