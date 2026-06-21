@@ -127,7 +127,7 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.storageAccount` | Storage account (supports variables) | `""` |
 | `storageClass.parameters.container` | Container name (supports variables) | `ublk-azblob-volumes` |
 | `storageClass.parameters.blobPathTemplate` | Blob path template | `${pvc.namespace}/volumes/${pv.name}` |
-| `storageClass.parameters.fsType` | Filesystem type | `ext4` |
+| `storageClass.parameters.newBlobFormatType` | Filesystem type to format a freshly-provisioned blob | `ext4` |
 | `storageClass.parameters.readOnly` | Expose the volume read-only (`"true"`/`"false"`) | `""` |
 | `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS and/or `?snapshot=`). Read-only (or a snapshot URL) ⇒ mount directly (no copy, no lock/lease); read-write ⇒ copy into the per-PVC blob and skip format | `""` |
 
@@ -219,7 +219,7 @@ storageClass:
   parameters:
     container: "volumes"
     blobPathTemplate: "${pvc.namespace}/${pvc.name}/${pv.name}"
-    fsType: ext4
+    newBlobFormatType: ext4
 ```
 
 ```bash
@@ -246,7 +246,7 @@ storageClass:
   name: azblob-ublk-standard
   parameters:
     blobPathTemplate: "${pvc.namespace}/standard/${pv.name}"
-    fsType: ext4
+    newBlobFormatType: ext4
 
 additionalStorageClasses:
   - name: azblob-ublk-xfs
@@ -256,7 +256,7 @@ additionalStorageClasses:
     parameters:
       container: "database-volumes"
       blobPathTemplate: "${pvc.namespace}/db/${pv.name}"
-      fsType: xfs
+      newBlobFormatType: xfs
   
   - name: azblob-ublk-scratch
     isDefault: false
@@ -265,7 +265,7 @@ additionalStorageClasses:
     parameters:
       container: "scratch"
       blobPathTemplate: "${pvc.namespace}/${pv.name}"
-      fsType: ext4
+      newBlobFormatType: ext4
 ```
 
 ```bash
@@ -317,7 +317,7 @@ storageClass:
   parameters:
     container: "volumes"
     blobPathTemplate: '${pvc.namespace}/${pv.name}'
-    fsType: ext4
+    newBlobFormatType: ext4
 ```
 
 ```bash

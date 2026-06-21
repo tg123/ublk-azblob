@@ -199,10 +199,12 @@ impl Node for NodeService {
             ));
         }
 
-        // Resolve filesystem type and mount flags from the volume capability.
+        // Resolve filesystem type and mount flags. The controller forwards the
+        // StorageClass `newBlobFormatType` parameter into the volume context; the
+        // CSI `volume_capability` mount fs_type (when set) overrides it.
         let mut fs_type = req
             .volume_context
-            .get("fsType")
+            .get("newBlobFormatType")
             .cloned()
             .unwrap_or_else(|| DEFAULT_FS_TYPE.to_string());
         let mut mount_flags: Vec<String> = Vec::new();

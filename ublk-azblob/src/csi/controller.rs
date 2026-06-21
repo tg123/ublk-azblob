@@ -37,8 +37,9 @@ const PARAM_STORAGE_ACCOUNT: &str = "storageAccount";
 const PARAM_CONTAINER: &str = "container";
 /// Parameter key for blob path template.
 const PARAM_BLOB_PATH_TEMPLATE: &str = "blobPathTemplate";
-/// Parameter key selecting the on-disk filesystem the node should create.
-const PARAM_FS_TYPE: &str = "fsType";
+/// Parameter key selecting the on-disk filesystem the node should create when
+/// formatting a freshly-provisioned (non-template) blob.
+const PARAM_NEW_BLOB_FORMAT_TYPE: &str = "newBlobFormatType";
 /// Parameter keys for the optional cluster-lease coordination, forwarded to the
 /// node via the volume context (the node's `child_env` reads them).
 const PARAM_COORDINATION: &str = "coordination";
@@ -259,8 +260,8 @@ impl Controller for ControllerService {
                 if let Some(sas) = &tmpl.sas {
                     volume_context.insert("sasToken".to_string(), sas.clone());
                 }
-                if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
-                    volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
+                if let Some(fs) = req.parameters.get(PARAM_NEW_BLOB_FORMAT_TYPE) {
+                    volume_context.insert(PARAM_NEW_BLOB_FORMAT_TYPE.to_string(), fs.clone());
                 }
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
@@ -334,8 +335,8 @@ impl Controller for ControllerService {
             // mkfs so it preserves the template's contents.
             volume_context.insert("fromTemplate".to_string(), "true".to_string());
         }
-        if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
-            volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
+        if let Some(fs) = req.parameters.get(PARAM_NEW_BLOB_FORMAT_TYPE) {
+            volume_context.insert(PARAM_NEW_BLOB_FORMAT_TYPE.to_string(), fs.clone());
         }
         // Forward the coordination opt-in (and its tuning) from the StorageClass
         // parameters into the volume context, since CSI only hands the node the
