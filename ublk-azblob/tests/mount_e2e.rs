@@ -79,6 +79,14 @@ struct DeviceSpec {
     /// that can persist a buffered write is an explicit flush or the
     /// flush-on-shutdown path. Used by the graceful-shutdown test.
     disable_auto_flush: bool,
+    /// When true the device is started with `--cache-warmup`, prefetching the
+    /// backing blob into the local-disk cache on boot. Only meaningful when
+    /// `cache_dir` is `Some`. Used by the sparse-image warm-up test.
+    cache_warmup: bool,
+    /// When `Some`, the child's stderr (where `tracing` logs go) is redirected
+    /// to this file so a test can assert on log output (e.g. that warm-up used
+    /// the blob sparseness map). `None` inherits the parent's stderr.
+    log_path: Option<PathBuf>,
 }
 
 impl DeviceSpec {
@@ -248,6 +256,9 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
             cmd.arg("--cache-max-bytes")
                 .arg(spec.cache_max_bytes.to_string());
         }
+        if spec.cache_warmup {
+            cmd.arg("--cache-warmup");
+        }
     }
     if spec.disable_auto_flush {
         // Disable both the idle and the force-flush timers so a buffered write
@@ -258,6 +269,12 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
             .arg("0");
     }
     azure_env(&mut cmd, &spec.container, &spec.blob);
+
+    if let Some(path) = &spec.log_path {
+        let file =
+            fs::File::create(path).unwrap_or_else(|e| panic!("create log file {path:?}: {e}"));
+        cmd.stderr(std::process::Stdio::from(file));
+    }
 
     let mut child = cmd.spawn().expect("failed to spawn ublk-azblob");
 
@@ -339,6 +356,37 @@ fn write_random_file(path: &Path, len: usize) {
     fs::write(path, &data).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
 }
 
+/// Extract the value of a `tracing` field rendered as `name=<u64>` from captured
+/// log text, returning the value on the first matching line.
+fn parse_log_field(logs: &str, name: &str) -> u64 {
+    let needle = format!("{name}=");
+    for line in logs.lines() {
+        if let Some(idx) = line.find(&needle) {
+            let rest = &line[idx + needle.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<u64>() {
+                return v;
+            }
+        }
+    }
+    panic!("field `{name}` not found in logs:\n{logs}");
+}
+
+/// Poll `path` until it contains `needle` or `timeout` elapses; returns whether
+/// the needle appeared. Used to wait for the background warm-up to finish.
+fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(s) = fs::read_to_string(path) {
+            if s.contains(needle) {
+                return true;
+            }
+        }
+        sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 /// Create a unique temporary directory under the system temp dir.
 fn tempdir(prefix: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -367,6 +415,8 @@ fn mount_roundtrip() {
         cache_dir: None,
         cache_max_bytes: 0,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     });
 }
 
@@ -398,6 +448,8 @@ fn mount_roundtrip_file_cache() {
         cache_dir: Some(cache_dir.clone()),
         cache_max_bytes: 0,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     });
     let _ = fs::remove_dir_all(&cache_dir);
 }
@@ -434,8 +486,132 @@ fn mount_roundtrip_file_cache_budget() {
         // file across NUM_FILES files), so eviction is exercised.
         cache_max_bytes: 8 * 1024 * 1024,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     });
     let _ = fs::remove_dir_all(&cache_dir);
+}
+
+/// e2e for sparseness-aware cache warm-up (`--cache-warmup`) over a disk image
+/// with large zero regions.
+///
+/// A 256 MiB page blob holds an ext4 filesystem that uses only a few MiB, so the
+/// backing blob is mostly unwritten (zero). On the second boot, warm-up must
+/// consult the blob's page-range map and *skip* those large zero gaps instead of
+/// downloading the whole device, yet every file must still read back correctly
+/// (zero pages serve as holes). The warm-up's own log output is captured and
+/// asserted on to prove the sparseness path actually ran.
+#[test]
+fn mount_warmup_sparse_image() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_warmup_sparse_image: requires root and a loaded \
+             ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let cache_dir = tempdir("ublk-azblob-cache-warmup");
+    let mut spec = DeviceSpec {
+        // 45 avoids the other tests' device ids (40,41,42,43,44).
+        dev_id: "45".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-warmup", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: Some(cache_dir.clone()),
+        cache_max_bytes: 0,
+        disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
+    };
+
+    let dev = spec.dev_path();
+    let mnt = tempdir("ublk-azblob-mnt");
+
+    // ── Phase 1: provision, make a small ext4, write a few small files ─────────
+    // Only a few MiB of the 256 MiB device are touched, so the page blob ends up
+    // with large zero gaps that warm-up should later skip.
+    let child = start_device(&spec, true);
+    log(&format!("mkfs.ext4 on {dev}"));
+    run("mkfs.ext4", &["-q", "-F", "-E", "nodiscard", &dev]);
+    log(&format!("mounting {dev} at {}", mnt.display()));
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+
+    log("writing a few small files (leaving large zero regions on the device)");
+    let mut checksums: Vec<(String, String)> = Vec::with_capacity(NUM_FILES);
+    for i in 1..=NUM_FILES {
+        let name = format!("sparse_{i}.bin");
+        let path = mnt.join(&name);
+        // Small files (≤256 KiB) so the bulk of the 256 MiB device stays zero.
+        let len = 1024 * (1 + (i * 31) % 256);
+        write_random_file(&path, len);
+        checksums.push((name, sha256_file(&path)));
+    }
+
+    log("sync + SIGUSR1 to force flush to the page blob");
+    run("sync", &[]);
+    signal(&child, libc::SIGUSR1);
+    sleep(Duration::from_secs(2));
+
+    log(&format!("unmounting {}", mnt.display()));
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // ── Phase 2: remount with a FRESH cache + warm-up, capturing the logs ──────
+    fs::remove_dir_all(&cache_dir).unwrap_or_else(|e| panic!("clear cache dir {cache_dir:?}: {e}"));
+    let log_dir = tempdir("ublk-azblob-warmup-log");
+    let log_path = log_dir.join("warmup.log");
+    spec.cache_warmup = true;
+    spec.log_path = Some(log_path.clone());
+    let child = start_device(&spec, false);
+
+    log(&format!("remounting {dev} at {}", mnt.display()));
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+
+    log("waiting for the background warm-up to complete");
+    assert!(
+        wait_for_log(&log_path, "cache warm-up complete", Duration::from_secs(60)),
+        "warm-up did not complete within 60s; logs:\n{}",
+        fs::read_to_string(&log_path).unwrap_or_default()
+    );
+
+    log("verifying checksums after warm-up remount");
+    for (name, expected) in &checksums {
+        let path = mnt.join(name);
+        let actual = sha256_file(&path);
+        assert_eq!(
+            &actual, expected,
+            "checksum mismatch for {name} after warm-up remount"
+        );
+        println!("{name}: OK");
+    }
+
+    log(&format!("unmounting {}", mnt.display()));
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // The warm-up must have consulted the blob sparseness map and skipped the
+    // large zero regions rather than downloading the whole 256 MiB device.
+    let logs = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("read warm-up log {log_path:?}: {e}"));
+    assert!(
+        logs.contains("warm-up using blob sparseness map"),
+        "warm-up did not use the blob sparseness map; logs:\n{logs}"
+    );
+    let skipped = parse_log_field(&logs, "skipped_bytes");
+    let warmed = parse_log_field(&logs, "warmed_bytes");
+    log(&format!(
+        "warm-up skipped {skipped} bytes, warmed {warmed} bytes"
+    ));
+    assert!(
+        skipped > warmed,
+        "expected warm-up to skip more zero bytes ({skipped}) than it warmed \
+         ({warmed}) on a mostly-empty device; logs:\n{logs}"
+    );
+
+    let _ = fs::remove_dir_all(&mnt);
+    let _ = fs::remove_dir_all(&cache_dir);
+    let _ = fs::remove_dir_all(&log_dir);
+    log("warm-up sparse-image e2e PASSED ✓");
 }
 
 /// Drive a full mount/write/flush/remount/verify cycle for the given device.
@@ -540,6 +716,8 @@ fn mount_read_only() {
         cache_dir: None,
         cache_max_bytes: 0,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     };
     let dev = spec.dev_path();
     let mnt = tempdir("ublk-azblob-ro-mnt");
@@ -663,6 +841,8 @@ fn graceful_shutdown_flush() {
         cache_max_bytes: 0,
         // The whole point: only the shutdown flush may persist the write.
         disable_auto_flush: true,
+        cache_warmup: false,
+        log_path: None,
     };
     let dev = spec.dev_path();
     let work = tempdir("ublk-azblob-shutdown");
@@ -763,6 +943,8 @@ fn mount_fsck() {
         cache_dir: None,
         cache_max_bytes: 0,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     };
     let dev = spec.dev_path();
     let mnt = tempdir("ublk-azblob-fsck-mnt");
