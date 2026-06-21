@@ -246,8 +246,8 @@ pub fn build_pipeline(auth: &AuthConfig) -> anyhow::Result<Pipeline> {
             per_try_policies.push(Arc::new(SasPolicy::new(sas_token)));
         }
         _ => {
-            let cred = build_token_credential(auth)?
-                .context("Entra auth produced no token credential")?;
+            let cred =
+                build_token_credential(auth)?.context("Entra auth produced no token credential")?;
             per_try_policies.push(Arc::new(BearerTokenAuthorizationPolicy::new(
                 cred,
                 vec!["https://storage.azure.com/.default"],

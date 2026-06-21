@@ -9,6 +9,7 @@ use super::BlobBackend;
 use crate::coordination::{BlobLock, LockError};
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
+use azure_core::http::{Context, Method, Pipeline, Request, Url};
 use azure_storage_blob::{
     models::{
         BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
@@ -18,7 +19,6 @@ use azure_storage_blob::{
     },
     BlobClient, BlobContainerClient,
 };
-use azure_core::http::{Context, Method, Pipeline, Request, Url};
 use bytes::Bytes;
 use futures::stream::{StreamExt as _, TryStreamExt as _};
 use std::sync::RwLock;
@@ -266,8 +266,7 @@ fn parse_page_ranges(body: &str) -> anyhow::Result<Vec<(u64, u64)>> {
             bail!("unterminated <PageRange> element in Get Page Ranges response");
         };
         let segment = &after[..close];
-        let start = extract_tag_u64(segment, "Start")
-            .context("missing <Start> in <PageRange>")?;
+        let start = extract_tag_u64(segment, "Start").context("missing <Start> in <PageRange>")?;
         let end = extract_tag_u64(segment, "End").context("missing <End> in <PageRange>")?;
         if end < start {
             bail!("invalid page range: End ({end}) < Start ({start})");
@@ -622,7 +621,10 @@ mod tests {
             <PageRange><Start>1024</Start><End>2047</End></PageRange>\
             <PageRange><Start>0</Start><End>511</End></PageRange>\
             </PageList>";
-        assert_eq!(parse_page_ranges(body).unwrap(), vec![(0, 512), (1024, 1024)]);
+        assert_eq!(
+            parse_page_ranges(body).unwrap(),
+            vec![(0, 512), (1024, 1024)]
+        );
     }
 
     #[test]
