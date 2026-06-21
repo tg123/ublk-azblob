@@ -633,7 +633,7 @@ impl FileCacheBackend {
 
         // Prefer a live peer's clean copy of this page (copy-on-write: cheaper
         // than a blob round-trip); fall back to the inner backend.
-        let data: Vec<u8> = match self.try_peer_page(state, page_idx, page_len)? {
+        let data: Vec<u8> = match self.try_peer_page(page_idx, page_len)? {
             Some(buf) => buf,
             None => {
                 let data = self
@@ -650,14 +650,27 @@ impl FileCacheBackend {
                 data.to_vec()
             }
         };
+        self.store_clean_page(state, page_idx, offset, &data)?;
+        Ok(page_len)
+    }
+
+    /// Write a freshly-fetched **clean** page into the cache file, mark it
+    /// present (persisting the bit; a lost bit just causes a re-read, so the
+    /// write is non-fatal), and account it against the byte budget. Shared by
+    /// [`ensure_page`](Self::ensure_page) and the concurrent warm-up path.
+    fn store_clean_page(
+        &self,
+        state: &mut CacheState,
+        page_idx: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
         state
             .data
-            .write_all_at(&data, offset)
+            .write_all_at(data, offset)
             .with_context(|| format!("write page {page_idx} to cache file"))?;
 
         bit_set(&mut state.present, page_idx, true);
-        // A freshly loaded clean page does not need an fsync: if the present bit
-        // is lost on crash it is simply re-read from the inner backend.
         let byte = page_idx / 8;
         let present_off = HEADER_SIZE + byte;
         if let Err(err) = state
@@ -667,22 +680,72 @@ impl FileCacheBackend {
             warn!(page_idx, %err, "failed to persist clean present bit (non-fatal)");
         }
 
-        // Account the newly-resident clean page and evict if over budget.  The
+        // Account the newly-resident clean page and evict if over budget. The
         // page just loaded is protected from immediate eviction.
         self.account_present(state, page_idx, true)?;
+        Ok(())
+    }
 
+    /// Make `page_idx` resident as a clean page, fetching it from a peer or the
+    /// inner backend **without holding the state lock** during the fetch — so
+    /// warm-up can run many fetches concurrently (the serial `ensure_page` holds
+    /// the lock across the blob read, which would serialize them). The lock is
+    /// taken only to check presence and to store the bytes. Returns the number
+    /// of newly-warmed bytes (0 if the page was already present / lost a race).
+    async fn warm_one_page(&self, page_idx: u64) -> anyhow::Result<u64> {
+        let (offset, page_len) = {
+            let state = self.state.lock().await;
+            if bit_get(&state.present, page_idx) {
+                return Ok(0);
+            }
+            let offset = page_idx * self.page_size;
+            (
+                offset,
+                self.page_size.min(state.dev_size.saturating_sub(offset)),
+            )
+        };
+        if page_len == 0 {
+            return Ok(0);
+        }
+
+        // Fetch with no state lock held, so concurrent warm-up pages overlap.
+        let data: Vec<u8> = match self.try_peer_page(page_idx, page_len)? {
+            Some(buf) => buf,
+            None => {
+                let d = self
+                    .inner
+                    .read(offset, page_len)
+                    .await
+                    .with_context(|| format!("warm-up read page {page_idx}"))?;
+                if d.len() as u64 != page_len {
+                    bail!(
+                        "inner backend returned {} bytes for page {page_idx} (expected {page_len})",
+                        d.len()
+                    );
+                }
+                d.to_vec()
+            }
+        };
+
+        // Store under a brief lock; another warm-up task may have raced us here.
+        let mut state = self.state.lock().await;
+        if bit_get(&state.present, page_idx) {
+            return Ok(0);
+        }
+        self.store_clean_page(&mut state, page_idx, offset, &data)?;
+        if let Some(idx) = &self.index {
+            if !bit_get(&state.dirty, page_idx) {
+                idx.publish(page_idx, page_len)
+                    .with_context(|| format!("publish warmed page {page_idx}"))?;
+            }
+        }
         Ok(page_len)
     }
 
     /// Try to fetch a full page from a live peer's cache via the shared index.
     /// Returns the page bytes on a sharing hit, `None` when no peer has it (so
     /// the caller fetches from the blob).  A no-op when sharing is disabled.
-    fn try_peer_page(
-        &self,
-        _state: &CacheState,
-        page_idx: u64,
-        page_len: u64,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
+    fn try_peer_page(&self, page_idx: u64, page_len: u64) -> anyhow::Result<Option<Vec<u8>>> {
         let Some(idx) = &self.index else {
             return Ok(None);
         };
@@ -928,7 +991,7 @@ impl BlobBackend for FileCacheBackend {
                 // the page stays resident only in the peer that owns it.
                 let page_len = self.page_len(&state, page_idx);
                 let mut served = false;
-                if let Some(page) = self.try_peer_page(&state, page_idx, page_len)? {
+                if let Some(page) = self.try_peer_page(page_idx, page_len)? {
                     let start = page_offset as usize;
                     result[pos as usize..(pos + chunk_len) as usize]
                         .copy_from_slice(&page[start..start + chunk_len as usize]);
@@ -997,6 +1060,46 @@ impl BlobBackend for FileCacheBackend {
             page_off += page_size;
         }
         Ok(())
+    }
+
+    async fn warmup(&self, dev_size: u64, _page_size: u64, limit_bytes: u64, concurrency: usize) {
+        use futures::stream::{self, StreamExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Warm in this cache's own page units, regardless of the caller's
+        // `page_size` hint (the cache can only make whole pages resident).
+        let page_size = self.page_size;
+        let limit = limit_bytes.min(dev_size);
+        if limit == 0 {
+            return;
+        }
+        let n_pages = limit.div_ceil(page_size);
+        let conc = concurrency.max(1);
+        let warmed = AtomicU64::new(0);
+
+        // Fetch up to `conc` pages from the blob at once (each `warm_one_page`
+        // does its blob read with no state lock held), turning warm-up from a
+        // latency-bound serial scan into a bandwidth-bound parallel one.
+        stream::iter(0..n_pages)
+            .for_each_concurrent(conc, |page_idx| {
+                let warmed = &warmed;
+                async move {
+                    match self.warm_one_page(page_idx).await {
+                        Ok(n) => {
+                            warmed.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(err) => warn!(page_idx, %err, "warm-up page failed (continuing)"),
+                    }
+                }
+            })
+            .await;
+
+        info!(
+            warmed_bytes = warmed.load(Ordering::Relaxed),
+            limit_bytes = limit,
+            concurrency = conc,
+            "cache warm-up complete"
+        );
     }
 
     async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
@@ -1603,6 +1706,38 @@ mod tests {
         assert_eq!(
             b.read(0, 2048).await.unwrap(),
             Bytes::from(vec![0xAB; 2048])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn warmup_concurrent_populates_all_pages() {
+        // The concurrent warm-up (`warmup` with concurrency > 1) fetches every
+        // page from the inner backend and makes it resident as a clean page.
+        let dir = tmp_dir("warmup-conc");
+        let page = 1024u64;
+        let dev = 16 * page; // 16 pages
+        let inner = Arc::new(MemBackend::new(dev).unwrap());
+        inner
+            .write(0, Bytes::from(vec![0x5A; dev as usize]))
+            .await
+            .unwrap();
+
+        let (b, _) = open(inner.clone(), &dir, page, dev);
+        // Warm the whole device, 8 pages in flight at once.
+        b.warmup(dev, page, dev, 8).await;
+
+        assert_eq!(b.present_count().await, 16);
+        assert_eq!(b.dirty_count().await, 0);
+
+        // Mutate inner; every page must now be served from the warmed cache.
+        inner
+            .write(0, Bytes::from(vec![0x00; dev as usize]))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.read(0, dev).await.unwrap(),
+            Bytes::from(vec![0x5A; dev as usize])
         );
         std::fs::remove_dir_all(&dir).ok();
     }
