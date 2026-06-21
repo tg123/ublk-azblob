@@ -544,7 +544,12 @@ mod tests {
             return;
         }
 
-        let tmp = std::env::temp_dir().join(format!("ublk-mkfs-e2e-{}", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp =
+            std::env::temp_dir().join(format!("ublk-mkfs-e2e-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&tmp).expect("create temp dir");
 
         for fs in FORMATTABLE {
