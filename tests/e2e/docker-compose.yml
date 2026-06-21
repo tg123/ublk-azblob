@@ -28,11 +28,14 @@ services:
   # Azurite for the mount/NBD e2e (the k8s e2e deploys its own Azurite in-cluster).
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:3.34.0
-    command: azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+    # `--disableProductStyleUrl` forces path-style URLs (account taken from the
+    # URL path, not the host's first label), so a single parseable blob URL with
+    # a DNS host round-trips; the mount/NBD e2e already use path-style.
+    command: azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck --disableProductStyleUrl
     networks:
       k3s:
         # Fixed IP so the k8s CSI pods can reach this single Azurite via
-        # hostAliases (subdomain-style URL) — see tests/e2e/k8s/e2e.values.yaml.
+        # hostAliases (resolving the DNS host) — see tests/e2e/k8s/e2e.values.yaml.
         ipv4_address: 172.30.0.10
     healthcheck:
       # Azurite is node-based (alpine, no curl); use node to confirm the blob

@@ -599,9 +599,10 @@ mod tests {
     #[test]
     fn child_blob_url_k8s_e2e_path_style_endpoint() {
         // Mirrors the k8s e2e endpoint: a `%s` account placeholder in the path
-        // of a literal-IP host (Azurite path-style).
+        // of a DNS host (Azurite runs with --disableProductStyleUrl, so the
+        // account is read from the path).
         let url = child_blob_url(
-            "http://172.30.0.10:10000/%s",
+            "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/%s",
             "devstoreaccount1",
             "ublk-azblob-volumes",
             "default/volumes/pvc-abc",
@@ -609,7 +610,7 @@ mod tests {
         );
         assert_eq!(
             url,
-            "http://172.30.0.10:10000/devstoreaccount1/ublk-azblob-volumes/default/volumes/pvc-abc"
+            "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/devstoreaccount1/ublk-azblob-volumes/default/volumes/pvc-abc"
         );
         let r = parse_blob_url(&url).unwrap();
         assert_eq!(r.account, "devstoreaccount1");
