@@ -367,6 +367,16 @@ enum Command {
         #[arg(long, default_value = "0", env = "UBLK_FLUSH_IO_TIMEOUT_SECS")]
         flush_io_timeout_secs: u64,
 
+        /// Maximum number of dirty pages flushed concurrently to the backend.
+        ///
+        /// Flushing is latency-bound when the backend is remote (e.g. Azure in a
+        /// distant region), so issuing several page writes in flight at once is
+        /// the key throughput lever. Transient extra memory is bounded by
+        /// `page_size × this value`. Set to 1 for fully sequential flushing.
+        /// `0` (the default) auto-sizes to the logical CPU count.
+        #[arg(long, default_value = "0", env = "UBLK_FLUSH_CONCURRENCY")]
+        flush_concurrency: usize,
+
         /// Serve over the NBD protocol instead of ublk (compatibility mode).
         ///
         /// When set, the device is exposed as an NBD server bound to this
@@ -501,6 +511,7 @@ async fn main() -> anyhow::Result<()> {
             idle_flush_secs,
             force_flush_timeout_secs,
             flush_io_timeout_secs,
+            flush_concurrency,
             ref nbd,
         } => {
             // Read-only is derived solely from selecting a snapshot: a snapshot
@@ -670,12 +681,18 @@ async fn main() -> anyhow::Result<()> {
                 info!("write-through mode (read-only)");
                 backend
             } else if page_size > 0 {
+                let flush_concurrency = if flush_concurrency == 0 {
+                    crate::backend::cpu_count()
+                } else {
+                    flush_concurrency
+                };
                 info!(
                     page_size,
                     max_dirty_pages,
                     idle_flush_secs,
                     force_flush_timeout_secs,
                     flush_io_timeout_secs,
+                    flush_concurrency,
                     "write-back buffer enabled"
                 );
                 BufferedBackend::new(
@@ -686,6 +703,7 @@ async fn main() -> anyhow::Result<()> {
                         idle_flush_secs,
                         force_flush_timeout_secs,
                         flush_io_timeout_secs,
+                        flush_concurrency,
                     },
                 )
                 .context("configure write-back buffer")?
