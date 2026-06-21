@@ -29,6 +29,14 @@ pub fn copy_chunk_bytes() -> u64 {
         .unwrap_or(MAX_PAGE_REQUEST_BYTES)
 }
 
+/// Number of logical CPUs, used to size default concurrency for the parallel
+/// copy / warm-up paths. Falls back to 8 when the count can't be determined.
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+}
+
 /// Abstraction over a page-blob–like byte store.
 ///
 /// All offsets and lengths **must** be multiples of 512 bytes (Azure Page Blob

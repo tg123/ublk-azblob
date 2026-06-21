@@ -338,8 +338,8 @@ enum Command {
         /// raising this makes it bandwidth-bound. Peak transient memory is
         /// roughly `concurrency × --cache-page-size`, so lower it when using
         /// large cache pages. Only used when `--cache-dir` and `--cache-warmup`
-        /// are set.
-        #[arg(long, default_value = "8", env = "UBLK_CACHE_WARMUP_CONCURRENCY")]
+        /// are set. `0` (the default) auto-sizes to the logical CPU count.
+        #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_CONCURRENCY")]
         cache_warmup_concurrency: usize,
 
         /// Idle flush timeout in seconds: automatically flush dirty pages after N
@@ -639,7 +639,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                     .min(actual_size);
                     let warm_backend = cache.clone();
-                    let conc = cache_warmup_concurrency;
+                    let conc = if cache_warmup_concurrency == 0 {
+                        crate::backend::cpu_count()
+                    } else {
+                        cache_warmup_concurrency
+                    };
                     info!(
                         warmup_limit_bytes = limit,
                         warmup_concurrency = conc,
