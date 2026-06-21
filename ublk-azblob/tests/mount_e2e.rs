@@ -756,8 +756,8 @@ fn mount_fsck() {
 
     let spec = DeviceSpec {
         // Distinct, high device id and blob so this test never collides with the
-        // other mount tests (40/41/42/43) or the k8s CSI e2e's low ids.
-        dev_id: "44".to_string(),
+        // other mount tests (40/41/42/43/44) or the k8s CSI e2e's low ids.
+        dev_id: "45".to_string(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-fsck", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
