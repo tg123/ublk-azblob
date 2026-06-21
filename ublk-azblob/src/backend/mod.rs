@@ -29,6 +29,14 @@ pub fn copy_chunk_bytes() -> u64 {
         .unwrap_or(MAX_PAGE_REQUEST_BYTES)
 }
 
+/// Number of logical CPUs, used to size default concurrency for the parallel
+/// copy / warm-up paths. Falls back to 8 when the count can't be determined.
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+}
+
 /// Abstraction over a page-blob–like byte store.
 ///
 /// All offsets and lengths **must** be multiples of 512 bytes (Azure Page Blob
@@ -72,6 +80,37 @@ pub trait BlobBackend: Send + Sync {
     /// Both `offset` and `len` must be multiples of 512.
     async fn prefetch(&self, offset: u64, len: u64) -> anyhow::Result<()> {
         self.read(offset, len).await.map(|_| ())
+    }
+
+    /// Warm `[0, limit_bytes)` into the local cache (if any), best-effort.
+    ///
+    /// `page_size` is the fetch granularity and `concurrency` bounds the number
+    /// of in-flight page fetches. The default implementation is a sequential
+    /// `prefetch` scan (no concurrency) that stops on the first read error;
+    /// cache-backed backends override it to fetch pages from the blob in
+    /// parallel (bandwidth- rather than latency-bound) and, being best-effort,
+    /// log and skip individual failed pages while continuing the warm-up — the
+    /// device keeps serving any missed regions on demand.
+    async fn warmup(&self, dev_size: u64, page_size: u64, limit_bytes: u64, concurrency: usize) {
+        let _ = concurrency; // honoured only by cache-backed backends
+        let limit = limit_bytes.min(dev_size);
+        let mut offset = 0u64;
+        let mut warmed = 0u64;
+        while offset < limit {
+            let len = page_size.min(dev_size - offset);
+            if let Err(err) = self.prefetch(offset, len).await {
+                tracing::warn!(offset, %err, "cache warm-up read failed; stopping early");
+                break;
+            }
+            warmed += len;
+            offset += len;
+            tokio::task::yield_now().await;
+        }
+        tracing::info!(
+            warmed_bytes = warmed,
+            limit_bytes = limit,
+            "cache warm-up complete"
+        );
     }
 
     /// Flush any pending writes to durable storage.

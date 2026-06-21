@@ -123,18 +123,18 @@ impl AzurePageBlobBackend {
         if !total_size.is_multiple_of(512) {
             bail!("copy size {total_size} is not 512-byte aligned");
         }
-        /// Concurrent in-flight copy requests (override with `UBLK_COPY_CONCURRENCY`).
-        const DEFAULT_CONCURRENCY: usize = 32;
         /// Re-mint the copy-source token roughly every this many bytes.
         const BATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
         // Per-request size (override with `UBLK_COPY_CHUNK_BYTES`); `Put Page From
         // URL` caps it at 4 MiB.
         let chunk = crate::backend::copy_chunk_bytes();
+        // Default concurrency to the logical CPU count (same auto-sizing as the
+        // cache warm-up path), overridable with `UBLK_COPY_CONCURRENCY`.
         let concurrency = std::env::var("UBLK_COPY_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_CONCURRENCY);
+            .unwrap_or_else(crate::backend::cpu_count);
 
         let blob_client = self.container.blob_client(&self.blob_name);
         let page_client = blob_client.page_blob_client();
