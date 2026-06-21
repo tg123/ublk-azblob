@@ -74,7 +74,7 @@ jobs:
           cache-from: type=gha,scope=bench-runner
           cache-to: type=gha,mode=max,scope=bench-runner
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo-home and target
         # The benchmark compile happens inside the runner container, which writes
         # CARGO_HOME to /workspace/.cargo-home and target/ to /workspace/target
         # (both on the bind-mounted checkout).
