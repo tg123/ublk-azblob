@@ -202,6 +202,25 @@ enum Command {
         )]
         coordination: bool,
 
+        /// Disable the Azure blob lease ("blob lock").
+        ///
+        /// By default `run` acquires the blob lease before mounting so that at
+        /// most one process writes to the page blob at a time (single-process
+        /// mode), refusing to mount if another process already holds it.  Pass
+        /// this flag to skip the blob lock entirely — only do so when you are
+        /// certain no other process is using the blob.  Read-only mounts never
+        /// take the lock.  Cannot be combined with `--coordination`, which
+        /// relies on the blob lock as its authoritative storage lock.
+        #[arg(
+            long,
+            env = "UBLK_DISABLE_BLOB_LOCK",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
+        disable_blob_lock: bool,
+
         /// Recovery timeout (seconds): how long a holder's cluster lease may go
         /// un-renewed before another node may break its blob lease and take the
         /// volume over.
@@ -481,6 +500,7 @@ async fn main() -> anyhow::Result<()> {
             page_size,
             max_dirty_pages,
             coordination,
+            disable_blob_lock,
             recovery_timeout_secs,
             lease_duration_secs,
             ref lease_namespace,
@@ -506,6 +526,13 @@ async fn main() -> anyhow::Result<()> {
             if read_only {
                 info!("snapshot selected: read-only mode (writes, discards, creation disabled)");
             }
+            // Fail fast on contradictory locking flags before any network/auth.
+            if disable_blob_lock && coordination {
+                anyhow::bail!(
+                    "--disable-blob-lock cannot be combined with --coordination \
+                     (coordination relies on the blob lock as its authoritative storage lock)"
+                );
+            }
             let azure_backend = build_azure_backend(&cli, &endpoint)?;
             if create {
                 if read_only {
@@ -521,13 +548,18 @@ async fn main() -> anyhow::Result<()> {
             let actual_size = azure_backend.size().await.context("get blob size")?;
             info!(size = actual_size, "blob ready");
 
-            // Acquire cluster + blob coordination locks before mounting (after
-            // the blob exists, so its lease can be taken).
-            let guard = if coordination {
+            // Acquire the blob lock (and, with --coordination, the cluster
+            // lease) before mounting, after the blob exists so its lease can be
+            // taken.  The blob lock is on by default; --disable-blob-lock skips
+            // it.  Read-only mounts never write, so they take no lock.
+            let guard = if read_only || disable_blob_lock {
+                None
+            } else {
                 Some(
-                    acquire_coordination(
+                    acquire_lock(
                         &cli,
                         &endpoint,
+                        coordination,
                         recovery_timeout_secs,
                         lease_duration_secs,
                         lease_namespace.clone(),
@@ -535,10 +567,8 @@ async fn main() -> anyhow::Result<()> {
                         lease_holder.clone(),
                     )
                     .await
-                    .context("acquire coordination locks")?,
+                    .context("acquire blob lock")?,
                 )
-            } else {
-                None
             };
 
             // Once the blob lease is held, every write/clear must carry the
@@ -867,29 +897,28 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown-node".to_string())
 }
 
-/// Acquire the cluster lease + blob lock for the selected blob and return the
-/// guard that keeps them renewed.  Requires the `coordination` build feature.
-#[cfg(feature = "coordination")]
+/// Acquire the blob lock for the selected blob — and, when `coordination` is
+/// requested, the Kubernetes cluster lease too — and return the guard that keeps
+/// them renewed.  The blob-lock half works in any build; the cluster-lease half
+/// requires the `coordination` build feature.
 #[allow(clippy::too_many_arguments)]
-async fn acquire_coordination(
+async fn acquire_lock(
     cli: &Cli,
     endpoint: &str,
+    coordination: bool,
     recovery_timeout_secs: u64,
     lease_duration_secs: u64,
     lease_namespace: Option<String>,
     lease_name: Option<String>,
     lease_holder: Option<String>,
 ) -> anyhow::Result<coordination::CoordinationGuard> {
-    use coordination::{
-        k8s::{sanitize_lease_name, K8sClusterLease},
-        CoordinationConfig, Coordinator,
-    };
+    use coordination::{CoordinationConfig, Coordinator};
     use std::time::Duration;
 
     let blob = cli
         .blob
         .clone()
-        .context("--blob (AZURE_STORAGE_BLOB) is required for coordination")?;
+        .context("--blob (AZURE_STORAGE_BLOB) is required for the blob lock")?;
     let auth = build_auth(cli)?;
     let container_client = auth::build_container_client(endpoint, &cli.container, &auth)
         .context("build container client for blob lock")?;
@@ -902,6 +931,47 @@ async fn acquire_coordination(
         .filter(|h| !h.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
         .unwrap_or_else(|| "unknown-node".to_string());
+
+    let config = CoordinationConfig::new(
+        holder.clone(),
+        Duration::from_secs(lease_duration_secs),
+        Duration::from_secs(recovery_timeout_secs),
+    );
+
+    // The cluster lease is the optional Kubernetes liveness layer; without
+    // --coordination we run in single-process, blob-lock-only mode.
+    let cluster = if coordination {
+        Some(
+            connect_cluster_lease(
+                &cli.container,
+                &blob,
+                holder,
+                lease_namespace,
+                lease_name,
+                &config,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    Coordinator::new(cluster, blob_lock, config).acquire().await
+}
+
+/// Connect to the Kubernetes cluster lease used by `--coordination`.  Requires
+/// the `coordination` build feature.
+#[cfg(feature = "coordination")]
+async fn connect_cluster_lease(
+    container: &str,
+    blob: &str,
+    holder: String,
+    lease_namespace: Option<String>,
+    lease_name: Option<String>,
+    config: &coordination::CoordinationConfig,
+) -> anyhow::Result<Arc<dyn coordination::ClusterLease>> {
+    use coordination::k8s::{sanitize_lease_name, K8sClusterLease};
+
     let namespace = lease_namespace
         .filter(|n| !n.is_empty())
         .or_else(|| {
@@ -912,46 +982,37 @@ async fn acquire_coordination(
         .unwrap_or_else(|| "default".to_string());
     let name = lease_name
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| sanitize_lease_name(&format!("{}-{}", cli.container, blob)));
-
-    let config = CoordinationConfig::new(
-        holder.clone(),
-        Duration::from_secs(lease_duration_secs),
-        Duration::from_secs(recovery_timeout_secs),
-    );
+        .unwrap_or_else(|| sanitize_lease_name(&format!("{container}-{blob}")));
 
     info!(
         %namespace, %name, %holder,
-        recovery_timeout_secs, "connecting to cluster lease"
+        recovery_timeout_secs = config.recovery_timeout.as_secs(),
+        "connecting to cluster lease"
     );
-    let cluster = Arc::new(
-        K8sClusterLease::connect(
-            &namespace,
-            name,
-            holder,
-            config.lease_duration,
-            config.recovery_timeout,
-        )
-        .await
-        .context("connect kubernetes cluster lease")?,
-    );
+    let cluster = K8sClusterLease::connect(
+        &namespace,
+        name,
+        holder,
+        config.lease_duration,
+        config.recovery_timeout,
+    )
+    .await
+    .context("connect kubernetes cluster lease")?;
 
-    Coordinator::new(cluster, blob_lock, config).acquire().await
+    Ok(Arc::new(cluster))
 }
 
 /// Stub used when the `coordination` feature is not compiled in: fail loudly so
 /// `--coordination` is never silently ignored.
 #[cfg(not(feature = "coordination"))]
-#[allow(clippy::too_many_arguments)]
-async fn acquire_coordination(
-    _cli: &Cli,
-    _endpoint: &str,
-    _recovery_timeout_secs: u64,
-    _lease_duration_secs: u64,
+async fn connect_cluster_lease(
+    _container: &str,
+    _blob: &str,
+    _holder: String,
     _lease_namespace: Option<String>,
     _lease_name: Option<String>,
-    _lease_holder: Option<String>,
-) -> anyhow::Result<coordination::CoordinationGuard> {
+    _config: &coordination::CoordinationConfig,
+) -> anyhow::Result<Arc<dyn coordination::ClusterLease>> {
     anyhow::bail!(
         "--coordination requires the `coordination` build feature; \
          rebuild with `--features coordination` (or `--features csi`)"
