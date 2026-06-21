@@ -40,7 +40,7 @@ parameters:
   blobPathTemplate: {{ .blobPathTemplate | quote }}
   {{- end }}
   {{- if .newBlobFsType }}
-  newBlobFsType: {{ .newBlobFsType }}
+  newBlobFsType: {{ .newBlobFsType | quote }}
   {{- end }}
   {{- if .templateBlobFsType }}
   templateBlobFsType: {{ .templateBlobFsType | quote }}
@@ -86,7 +86,7 @@ parameters:
   blobPathTemplate: {{ .blobPathTemplate | quote }}
   {{- end }}
   {{- if .newBlobFsType }}
-  newBlobFsType: {{ .newBlobFsType }}
+  newBlobFsType: {{ .newBlobFsType | quote }}
   {{- end }}
   {{- if .templateBlobFsType }}
   templateBlobFsType: {{ .templateBlobFsType | quote }}
