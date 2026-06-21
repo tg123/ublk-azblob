@@ -243,7 +243,10 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
   `--cache-dir` via a `flock`-coordinated, crash-safe `.cache-budget` file, so a
   single noisy volume cannot fill a shared CSI node's cache disk. Each process
   evicts only its own clean pages and never touches a peer's cache files.
-- ✅ Cross-process clean-page sharing (`--cache-share-pages`): processes caching
+- ⚠️ Cross-process clean-page sharing (`--cache-share-pages`) — **implemented but
+  currently disabled in the shipped binary** (the flag is accepted but ignored;
+  every cache is single-process). Design, retained for a later iteration:
+  processes caching
   the same blob in one `--cache-dir` serve each other's clean pages off local
   disk via a `flock`-coordinated `.cache-index` (sibling to `.cache-budget`)
   mapping `(blob, page) → owner .dat + offset`. A read miss consults the index

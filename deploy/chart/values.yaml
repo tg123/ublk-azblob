@@ -68,9 +68,11 @@ node:
     # Cache page size in bytes (the local-disk cache granularity).
     pageSize: 1048576
 
-    # Cross-process clean-page sharing. When true, volumes on the node that
-    # cache the *same* blob serve each other's already-fetched clean pages
-    # directly off the shared cache directory (via a flock-coordinated
+    # Cross-process clean-page sharing. NOTE: currently a no-op — the node
+    # binary forces sharing OFF (the flag is accepted but ignored), so every
+    # volume's cache is single-process for now. When re-enabled, volumes on the
+    # node that cache the *same* blob would serve each other's already-fetched
+    # clean pages directly off the shared cache directory (via a flock-coordinated
     # `.cache-index`), avoiding redundant blob reads. Each volume still writes
     # only its own data file (copy-on-write on a dirtying write), so a write to
     # one volume never affects another. The node plugin gives each volume a
@@ -79,8 +81,8 @@ node:
 
     # Background cache warm-up: each volume prefetches its blob into the cache on
     # start (in the background; the device comes online immediately). Best for
-    # read-only / read-mostly datasets that fit the cache budget — combined with
-    # sharePages, the first volume warms the shared cache and peers serve from it.
+    # read-only / read-mostly datasets (e.g. an immutable snapshot golden image)
+    # that fit the cache budget.
     warmup: false
 
     # Cap in bytes for warm-up. 0 = auto (the cache byte budget when set, else the

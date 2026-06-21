@@ -254,7 +254,9 @@ enum Command {
 
         /// Enable cross-process clean-page sharing in the local-disk cache.
         ///
-        /// When set, processes that cache the **same blob** (same
+        /// **Currently disabled / no-op:** accepted but ignored (a warning is
+        /// logged) — every cache is single-process for now. When re-enabled,
+        /// processes that cache the **same blob** (same
         /// `--cache-blob-identity`) in a shared `--cache-dir` can serve each
         /// other's already-fetched *clean* pages directly off local disk via a
         /// `flock`-coordinated `.cache-index`, avoiding a redundant blob read.
@@ -541,11 +543,13 @@ async fn main() -> anyhow::Result<()> {
                     .clone()
                     .map(|s| sanitize_cache_component(&s))
                     .unwrap_or_else(|| default_name.clone());
-                // Cross-process page sharing is forced OFF for now: a snapshot
-                // read cache and a pre-upload write cache are both single-owner,
-                // so the cache never publishes to or reads from peers. The
-                // `--cache-share-pages` flag is accepted but ignored until the
-                // write-aware sharing path lands in a later iteration.
+                // Cross-process page sharing is forced OFF in the shipped binary
+                // for now: a snapshot read cache and a pre-upload write cache are
+                // both single-owner, so the cache never publishes to or reads
+                // from peers. The `.cache-index` sharing machinery (including the
+                // copy-on-write write path) is fully implemented but gated off
+                // here; `--cache-share-pages` is accepted but ignored, pending
+                // further correctness review before it is re-enabled.
                 if cache_share_pages {
                     warn!(
                         "--cache-share-pages is currently disabled (single-process cache only); ignoring"
@@ -589,8 +593,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 // Optional background cache warm-up: sequentially prefetch the
                 // blob into the cache so reads are served locally. Spawned
-                // detached so the device comes online immediately; reads go
-                // through the cache (peer-first), so it's sharing-aware.
+                // detached so the device comes online immediately. (Sharing is
+                // disabled, so warm-up populates only this process's own cache.)
                 if cache_warmup {
                     let limit = if cache_warmup_bytes > 0 {
                         cache_warmup_bytes

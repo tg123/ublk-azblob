@@ -181,7 +181,6 @@ All CLI flags have environment-variable equivalents:
 | `--container` | `AZURE_STORAGE_CONTAINER` |
 | `--blob` | `AZURE_STORAGE_BLOB` |
 | `--snapshot` | `AZURE_STORAGE_SNAPSHOT` |
-| `--read-only` | `UBLK_READ_ONLY` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
 | `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
@@ -252,6 +251,14 @@ total is crash-safe — entries for processes that died are pruned automatically
 
 ### Cross-process page sharing (`--cache-share-pages`)
 
+> **Currently disabled.** Cross-process page sharing is implemented (the
+> `.cache-index` machinery below) but **forced off in the shipped binary**:
+> `--cache-share-pages` / `UBLK_CACHE_SHARE_PAGES` are accepted but ignored (a
+> warning is logged), so every cache is single-process. Read caching for an
+> immutable snapshot and the pre-upload write cache are both single-owner and do
+> not need sharing. The description below documents the (gated-off) design; it is
+> expected to be re-enabled in a later iteration.
+
 With `--cache-share-pages` (or `UBLK_CACHE_SHARE_PAGES=1`), processes that cache
 the **same blob** in the same `--cache-dir` serve each other's clean pages off
 local disk instead of re-fetching from Azure. A shared `.cache-index` file
@@ -283,19 +290,16 @@ or the blob and is **not** stored in the local `.dat`, so a read-only blob that
 is never warmed keeps reading through to its source. With `--cache-warmup` (or
 `UBLK_CACHE_WARMUP=1`) the process instead **prefetches the blob into the cache
 on start**, sequentially, in the **background** (the device comes online
-immediately). Each prefetched page is stored locally as a clean, resident page
-(and, with `--cache-share-pages`, published to the shared index). Warm-up is
-**sharing-aware**: a page a live peer already caches is copied from the peer
-rather than re-fetched from Azure.
+immediately). Each prefetched page is stored locally as a clean, resident page.
+(While sharing is disabled, warm-up populates only this process's own cache.)
 
 Prefetch stops after `--cache-warmup-bytes` (or `UBLK_CACHE_WARMUP_BYTES`); `0`
 (the default) means auto — the cache byte budget (`--cache-max-bytes`) when set,
 otherwise the whole device. Warm-up is best for **read-only / read-mostly
-datasets that fit the cache budget** (e.g. a shared golden image): combine it
-with `--cache-share-pages` so the first volume warms the shared cache and every
-peer then serves locally. For large, write-heavy, or sparsely-accessed blobs,
-leave it off — lazy caching only fetches what's actually used. In CSI deployments
-toggle it via the Helm chart's `node.cache.warmup`.
+datasets that fit the cache budget** (e.g. an immutable snapshot golden image).
+For large, write-heavy, or sparsely-accessed blobs, leave it off — the cache
+only fetches what's actually used. In CSI deployments toggle it via the Helm
+chart's `node.cache.warmup`.
 
 ---
 

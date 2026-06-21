@@ -110,7 +110,7 @@ A single image is shared by the controller and node plugins.
 | `node.cache.hostPath` | Host directory used as the shared cache | `/var/lib/ublk-azblob/cache` |
 | `node.cache.maxBytes` | Max total cache bytes shared across volumes (0 = unlimited) | `0` |
 | `node.cache.pageSize` | Cache page size in bytes | `1048576` |
-| `node.cache.sharePages` | Share clean pages across volumes caching the same blob (cross-process page sharing) | `false` |
+| `node.cache.sharePages` | Share clean pages across volumes caching the same blob (cross-process page sharing). **Currently disabled / no-op** | `false` |
 | `node.cache.warmup` | Background cache warm-up: each volume prefetches its blob into the cache on start | `false` |
 | `node.cache.warmupBytes` | Cap in bytes for warm-up (0 = auto: the cache byte budget when set, else the whole device) | `0` |
 | `node.resources.limits.cpu` | Node CPU limit | `500m` |

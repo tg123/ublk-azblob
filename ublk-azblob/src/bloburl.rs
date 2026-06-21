@@ -1,9 +1,9 @@
 //! Parsing of a full Azure blob URL into its components.
 //!
-//! Used both by the CSI controller (to parse a StorageClass `templateBlobUrl`
-//! golden-image source) and by the standalone `run`/`test` path (to load a
-//! golden-image URL, e.g. from a file, for local testing). Kept feature-gate
-//! free so it is available without the `csi` feature.
+//! Used by the CSI controller (to parse a StorageClass `templateBlobUrl`
+//! golden-image source). This module is compiled only with the `csi` feature
+//! (its only caller), so it is gated behind `#[cfg(feature = "csi")]` in
+//! `main.rs`.
 
 use anyhow::Context as _;
 
