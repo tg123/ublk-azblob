@@ -66,7 +66,7 @@ struct Cli {
     /// **read-only** (all write/discard operations are rejected) *and* makes the
     /// local cache safe to reuse: there is no separate `--read-only` flag.
     /// May also be supplied as a `?snapshot=` query on `--blob-url`.
-    #[arg(long, env = "AZURE_STORAGE_SNAPSHOT")]
+    #[arg(long)]
     snapshot: Option<String>,
 
     /// Storage account key (base64).  Enables SharedKey auth mode.
