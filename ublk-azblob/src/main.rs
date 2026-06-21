@@ -14,6 +14,8 @@
 
 mod auth;
 mod backend;
+#[cfg(feature = "csi")]
+mod bloburl;
 #[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 mod coordination;
 #[cfg(feature = "csi")]
@@ -32,7 +34,7 @@ use backend::{
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -63,9 +65,10 @@ struct Cli {
 
     /// Target a specific blob *snapshot* (the `x-ms-snapshot` timestamp).
     ///
-    /// A snapshot is an immutable, point-in-time view of the blob.  Selecting a
-    /// snapshot implies read-only mode: the device is exposed read-only and all
-    /// write/discard operations are rejected.
+    /// A snapshot is an immutable, point-in-time view of the blob.  Because a
+    /// snapshot can never change, selecting one is what makes the device
+    /// **read-only** (all write/discard operations are rejected) *and* makes the
+    /// local cache safe to reuse: there is no separate `--read-only` flag.
     #[arg(long, env = "AZURE_STORAGE_SNAPSHOT")]
     snapshot: Option<String>,
 
@@ -155,21 +158,6 @@ enum Command {
         #[arg(long)]
         create: bool,
 
-        /// Expose the device read-only.
-        ///
-        /// The ublk device / NBD export is advertised read-only and every
-        /// write, discard, and write-zeroes request is rejected.  Implied when
-        /// `--snapshot` is set.
-        #[arg(
-            long,
-            env = "UBLK_READ_ONLY",
-            num_args = 0..=1,
-            default_value_t = false,
-            default_missing_value = "true",
-            value_parser = clap::builder::BoolishValueParser::new(),
-        )]
-        read_only: bool,
-
         /// Number of io_uring queues.
         #[arg(long, default_value = "1")]
         nr_queues: u16,
@@ -252,6 +240,75 @@ enum Command {
         /// Only used when `--cache-dir` is set.
         #[arg(long, default_value = "1048576", env = "UBLK_CACHE_PAGE_SIZE")]
         cache_page_size: u64,
+
+        /// Maximum total bytes of cached page data on local disk, **shared
+        /// across all processes** using the same `--cache-dir` (0 = unlimited).
+        ///
+        /// When set, processes sharing the cache directory enforce one node-wide
+        /// LRU byte budget: clean (already-flushed) pages are evicted to stay
+        /// within the limit, so a single noisy volume cannot fill the disk.
+        /// Dirty (unflushed) pages are never evicted.  Only used when
+        /// `--cache-dir` is set.
+        #[arg(long, default_value = "0", env = "UBLK_CACHE_MAX_BYTES")]
+        cache_max_bytes: u64,
+
+        /// Enable cross-process clean-page sharing in the local-disk cache.
+        ///
+        /// **Currently disabled / no-op:** accepted but ignored (a warning is
+        /// logged) — every cache is single-process for now. When re-enabled,
+        /// processes that cache the **same blob** (same
+        /// `--cache-blob-identity`) in a shared `--cache-dir` can serve each
+        /// other's already-fetched *clean* pages directly off local disk via a
+        /// `flock`-coordinated `.cache-index`, avoiding a redundant blob read.
+        /// Each cache still writes only its own data file (copy-on-write on a
+        /// dirtying write), so the single-writer-per-file invariant holds.
+        /// Requires a per-instance `--cache-instance` so peers have distinct
+        /// data files.  Only used when `--cache-dir` is set.
+        #[arg(
+            long,
+            env = "UBLK_CACHE_SHARE_PAGES",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
+        cache_share_pages: bool,
+
+        /// Shared identity of the blob this cache mirrors, used to match peers
+        /// for `--cache-share-pages`.  Defaults to the container/blob.  Set it to
+        /// a common value (e.g. a golden-image id) across volumes that should
+        /// share pages.  Only used when `--cache-dir` is set.
+        #[arg(long, env = "UBLK_CACHE_BLOB_IDENTITY")]
+        cache_blob_identity: Option<String>,
+
+        /// Per-instance cache file base name, making each cache's data file
+        /// unique within a shared `--cache-dir`.  Defaults to the container/blob.
+        /// Must be stable across restarts of the same volume (so dirty pages are
+        /// recovered) and unique per volume when `--cache-share-pages` is set.
+        /// Only used when `--cache-dir` is set.
+        #[arg(long, env = "UBLK_CACHE_INSTANCE")]
+        cache_instance: Option<String>,
+
+        /// Warm the local-disk cache on start by sequentially prefetching the
+        /// blob into it. Runs in the background (does not delay the device coming
+        /// online) and is sharing-aware (pages a live peer already caches are
+        /// fetched from the peer, not Azure). Only used when `--cache-dir` is set;
+        /// best for read-only / read-mostly datasets that fit the cache budget.
+        #[arg(
+            long,
+            env = "UBLK_CACHE_WARMUP",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
+        cache_warmup: bool,
+
+        /// Cap in bytes for `--cache-warmup`. `0` = auto: the cache byte budget
+        /// (`--cache-max-bytes`) when set, otherwise the whole device. Prefetch
+        /// stops once this many bytes from offset 0 have been scanned.
+        #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_BYTES")]
+        cache_warmup_bytes: u64,
 
         /// Idle flush timeout in seconds: automatically flush dirty pages after N
         /// seconds of write inactivity.  Set to 0 to disable idle flushing.
@@ -362,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
     // The endpoint *template* may contain a `%s` placeholder for the account
     // (subdomain-style, e.g. `http://%s.blob.localhost:10000/`). The CSI driver
     // keeps the template verbatim and substitutes `%s` per volume in
@@ -387,7 +445,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             size,
             create,
-            read_only,
             nr_queues,
             queue_depth,
             id,
@@ -401,22 +458,28 @@ async fn main() -> anyhow::Result<()> {
             ref lease_holder,
             ref cache_dir,
             cache_page_size,
+            cache_max_bytes,
+            cache_share_pages,
+            ref cache_blob_identity,
+            ref cache_instance,
+            cache_warmup,
+            cache_warmup_bytes,
             idle_flush_secs,
             force_flush_timeout_secs,
             flush_io_timeout_secs,
             ref nbd,
         } => {
-            // A snapshot is immutable, so selecting one forces read-only mode.
-            let read_only = read_only || cli.snapshot.is_some();
+            // Read-only is derived solely from selecting a snapshot: a snapshot
+            // is immutable, so the device is exposed read-only and its cache is
+            // safe to reuse. There is no separate read-only flag.
+            let read_only = cli.snapshot.is_some();
             if read_only {
-                info!("read-only mode: writes, discards, and creation are disabled");
+                info!("snapshot selected: read-only mode (writes, discards, creation disabled)");
             }
             let azure_backend = build_azure_backend(&cli, &endpoint)?;
             if create {
                 if read_only {
-                    anyhow::bail!(
-                        "--create cannot be used in read-only mode (--read-only/--snapshot)"
-                    );
+                    anyhow::bail!("--create cannot be used against a snapshot (read-only)");
                 }
                 info!(size, "creating page blob");
                 azure_backend
@@ -458,20 +521,49 @@ async fn main() -> anyhow::Result<()> {
 
             // Optional local-disk cache layer (memory → local disk → blob).
             let backend: Arc<dyn BlobBackend> = if let Some(dir) = cache_dir.clone() {
+                // Default the blob identity and per-instance name to the
+                // container/blob.
+                let default_name =
+                    cache_file_name(&cli.container, cli.blob.as_deref().unwrap_or_default());
+                let blob_identity = cache_blob_identity
+                    .clone()
+                    .map(|s| sanitize_cache_component(&s))
+                    .unwrap_or_else(|| default_name.clone());
+                let name = cache_instance
+                    .clone()
+                    .map(|s| sanitize_cache_component(&s))
+                    .unwrap_or_else(|| default_name.clone());
+                // Cross-process page sharing is forced OFF in the shipped binary
+                // for now: a snapshot read cache and a pre-upload write cache are
+                // both single-owner, so the cache never publishes to or reads
+                // from peers. The `.cache-index` sharing machinery (including the
+                // copy-on-write write path) is fully implemented but gated off
+                // here; `--cache-share-pages` is accepted but ignored, pending
+                // further correctness review before it is re-enabled.
+                if cache_share_pages {
+                    warn!(
+                        "--cache-share-pages is currently disabled (single-process cache only); ignoring"
+                    );
+                }
+                let share_pages = false;
                 info!(
                     cache_dir = %dir.display(),
                     cache_page_size,
+                    cache_max_bytes,
+                    cache_share_pages = share_pages,
+                    blob_identity = %blob_identity,
+                    name = %name,
                     "local-disk cache enabled"
                 );
                 let (cache, recovered_dirty) = FileCacheBackend::open(
                     backend,
                     FileCacheConfig {
                         dir,
-                        name: cache_file_name(
-                            &cli.container,
-                            cli.blob.as_deref().unwrap_or_default(),
-                        ),
+                        name,
                         page_size: cache_page_size,
+                        max_bytes: cache_max_bytes,
+                        blob_identity,
+                        share_pages,
                     },
                     actual_size,
                 )
@@ -489,8 +581,33 @@ async fn main() -> anyhow::Result<()> {
                         .await
                         .context("flush recovered dirty cache pages")?;
                 }
+                // Optional background cache warm-up: sequentially prefetch the
+                // blob into the cache so reads are served locally. Spawned
+                // detached so the device comes online immediately. (Sharing is
+                // disabled, so warm-up populates only this process's own cache.)
+                if cache_warmup {
+                    let limit = if cache_warmup_bytes > 0 {
+                        cache_warmup_bytes
+                    } else if cache_max_bytes > 0 {
+                        cache_max_bytes
+                    } else {
+                        actual_size
+                    }
+                    .min(actual_size);
+                    let warm_backend = cache.clone();
+                    info!(
+                        warmup_limit_bytes = limit,
+                        "cache warm-up started (background)"
+                    );
+                    tokio::spawn(async move {
+                        warmup_cache(warm_backend, actual_size, cache_page_size, limit).await;
+                    });
+                }
                 cache
             } else {
+                if cache_warmup {
+                    warn!("--cache-warmup ignored: requires --cache-dir");
+                }
                 backend
             };
 
@@ -794,15 +911,57 @@ async fn acquire_coordination(
 /// fixed alphabet (alphanumerics plus `-` and `_`) keeps the cache files inside
 /// the chosen `--cache-dir` and prevents path traversal (e.g. `..`).
 fn cache_file_name(container: &str, blob: &str) -> String {
-    let mut name = String::with_capacity(container.len() + blob.len() + 1);
-    for ch in format!("{container}-{blob}").chars() {
+    sanitize_cache_component(&format!("{container}-{blob}"))
+}
+
+/// Background cache warm-up: sequentially populate `[0, limit_bytes)` of the
+/// device through `backend` (the cache layer) so those pages become resident
+/// locally — served from a peer when one already holds them, else fetched from
+/// the blob and stored as clean pages in the local cache.
+///
+/// Best-effort: a read error stops the warm-up (the device keeps serving on
+/// demand). Yields between pages so it doesn't starve live I/O.
+async fn warmup_cache(
+    backend: Arc<dyn BlobBackend>,
+    dev_size: u64,
+    page_size: u64,
+    limit_bytes: u64,
+) {
+    let limit = limit_bytes.min(dev_size);
+    let mut offset = 0u64;
+    let mut warmed = 0u64;
+    while offset < limit {
+        let len = page_size.min(dev_size - offset);
+        match backend.prefetch(offset, len).await {
+            Ok(()) => warmed += len,
+            Err(err) => {
+                warn!(offset, %err, "cache warm-up read failed; stopping early");
+                break;
+            }
+        }
+        offset += len;
+        tokio::task::yield_now().await;
+    }
+    info!(
+        warmed_bytes = warmed,
+        limit_bytes = limit,
+        "cache warm-up complete"
+    );
+}
+
+/// Sanitize a single string to the cache file-name alphabet (alphanumerics plus
+/// `-` and `_`), so an operator-supplied `--cache-instance` / blob identity
+/// stays inside `--cache-dir` and cannot traverse paths.
+fn sanitize_cache_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            name.push(ch);
+            out.push(ch);
         } else {
-            name.push('_');
+            out.push('_');
         }
     }
-    name
+    out
 }
 
 fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
@@ -895,4 +1054,78 @@ async fn run_smoke_test(backend: Arc<dyn BlobBackend>, size: u64) -> anyhow::Res
 
     info!("smoke test PASSED ✓");
     Ok(())
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::sync::Mutex;
+
+    /// Records every `read(offset, len)` so a test can assert the warm-up's
+    /// access pattern.
+    #[derive(Default)]
+    struct RecordingBackend {
+        size: u64,
+        reads: Mutex<Vec<(u64, u64)>>,
+    }
+
+    #[async_trait]
+    impl BlobBackend for RecordingBackend {
+        async fn create(&self, _size: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.lock().unwrap().push((offset, len));
+            Ok(Bytes::from(vec![0u8; len as usize]))
+        }
+        async fn write(&self, _offset: u64, _data: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn clear(&self, _offset: u64, _len: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            Ok(self.size)
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_scans_whole_device_in_page_chunks() {
+        let b = Arc::new(RecordingBackend {
+            size: 8192,
+            ..Default::default()
+        });
+        warmup_cache(b.clone(), 8192, 4096, 8192).await;
+        assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (4096, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_stops_at_limit() {
+        let b = Arc::new(RecordingBackend {
+            size: 8192,
+            ..Default::default()
+        });
+        // limit = one page
+        warmup_cache(b.clone(), 8192, 4096, 4096).await;
+        assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_last_chunk_is_clamped_to_device() {
+        let b = Arc::new(RecordingBackend {
+            size: 6144,
+            ..Default::default()
+        });
+        // limit > dev_size is clamped; last chunk is the partial tail.
+        warmup_cache(b.clone(), 6144, 4096, u64::MAX).await;
+        assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (4096, 2048)]);
+    }
 }

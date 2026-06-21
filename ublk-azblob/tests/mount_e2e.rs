@@ -29,7 +29,7 @@
 //! ```
 //!
 //! A second test, [`mount_read_only`](fn.mount_read_only.html), exercises
-//! `run --read-only`: it asserts the kernel marks `/dev/ublkbN` read-only,
+//! `run --snapshot`: it snapshots the blob, asserts the kernel marks `/dev/ublkbN` read-only,
 //! verifies the data is still readable, and confirms a write to the read-only
 //! mount fails without mutating the backing blob.
 //!
@@ -71,6 +71,9 @@ struct DeviceSpec {
     container: String,
     blob: String,
     cache_dir: Option<PathBuf>,
+    /// Shared local-disk cache byte budget (`--cache-max-bytes`); `0` (the
+    /// default) means unlimited.  Only meaningful when `cache_dir` is `Some`.
+    cache_max_bytes: u64,
     /// When true the device is started with all automatic flushing disabled
     /// (`--idle-flush-secs 0 --force-flush-timeout-secs 0`), so the only thing
     /// that can persist a buffered write is an explicit flush or the
@@ -152,14 +155,57 @@ fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
 /// `stop_device`), so the zombie-process lint does not apply.
 #[allow(clippy::zombie_processes)]
 fn start_device(spec: &DeviceSpec, create: bool) -> Child {
-    start_device_opts(spec, create, false)
+    start_device_opts(spec, create, None)
 }
 
-/// Like [`start_device`] but lets the caller expose the device read-only
-/// (`run --read-only`).  `create` and `read_only` are mutually exclusive at the
-/// CLI level, so callers pass `create=false` when `read_only=true`.
+/// Create a snapshot of the test blob with the Azure CLI (`az storage blob
+/// snapshot`) and return its `x-ms-snapshot` id (used to bring the device back
+/// up read-only, since a snapshot is the only way a device is exposed
+/// read-only).
+fn create_snapshot(spec: &DeviceSpec) -> String {
+    let account = env_or("AZURE_STORAGE_ACCOUNT", DEFAULT_ACCOUNT);
+    let key = env_or("AZURE_STORAGE_KEY", DEFAULT_KEY);
+    let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
+    log(&format!("creating snapshot of blob {} via az", spec.blob));
+    let out = Command::new("az")
+        .args([
+            "storage",
+            "blob",
+            "snapshot",
+            "--account-name",
+            &account,
+            "--account-key",
+            &key,
+            "--blob-endpoint",
+            &endpoint,
+            "--container-name",
+            &spec.container,
+            "--name",
+            &spec.blob,
+            "--query",
+            "snapshot",
+            "--output",
+            "tsv",
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn `az`: {e}"));
+    assert!(
+        out.status.success(),
+        "az storage blob snapshot failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!id.is_empty(), "az returned an empty snapshot id");
+    log(&format!("created snapshot {id}"));
+    id
+}
+
+/// Like [`start_device`] but lets the caller bring the device up against a blob
+/// `snapshot` (`run --snapshot <id>`), which exposes it read-only.  `create` and
+/// a snapshot are mutually exclusive (a snapshot is immutable), so callers pass
+/// `create=false` when supplying a snapshot.
 #[allow(clippy::zombie_processes)]
-fn start_device_opts(spec: &DeviceSpec, create: bool, read_only: bool) -> Child {
+fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) -> Child {
     let dev = spec.dev_path();
     log(&format!(
         "starting ublk device {dev} ({}{}{})",
@@ -168,7 +214,10 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, read_only: bool) -> Child 
         } else {
             "reuse existing blob"
         },
-        if read_only { ", --read-only" } else { "" },
+        match snapshot {
+            Some(s) => format!(", --snapshot {s}"),
+            None => String::new(),
+        },
         match &spec.cache_dir {
             Some(d) => format!(", cache_dir={}", d.display()),
             None => String::new(),
@@ -187,11 +236,18 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, read_only: bool) -> Child 
     if create {
         cmd.arg("--create");
     }
-    if read_only {
-        cmd.arg("--read-only");
+    if let Some(s) = snapshot {
+        // `--snapshot` is a top-level option (parsed before the subcommand), so
+        // pass it via its env var — like account/container/blob — rather than as
+        // a `run` argument, where clap would reject it.
+        cmd.env("AZURE_STORAGE_SNAPSHOT", s);
     }
     if let Some(dir) = &spec.cache_dir {
         cmd.arg("--cache-dir").arg(dir);
+        if spec.cache_max_bytes > 0 {
+            cmd.arg("--cache-max-bytes")
+                .arg(spec.cache_max_bytes.to_string());
+        }
     }
     if spec.disable_auto_flush {
         // Disable both the idle and the force-flush timers so a buffered write
@@ -309,6 +365,7 @@ fn mount_roundtrip() {
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB),
         cache_dir: None,
+        cache_max_bytes: 0,
         disable_auto_flush: false,
     });
 }
@@ -339,6 +396,43 @@ fn mount_roundtrip_file_cache() {
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-fcache", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: Some(cache_dir.clone()),
+        cache_max_bytes: 0,
+        disable_auto_flush: false,
+    });
+    let _ = fs::remove_dir_all(&cache_dir);
+}
+
+/// Same round-trip cycle as `mount_roundtrip_file_cache`, but with a *capped*
+/// local-disk cache (`--cache-max-bytes`) that is much smaller than the data
+/// written.  This forces the LRU eviction path to fire under a real ublk
+/// workload: clean pages are punched out of the cache file while we keep
+/// writing, yet every file must still flush to the page blob and read back
+/// correctly after a remount with a fresh cache (i.e. via read-through from the
+/// blob, not from cached pages that were evicted).
+#[test]
+fn mount_roundtrip_file_cache_budget() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_roundtrip_file_cache_budget: requires root and a \
+             loaded ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let cache_dir = tempdir("ublk-azblob-cache-budget");
+    run_mount_roundtrip(DeviceSpec {
+        // Distinct device id, container and blob (see other tests' comments).
+        // 44 avoids mount_read_only's 42 and graceful_shutdown's 43.
+        dev_id: "44".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!(
+            "{}-fcache-budget",
+            env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)
+        ),
+        cache_dir: Some(cache_dir.clone()),
+        // 8 MiB budget while the test writes well over that (up to ~4 MiB per
+        // file across NUM_FILES files), so eviction is exercised.
+        cache_max_bytes: 8 * 1024 * 1024,
         disable_auto_flush: false,
     });
     let _ = fs::remove_dir_all(&cache_dir);
@@ -414,12 +508,12 @@ fn run_mount_roundtrip(spec: DeviceSpec) {
     log("mount e2e PASSED ✓");
 }
 
-/// e2e for read-only mode (`run --read-only`) over the kernel ublk path.
+/// e2e for read-only mode (`run --snapshot`) over the kernel ublk path.
 ///
 /// Cycle:
 ///   1. provision the device writable, make an ext4 filesystem, write random
 ///      files, record their checksums, flush and tear the device down
-///   2. bring the device back up over the *same* blob with `--read-only` and
+///   2. snapshot the blob and bring the device back up against that snapshot, then
 ///      assert:
 ///      * the kernel marks `/dev/ublkbN` read-only
 ///        (`/sys/block/ublkbN/ro == 1`, courtesy of `UBLK_ATTR_READ_ONLY`)
@@ -444,6 +538,7 @@ fn mount_read_only() {
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-ro", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
+        cache_max_bytes: 0,
         disable_auto_flush: false,
     };
     let dev = spec.dev_path();
@@ -472,8 +567,10 @@ fn mount_read_only() {
     run("umount", &[mnt.to_str().unwrap()]);
     stop_device(&dev, child);
 
-    // ── Phase 2: reopen read-only and assert the device rejects writes ────────
-    let child = start_device_opts(&spec, false, true);
+    // ── Phase 2: snapshot the blob, then reopen that snapshot (read-only) ─────
+    // A snapshot is the only way the device is exposed read-only.
+    let snapshot = create_snapshot(&spec);
+    let child = start_device_opts(&spec, false, Some(&snapshot));
 
     // The kernel exposes the read-only attribute via /sys/block/<dev>/ro.
     let ro_attr = format!("/sys/block/ublkb{}/ro", spec.dev_id);
@@ -563,6 +660,7 @@ fn graceful_shutdown_flush() {
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-shutdown", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
+        cache_max_bytes: 0,
         // The whole point: only the shutdown flush may persist the write.
         disable_auto_flush: true,
     };
@@ -663,6 +761,7 @@ fn mount_fsck() {
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-fsck", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
+        cache_max_bytes: 0,
         disable_auto_flush: false,
     };
     let dev = spec.dev_path();
