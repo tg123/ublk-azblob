@@ -126,6 +126,7 @@ storageClass:
     blobPathTemplate: '${pvc.namespace}/volumes/${pv.name}'
     
     # Filesystem type to format a freshly-provisioned blob with: ext4, xfs, btrfs, etc.
+    # (the parameter may also be spelled `newBlobFsType`).
     newBlobFormatType: ext4
 
     # Expose the volume read-only ("true"/"false"). The device rejects every
