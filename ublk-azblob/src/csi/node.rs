@@ -183,11 +183,12 @@ impl NodeService {
 /// the per-volume endpoint template, account, container, blob and optional
 /// read-only snapshot.
 ///
-/// The endpoint's `%s` account placeholder (subdomain style) is substituted
-/// here so the child receives a fully-resolved, `parse_blob_url`-parseable URL:
-/// when the endpoint host already encodes the account (`*.blob.*`) the path is
-/// just `/<container>/<blob>`; otherwise (path-style / Azurite) the account is
-/// the leading path segment so the account round-trips.
+/// The endpoint's `%s` account placeholder is substituted here so the child
+/// receives a fully-resolved, `parse_blob_url`-parseable URL: when the endpoint
+/// host already encodes the account (subdomain / production style, e.g.
+/// `<account>.blob.core.windows.net` or a custom `<account>.host...`) the path
+/// is just `/<container>/<blob>`; for path-style hosts (IP / single-label) the
+/// account is the leading path segment so it round-trips.
 fn child_blob_url(
     endpoint: &str,
     account: &str,
@@ -197,9 +198,12 @@ fn child_blob_url(
 ) -> String {
     let resolved = endpoint.replace("%s", account);
     let base = resolved.trim_end_matches('/');
-    let host_has_account = base.contains(".blob.");
+    let account_in_host = azure_core::http::Url::parse(&format!("{base}/"))
+        .ok()
+        .and_then(|u| u.host_str().map(crate::bloburl::is_subdomain_host))
+        .unwrap_or(false);
     let account_in_path = base.split('/').any(|seg| seg == account);
-    let mut url = if host_has_account || account_in_path {
+    let mut url = if account_in_host || account_in_path {
         format!("{base}/{container}/{blob}")
     } else {
         format!("{base}/{account}/{container}/{blob}")
@@ -597,12 +601,11 @@ mod tests {
     }
 
     #[test]
-    fn child_blob_url_k8s_e2e_path_style_endpoint() {
-        // Mirrors the k8s e2e endpoint: a `%s` account placeholder in the path
-        // of a DNS host (Azurite runs with --disableProductStyleUrl, so the
-        // account is read from the path).
+    fn child_blob_url_k8s_e2e_subdomain_endpoint() {
+        // Mirrors the k8s e2e endpoint: a `%s` account placeholder in the host
+        // (production/subdomain style — account read from the host).
         let url = child_blob_url(
-            "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/%s",
+            "http://%s.azurite.kube-system.svc.cluster.local:10000/",
             "devstoreaccount1",
             "ublk-azblob-volumes",
             "default/volumes/pvc-abc",
@@ -610,7 +613,7 @@ mod tests {
         );
         assert_eq!(
             url,
-            "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/devstoreaccount1/ublk-azblob-volumes/default/volumes/pvc-abc"
+            "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/ublk-azblob-volumes/default/volumes/pvc-abc"
         );
         let r = parse_blob_url(&url).unwrap();
         assert_eq!(r.account, "devstoreaccount1");

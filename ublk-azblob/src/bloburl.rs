@@ -78,9 +78,9 @@ pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
         })
         .unwrap_or_default();
 
-    // Azure subdomain style: `<account>.blob.<suffix>` → account is the first
-    // host label, the path is `<container>/<blob...>`.
-    let azure_subdomain = host.contains(".blob.");
+    // Subdomain/production style: `<account>.<host-suffix>` → account is the
+    // first host label, the path is `<container>/<blob...>`.
+    let azure_subdomain = is_subdomain_host(&host);
     let (service_url, account, container, blob) = if azure_subdomain {
         let account = host.split('.').next().unwrap_or("").to_string();
         if segments.len() < 2 {
@@ -118,6 +118,20 @@ pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
         snapshot,
         sas,
     })
+}
+
+/// Whether `host` is subdomain / *production* style — i.e. the storage account
+/// is the first host label (`<account>.blob.core.windows.net`, or a custom
+/// `<account>.host...` such as an Azurite `<account>.azurite.<ns>...`).
+///
+/// Path-style hosts — where the account is instead the first URL *path* segment
+/// — are IP literals and single-label hosts (e.g. Azurite's `127.0.0.1` or
+/// `azurite`). This mirrors the Azure SDK / Azurite "product style URL"
+/// detection (account from host unless the host is an IP/bare name).
+pub fn is_subdomain_host(host: &str) -> bool {
+    let is_ip =
+        host.parse::<std::net::IpAddr>().is_ok() || (host.starts_with('[') && host.ends_with(']'));
+    !is_ip && host.contains('.')
 }
 
 #[cfg(test)]
@@ -167,6 +181,36 @@ mod tests {
         // A bare query without a signature is not treated as a SAS token.
         let r = parse_blob_url("https://myacct.blob.core.windows.net/c/b?foo=bar").unwrap();
         assert_eq!(r.sas, None);
+    }
+
+    #[test]
+    fn parse_blob_url_custom_subdomain_host() {
+        // A non-`.blob.` multi-label host (e.g. an Azurite custom subdomain) is
+        // production style: the account is the first host label.
+        let r = parse_blob_url(
+            "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/c/blob/path",
+        )
+        .unwrap();
+        assert_eq!(
+            r.service_url,
+            "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000"
+        );
+        assert_eq!(r.account, "devstoreaccount1");
+        assert_eq!(r.container, "c");
+        assert_eq!(r.blob, "blob/path");
+    }
+
+    #[test]
+    fn is_subdomain_host_classification() {
+        assert!(is_subdomain_host("myacct.blob.core.windows.net"));
+        assert!(is_subdomain_host(
+            "devstoreaccount1.azurite.kube-system.svc.cluster.local"
+        ));
+        // IP literals and single-label hosts are path-style.
+        assert!(!is_subdomain_host("127.0.0.1"));
+        assert!(!is_subdomain_host("azurite"));
+        assert!(!is_subdomain_host("localhost"));
+        assert!(!is_subdomain_host("[::1]"));
     }
 
     #[test]

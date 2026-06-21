@@ -240,12 +240,10 @@ fn test_basic_mount_and_recovery() {
 
     // ── Deploy CSI driver using Helm ──────────────────────────────────────────
     // Azurite runs as the docker-compose `azurite` service (shared with the
-    // mount/NBD e2e); the CSI pods reach it via the hostAlias in e2e.values.yaml
-    // (`devstoreaccount1.azurite.<ns>...` → its fixed compose IP). The endpoint
-    // is path-style (`%s` account placeholder in the path) — Azurite runs with
-    // `--disableProductStyleUrl` so it always reads the account from the path —
-    // so it collapses into a single parseable `AZURE_STORAGE_BLOB_URL`.
-    let endpoint = format!("http://devstoreaccount1.azurite.{NS}.svc.cluster.local:10000/%s");
+    // mount/NBD e2e); the CSI pods reach it subdomain-style via hostAliases (see
+    // e2e.values.yaml) pointing at its fixed compose IP. Subdomain form keeps the
+    // SharedKey canonicalization single-account (no /account/account double path).
+    let endpoint = format!("http://%s.azurite.{NS}.svc.cluster.local:10000/");
     deploy_csi_driver_helm(&repo, &here, &endpoint);
 
     // ── Create secret in default namespace for PVC provisioning ───────────────
