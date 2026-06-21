@@ -108,7 +108,10 @@ jobs:
 
       - name: Normalize cache ownership
         if: always()
-        run: sudo chown -R "$(id -u):$(id -g)" .cargo-home target || true
+        run: |
+          if [ -e .cargo-home ] || [ -e target ]; then
+            sudo chown -R "$(id -u):$(id -g)" .cargo-home target
+          fi
 
       - name: Publish results to job summary
         if: always()
