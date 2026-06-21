@@ -128,6 +128,8 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.container` | Container name (supports variables) | `ublk-azblob-volumes` |
 | `storageClass.parameters.blobPathTemplate` | Blob path template | `${pvc.namespace}/volumes/${pv.name}` |
 | `storageClass.parameters.newBlobFsType` | Filesystem type to format a freshly-provisioned blob | `ext4` |
+| `storageClass.parameters.newBlobMkfsOptions` | Extra options passed to `mkfs` when formatting a freshly-provisioned blob (comma/space-separated) | `""` |
+| `storageClass.parameters.mountOptions` | Extra mount options applied when mounting the device (comma/space-separated) | `""` |
 | `storageClass.parameters.readOnly` | Expose the volume read-only (`"true"`/`"false"`) | `""` |
 | `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS and/or `?snapshot=`). Read-only (or a snapshot URL) ⇒ mount directly (no copy, no lock/lease); read-write ⇒ copy into the per-PVC blob and skip format | `""` |
 

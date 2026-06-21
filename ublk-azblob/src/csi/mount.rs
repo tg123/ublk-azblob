@@ -306,24 +306,29 @@ pub fn has_filesystem(dev: &str) -> bool {
 }
 
 /// Create a filesystem of type `fs_type` on `dev` (only call on a blank device).
-pub fn mkfs(dev: &str, fs_type: &str) -> anyhow::Result<()> {
+///
+/// `extra_options` are appended verbatim after the built-in defaults, letting a
+/// StorageClass pass filesystem-specific `mkfs` flags.
+pub fn mkfs(dev: &str, fs_type: &str, extra_options: &[String]) -> anyhow::Result<()> {
     let mkfs_bin = format!("mkfs.{fs_type}");
     info!(dev, fs_type, "creating filesystem");
     // `-F` forces creation without interactive confirmation; `-E nodiscard`
     // avoids a full TRIM pass (faster, and discard maps onto Clear Pages).
     // For ext4, use lazy_itable_init and lazy_journal_init to speed up mkfs
     // on large devices (avoids writing zeros to entire inode tables and journal).
-    let args: Vec<&str> = if fs_type == "ext4" || fs_type == "ext3" || fs_type == "ext2" {
+    let mut args: Vec<String> = if fs_type == "ext4" || fs_type == "ext3" || fs_type == "ext2" {
         vec![
-            "-F",
-            "-E",
-            "nodiscard,lazy_itable_init=1,lazy_journal_init=1",
-            dev,
+            "-F".into(),
+            "-E".into(),
+            "nodiscard,lazy_itable_init=1,lazy_journal_init=1".into(),
         ]
     } else {
-        vec![dev]
+        Vec::new()
     };
-    run(&mkfs_bin, &args)
+    args.extend(extra_options.iter().cloned());
+    args.push(dev.into());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&mkfs_bin, &arg_refs)
 }
 
 /// Mount `dev` at `target`, creating the mount point if needed.

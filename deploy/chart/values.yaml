@@ -128,6 +128,15 @@ storageClass:
     # Filesystem type to format a freshly-provisioned blob with: ext4, xfs, btrfs, etc.
     newBlobFsType: ext4
 
+    # Extra options passed to `mkfs` when formatting a freshly-provisioned blob.
+    # Filesystem-specific; comma- or space-separated. Ignored for template/copied
+    # or already-formatted blobs.
+    # newBlobMkfsOptions: "-b 4096"
+
+    # Extra mount options applied when the node mounts the device, in addition to
+    # any the PVC/StorageClass already carries. Comma- or space-separated.
+    # mountOptions: "noatime,nodiratime"
+
     # Expose the volume read-only ("true"/"false"). The device rejects every
     # write/discard and is mounted read-only; the blob must already be formatted.
     # readOnly: "true"

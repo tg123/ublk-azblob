@@ -42,6 +42,12 @@ parameters:
   {{- if .newBlobFsType }}
   newBlobFsType: {{ .newBlobFsType }}
   {{- end }}
+  {{- if .newBlobMkfsOptions }}
+  newBlobMkfsOptions: {{ .newBlobMkfsOptions | quote }}
+  {{- end }}
+  {{- if .mountOptions }}
+  mountOptions: {{ .mountOptions | quote }}
+  {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}
   {{- end }}
@@ -84,6 +90,12 @@ parameters:
   {{- end }}
   {{- if .newBlobFsType }}
   newBlobFsType: {{ .newBlobFsType }}
+  {{- end }}
+  {{- if .newBlobMkfsOptions }}
+  newBlobMkfsOptions: {{ .newBlobMkfsOptions | quote }}
+  {{- end }}
+  {{- if .mountOptions }}
+  mountOptions: {{ .mountOptions | quote }}
   {{- end }}
   {{- if .readOnly }}
   readOnly: {{ .readOnly | quote }}

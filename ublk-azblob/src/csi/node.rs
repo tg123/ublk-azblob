@@ -224,6 +224,30 @@ impl Node for NodeService {
                 None => {}
             }
         }
+        // Extra mount options from the StorageClass `mountOptions` parameter, in
+        // addition to whatever the CSI volume capability carries. Comma- or
+        // whitespace-separated.
+        if let Some(opts) = req.volume_context.get("mountOptions") {
+            mount_flags.extend(
+                opts.split([',', ' ', '\t', '\n'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        // Extra mkfs options from the StorageClass `newBlobMkfsOptions` parameter,
+        // applied only when the node formats a freshly-provisioned blob.
+        let mkfs_options: Vec<String> = req
+            .volume_context
+            .get("newBlobMkfsOptions")
+            .map(|opts| {
+                opts.split([',', ' ', '\t', '\n'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let size: u64 = req
             .volume_context
@@ -341,7 +365,7 @@ impl Node for NodeService {
                          a read-only/snapshot volume must already be formatted"
                     );
                 } else {
-                    mount::mkfs(&device, &fs_type)?;
+                    mount::mkfs(&device, &fs_type, &mkfs_options)?;
                 }
                 mount::mount(&device, &target, &fs_type, &mount_flags, readonly)?;
                 Ok(())
