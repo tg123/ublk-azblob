@@ -47,8 +47,9 @@ services:
         cargo build --release --no-default-features --features ublk -p ublk-azblob
         bash tests/bench/bench.sh
 
-# The extended e2e runner service still mounts /kubeconfig and joins the shared
-# bridge network, so keep the same top-level resource names here.
+# The extended e2e runner service still mounts the `kubeconfig` volume at
+# /kubeconfig and joins the shared bridge network, so keep the same top-level
+# resource names here.
 volumes:
   kubeconfig:
 
