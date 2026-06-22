@@ -342,6 +342,9 @@ stringData:
     // ── Test 3: Two disks mounted on the same node, no conflict ────────────────
     test_multi_disk_same_node(&here);
 
+    // ── Test 4: Online volume expansion (resize a PVC, grow the filesystem) ─────
+    test_volume_expansion(&here);
+
     log("k8s PVC e2e PASSED ✓");
 }
 
@@ -875,6 +878,219 @@ spec:
             "azblob-pvc-multi-b",
             "--wait=true",
         ],
+    );
+}
+
+/// Test 4: volume expansion.  Create a PVC, write data + record the filesystem
+/// size, then grow the PVC (`kubectl patch`).  The csi-resizer drives
+/// ControllerExpandVolume (which resizes the backing page blob); a fresh reader
+/// pod remounts the PVC at the new size, kubelet calls NodeExpandVolume which
+/// grows the filesystem with `resize2fs`.  We assert both that the original data
+/// survived and that the filesystem capacity actually grew.
+fn test_volume_expansion(_here: &Path) {
+    log("TEST 4: volume expansion (resize PVC, grow filesystem)");
+
+    let old_size = "256Mi";
+    let new_size = "512Mi";
+
+    let pvc = format!(
+        r#"apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azblob-pvc-expand
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: azblob-ublk
+  resources:
+    requests:
+      storage: {old_size}
+"#
+    );
+    log(&format!("creating PVC azblob-pvc-expand ({old_size})"));
+    kubectl_apply_stdin(&pvc);
+
+    // Writer: record the filesystem's total 1K-block count *before* the resize,
+    // alongside a checksummed payload.
+    let writer_yaml = r#"apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azblob-expand-writer
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: azblob-expand-writer
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "writing payload + recording fs size on $(hostname)"
+              dd if=/dev/urandom of=/data/payload bs=1M count=8
+              sha256sum /data/payload | sed 's# .*# /data/payload#' > /data/payload.sha256
+              df -k /data | tail -1 | awk '{print $2}' > /data/df_before
+              echo "fs 1K-blocks before resize: $(cat /data/df_before)"
+              sync
+              echo "expand-writer done"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: azblob-pvc-expand
+"#;
+    log("running expand writer Job");
+    kubectl_apply_stdin(writer_yaml);
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=complete",
+            "job/azblob-expand-writer",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-expand-writer");
+        panic!("expand writer Job did not complete");
+    }
+    let _ = try_run("kubectl", &["logs", "-l", "app=azblob-expand-writer", "--tail=50"]);
+
+    log("deleting expand writer (tears down device, flushes blob)");
+    run(
+        "kubectl",
+        &["delete", "job", "azblob-expand-writer", "--wait=true"],
+    );
+
+    // Patch the PVC to request the larger size — this is what `kubectl edit pvc`
+    // does under the hood and is what the csi-resizer watches for.
+    log(&format!("patching PVC azblob-pvc-expand to {new_size}"));
+    let patch = format!(
+        r#"{{"spec":{{"resources":{{"requests":{{"storage":"{new_size}"}}}}}}}}"#
+    );
+    run(
+        "kubectl",
+        &["patch", "pvc", "azblob-pvc-expand", "--type=merge", "-p", &patch],
+    );
+
+    // Wait for the csi-resizer to drive ControllerExpandVolume: the bound PV's
+    // capacity reflects the resized backing blob once the controller side
+    // completes.  The filesystem grow happens later, on the node, when a pod
+    // remounts the volume.
+    let pv = {
+        let out = Command::new("kubectl")
+            .args([
+                "get",
+                "pvc",
+                "azblob-pvc-expand",
+                "-o",
+                "jsonpath={.spec.volumeName}",
+            ])
+            .output()
+            .expect("get pvc volumeName");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert!(!pv.is_empty(), "expand: PVC has no bound PV");
+    log(&format!("waiting for PV {pv} capacity to reach {new_size}"));
+    let mut grown = false;
+    for attempt in 1..=60 {
+        let out = Command::new("kubectl")
+            .args([
+                "get",
+                "pv",
+                &pv,
+                "-o",
+                "jsonpath={.spec.capacity.storage}",
+            ])
+            .output()
+            .expect("get pv capacity");
+        let cap = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if cap == new_size {
+            grown = true;
+            break;
+        }
+        if attempt % 10 == 0 {
+            log(&format!("  PV capacity still {cap} (attempt {attempt})"));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    if !grown {
+        dump_diagnostics("csi-ublk-azblob-controller");
+        panic!("expand: PV {pv} capacity never reached {new_size} (ControllerExpandVolume)");
+    }
+    log(&format!("PV {pv} capacity is now {new_size}"));
+
+    // Reader: remount the PVC.  kubelet sees the pending filesystem resize and
+    // calls NodeExpandVolume (resize2fs).  Assert the payload survived and that
+    // the filesystem total grew beyond what the writer recorded.
+    let reader_yaml = r#"apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azblob-expand-reader
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: azblob-expand-reader
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: reader
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "verifying payload + fs growth on $(hostname)"
+              sha256sum -c /data/payload.sha256
+              before=$(cat /data/df_before)
+              after=$(df -k /data | tail -1 | awk '{print $2}')
+              echo "fs 1K-blocks before=$before after=$after"
+              if [ "$after" -le "$before" ]; then
+                echo "FILESYSTEM DID NOT GROW after expansion"
+                exit 1
+              fi
+              echo "expand-reader verified OK"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: azblob-pvc-expand
+"#;
+    log("running expand reader Job (remounts PVC, verifies data + fs growth)");
+    kubectl_apply_stdin(reader_yaml);
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=complete",
+            "job/azblob-expand-reader",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-expand-reader");
+        panic!("expand reader Job did not complete — filesystem did not grow or data was lost");
+    }
+    let _ = try_run("kubectl", &["logs", "-l", "app=azblob-expand-reader", "--tail=50"]);
+
+    log("✓ Volume expansion test PASSED: blob + filesystem grew, data intact");
+
+    // Cleanup
+    run(
+        "kubectl",
+        &["delete", "job", "azblob-expand-reader", "--wait=true"],
+    );
+    run(
+        "kubectl",
+        &["delete", "pvc", "azblob-pvc-expand", "--wait=true"],
     );
 }
 
