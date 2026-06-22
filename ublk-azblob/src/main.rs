@@ -128,18 +128,26 @@ struct Cli {
     azure_client_secret: Option<String>,
 
     // ── Centralized Azure I/O limits (apply to every subcommand) ───────────────
-    /// Max concurrent Azure *download* (read) requests.
+    /// Total concurrent Azure requests shared across download and upload.
     ///
-    /// One half of the centralized I/O gateway's thread budget. `0` (default)
-    /// auto-sizes so that download + upload concurrency equals the logical CPU
-    /// count (split evenly).
+    /// The gateway's overall thread budget. Downloads and uploads draw from it
+    /// dynamically, so either direction can use the whole budget while the other
+    /// is idle. `0` (default) auto-sizes to the logical CPU count.
+    #[arg(long, default_value = "0", env = "UBLK_IO_CONCURRENCY")]
+    io_concurrency: usize,
+
+    /// Per-direction ceiling on concurrent Azure *download* (read) requests.
+    ///
+    /// Caps how much of the shared `--io-concurrency` budget downloads may use.
+    /// `0` (default) lets downloads use the entire budget when uploads are idle.
     #[arg(long, default_value = "0", env = "UBLK_DOWNLOAD_CONCURRENCY")]
     download_concurrency: usize,
 
-    /// Max concurrent Azure *upload* (write / clear / copy) requests.
+    /// Per-direction ceiling on concurrent Azure *upload* (write / clear / copy)
+    /// requests.
     ///
-    /// The other half of the gateway's thread budget. `0` (default) auto-sizes
-    /// so that download + upload concurrency equals the logical CPU count.
+    /// Caps how much of the shared `--io-concurrency` budget uploads may use.
+    /// `0` (default) lets uploads use the entire budget when downloads are idle.
     #[arg(long, default_value = "0", env = "UBLK_UPLOAD_CONCURRENCY")]
     upload_concurrency: usize,
 
@@ -497,10 +505,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize the process-wide Azure I/O gateway before any backend is built,
     // so every download/upload funnels through its bandwidth, concurrency and
-    // priority controls. Zero concurrency means "auto" (download + upload =
-    // logical CPU count); zero bandwidth means unlimited.
+    // priority controls. Zero concurrency means "auto": the shared budget
+    // defaults to the logical CPU count and each direction may use all of it
+    // when the other is idle. Zero bandwidth means unlimited.
     {
         let mut io_cfg = backend::io_gateway::IoGatewayConfig::auto();
+        if cli.io_concurrency > 0 {
+            io_cfg.concurrency = cli.io_concurrency;
+            // Keep the per-direction ceilings in step with an explicit total
+            // unless the user overrode them below, so a raised budget is usable
+            // by either direction.
+            io_cfg.download_concurrency = cli.io_concurrency;
+            io_cfg.upload_concurrency = cli.io_concurrency;
+        }
         if cli.download_concurrency > 0 {
             io_cfg.download_concurrency = cli.download_concurrency;
         }
@@ -510,6 +527,7 @@ async fn main() -> anyhow::Result<()> {
         io_cfg.download_bandwidth_bps = cli.download_bandwidth;
         io_cfg.upload_bandwidth_bps = cli.upload_bandwidth;
         info!(
+            concurrency = io_cfg.concurrency,
             download_concurrency = io_cfg.download_concurrency,
             upload_concurrency = io_cfg.upload_concurrency,
             download_bandwidth_bps = io_cfg.download_bandwidth_bps,

@@ -8,18 +8,24 @@
 //! independently:
 //!
 //! 1. **Bandwidth** — a byte-rate ceiling (leaky bucket), `0` = unlimited.
-//! 2. **Threads / concurrency** — a fixed worker pool; at most that many Azure
-//!    requests are in flight at once.
+//! 2. **Threads / concurrency** — a single shared worker budget across both
+//!    directions; at most that many Azure requests are in flight at once
+//!    *combined* (see below for how the two directions share it).
 //! 3. **Fairness** — a *provider/consumer* model: producers (on-demand reads,
 //!    flush write-back, server-side copy, cache warm-up) enqueue work onto a
 //!    priority queue that the workers drain highest-priority-first. This
 //!    prevents background work from starving foreground I/O. The priority order
 //!    is **foreground read > flush > copy > warm-up**.
 //!
-//! Downloads and uploads have *separate* pools, limiters and queues, so the two
-//! directions never contend with each other; the priority order above is
-//! enforced *within* each direction (downloads: foreground read > copy >
-//! warm-up; uploads: flush > copy).
+//! Downloads and uploads keep *separate* priority queues and bandwidth limiters
+//! (the priority order above is enforced *within* each direction: downloads
+//! foreground read > copy > warm-up; uploads flush > copy), but they share a
+//! single concurrency budget. Rather than statically splitting the worker
+//! threads in half, both directions draw from one shared pool of permits sized
+//! to the total budget, so a busy direction can use the *entire* budget while
+//! the other is idle (e.g. downloads alone can reach the full CPU count when no
+//! uploads are in flight), and the two only contend for threads when both are
+//! active.
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -29,7 +35,7 @@ use async_priority_channel as pc;
 use futures::future::BoxFuture;
 use leaky_bucket::RateLimiter;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::trace;
 
@@ -99,16 +105,25 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    /// Build a pipeline with `workers` consumer tasks and an optional byte-rate
-    /// limiter (`bandwidth_bps == 0` ⇒ unlimited).
-    fn new(workers: usize, bandwidth_bps: u64, handles: &mut Vec<JoinHandle<()>>) -> Self {
+    /// Build a pipeline with up to `workers` consumer tasks draining its queue
+    /// and an optional byte-rate limiter (`bandwidth_bps == 0` ⇒ unlimited).
+    /// Every job additionally acquires one permit from the gateway-wide
+    /// `concurrency` semaphore before running, so the two directions share a
+    /// single thread budget dynamically instead of each owning a fixed slice.
+    fn new(
+        workers: usize,
+        concurrency: Arc<Semaphore>,
+        bandwidth_bps: u64,
+        handles: &mut Vec<JoinHandle<()>>,
+    ) -> Self {
         let workers = workers.max(1);
         let (tx, rx) = pc::unbounded::<Job, u8>();
         let limiter = build_limiter(bandwidth_bps);
         for _ in 0..workers {
             let rx = rx.clone();
             let limiter = limiter.clone();
-            handles.push(tokio::spawn(worker_loop(rx, limiter)));
+            let concurrency = concurrency.clone();
+            handles.push(tokio::spawn(worker_loop(rx, concurrency, limiter)));
         }
         Self { tx }
     }
@@ -135,9 +150,24 @@ fn build_limiter(bandwidth_bps: u64) -> Option<Arc<RateLimiter>> {
     Some(Arc::new(limiter))
 }
 
-/// Consumer loop: pull the highest-priority job, pay its bandwidth cost, run it.
-async fn worker_loop(rx: pc::Receiver<Job, u8>, limiter: Option<Arc<RateLimiter>>) {
+/// Consumer loop: pull the highest-priority job, claim a shared concurrency
+/// permit, pay its bandwidth cost, then run it. The permit (held for the whole
+/// request) is what bounds *combined* download+upload parallelism to the
+/// gateway's total budget while letting either direction borrow the other's
+/// idle capacity.
+async fn worker_loop(
+    rx: pc::Receiver<Job, u8>,
+    concurrency: Arc<Semaphore>,
+    limiter: Option<Arc<RateLimiter>>,
+) {
     while let Ok((job, _priority)) = rx.recv().await {
+        // Held until the end of the loop body, so the request occupies one slot
+        // of the shared budget for its entire lifetime. The semaphore is never
+        // closed for a live gateway, so this acquire cannot fail.
+        let _permit = concurrency
+            .acquire()
+            .await
+            .expect("Azure I/O gateway concurrency semaphore closed");
         if let Some(rl) = &limiter {
             if job.bytes > 0 {
                 // Clamp to the limiter's capacity so an unexpectedly large
@@ -153,9 +183,16 @@ async fn worker_loop(rx: pc::Receiver<Job, u8>, limiter: Option<Arc<RateLimiter>
 /// Configuration for the gateway's two pipelines.
 #[derive(Clone, Copy, Debug)]
 pub struct IoGatewayConfig {
-    /// Max concurrent download (read) requests.
+    /// Total number of concurrent Azure requests across *both* directions. This
+    /// is the shared thread budget; downloads and uploads draw from it
+    /// dynamically rather than each owning a fixed half.
+    pub concurrency: usize,
+    /// Per-direction ceiling on concurrent download (read) requests. Capped by
+    /// `concurrency`; defaults to it so a download burst can use the whole
+    /// budget when uploads are idle.
     pub download_concurrency: usize,
-    /// Max concurrent upload (write/clear/copy) requests.
+    /// Per-direction ceiling on concurrent upload (write/clear/copy) requests.
+    /// Capped by `concurrency`; defaults to it for the same reason.
     pub upload_concurrency: usize,
     /// Download bandwidth ceiling in bytes/sec (`0` = unlimited).
     pub download_bandwidth_bps: u64,
@@ -164,22 +201,25 @@ pub struct IoGatewayConfig {
 }
 
 impl IoGatewayConfig {
-    /// Auto-size concurrency so that *download + upload = logical CPU count*
-    /// (split as evenly as possible, at least one worker each); bandwidth
-    /// unlimited. Environment variables, when set to a non-zero value, are used
-    /// as the defaults for each field (`UBLK_DOWNLOAD_CONCURRENCY`,
-    /// `UBLK_UPLOAD_CONCURRENCY`, `UBLK_DOWNLOAD_BANDWIDTH`,
-    /// `UBLK_UPLOAD_BANDWIDTH`, bytes/sec for bandwidth). An env concurrency of
-    /// `0` is treated as unset (falls back to the CPU-count split), matching the
-    /// CLI flags — which take precedence over these defaults when explicitly
-    /// provided (see `main.rs`).
+    /// Auto-size the shared concurrency budget to the logical CPU count, with
+    /// each direction allowed to use *all* of it when the other is idle
+    /// (dynamic split, not a fixed half each); bandwidth unlimited. Environment
+    /// variables, when set to a non-zero value, are used as the defaults for
+    /// each field (`UBLK_IO_CONCURRENCY` for the shared budget,
+    /// `UBLK_DOWNLOAD_CONCURRENCY` / `UBLK_UPLOAD_CONCURRENCY` for the
+    /// per-direction ceilings, `UBLK_DOWNLOAD_BANDWIDTH` /
+    /// `UBLK_UPLOAD_BANDWIDTH` in bytes/sec for bandwidth). An env concurrency
+    /// of `0` is treated as unset (the shared budget falls back to the CPU
+    /// count, and each per-direction ceiling falls back to the shared budget),
+    /// matching the CLI flags — which take precedence over these defaults when
+    /// explicitly provided (see `main.rs`).
     pub fn auto() -> Self {
         let cpu = cpu_count().max(1);
-        let download = (cpu / 2).max(1);
-        let upload = cpu.saturating_sub(download).max(1);
+        let concurrency = env_usize("UBLK_IO_CONCURRENCY").unwrap_or(cpu);
         Self {
-            download_concurrency: env_usize("UBLK_DOWNLOAD_CONCURRENCY").unwrap_or(download),
-            upload_concurrency: env_usize("UBLK_UPLOAD_CONCURRENCY").unwrap_or(upload),
+            concurrency,
+            download_concurrency: env_usize("UBLK_DOWNLOAD_CONCURRENCY").unwrap_or(concurrency),
+            upload_concurrency: env_usize("UBLK_UPLOAD_CONCURRENCY").unwrap_or(concurrency),
             download_bandwidth_bps: env_u64("UBLK_DOWNLOAD_BANDWIDTH").unwrap_or(0),
             upload_bandwidth_bps: env_u64("UBLK_UPLOAD_BANDWIDTH").unwrap_or(0),
         }
@@ -215,20 +255,32 @@ impl AzureIoGateway {
     /// Tokio runtime (a multi-threaded runtime, so workers make progress while
     /// the I/O loop blocks on a result).
     pub fn new(cfg: IoGatewayConfig) -> Self {
+        let total = cfg.concurrency.max(1);
+        // Shared budget: combined download+upload in-flight never exceeds it,
+        // but a single direction can claim all of it when the other is idle.
+        let concurrency = Arc::new(Semaphore::new(total));
         let mut workers = Vec::new();
+        // A direction never needs more worker tasks than the shared budget, so
+        // clamp its pool to `total` (extra workers would only ever block on the
+        // semaphore). Each pool can still grow to the full budget.
+        let download_workers = cfg.download_concurrency.clamp(1, total);
+        let upload_workers = cfg.upload_concurrency.clamp(1, total);
         let download = Pipeline::new(
-            cfg.download_concurrency,
+            download_workers,
+            concurrency.clone(),
             cfg.download_bandwidth_bps,
             &mut workers,
         );
         let upload = Pipeline::new(
-            cfg.upload_concurrency,
+            upload_workers,
+            concurrency.clone(),
             cfg.upload_bandwidth_bps,
             &mut workers,
         );
         trace!(
-            download_concurrency = cfg.download_concurrency,
-            upload_concurrency = cfg.upload_concurrency,
+            concurrency = total,
+            download_concurrency = download_workers,
+            upload_concurrency = upload_workers,
             download_bandwidth_bps = cfg.download_bandwidth_bps,
             upload_bandwidth_bps = cfg.upload_bandwidth_bps,
             "Azure I/O gateway started"
@@ -308,7 +360,14 @@ mod tests {
     use std::time::Instant;
 
     fn cfg(dl: usize, ul: usize, dl_bps: u64, ul_bps: u64) -> IoGatewayConfig {
+        // Total budget = sum of the per-direction ceilings, so each direction's
+        // worker count is the binding limit (matching these tests' intent).
+        cfg_total(dl + ul, dl, ul, dl_bps, ul_bps)
+    }
+
+    fn cfg_total(total: usize, dl: usize, ul: usize, dl_bps: u64, ul_bps: u64) -> IoGatewayConfig {
         IoGatewayConfig {
+            concurrency: total,
             download_concurrency: dl,
             upload_concurrency: ul,
             download_bandwidth_bps: dl_bps,
@@ -446,6 +505,81 @@ mod tests {
             start.elapsed() >= Duration::from_millis(250),
             "bandwidth limiter should have paced the uploads, took {:?}",
             start.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_direction_can_use_the_whole_budget() {
+        // Total budget 4, each direction allowed up to the full budget. With no
+        // uploads in flight, downloads alone must be able to reach 4 concurrent
+        // requests (the old fixed half-split would have capped them at 2).
+        let gw = Arc::new(AzureIoGateway::new(cfg_total(4, 4, 4, 0, 0)));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let gw = gw.clone();
+            let inflight = inflight.clone();
+            let max_seen = max_seen.clone();
+            tasks.push(tokio::spawn(async move {
+                gw.download(IoClass::ForegroundRead, 0, async move {
+                    let n = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(n, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            4,
+            "downloads alone should be able to use the whole shared budget"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn combined_concurrency_capped_by_shared_budget() {
+        // Total budget 2, but each direction may individually use up to 2.
+        // Flooding both directions at once must never exceed 2 in flight
+        // *combined* — the shared semaphore, not the per-direction pools, is the
+        // binding limit.
+        let gw = Arc::new(AzureIoGateway::new(cfg_total(2, 2, 2, 0, 0)));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let gw = gw.clone();
+            let inflight = inflight.clone();
+            let max_seen = max_seen.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = {
+                    let inflight = inflight.clone();
+                    let max_seen = max_seen.clone();
+                    async move {
+                        let n = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(n, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        inflight.fetch_sub(1, Ordering::SeqCst);
+                    }
+                };
+                if i % 2 == 0 {
+                    gw.download(IoClass::ForegroundRead, 0, body).await;
+                } else {
+                    gw.upload(IoClass::Flush, 0, body).await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 2,
+            "combined in-flight must not exceed the shared budget, saw {}",
+            max_seen.load(Ordering::SeqCst)
         );
     }
 }

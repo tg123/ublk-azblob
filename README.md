@@ -190,6 +190,7 @@ Common CLI flags have environment-variable equivalents:
 | `--cache-share-pages` | `UBLK_CACHE_SHARE_PAGES` |
 | `--cache-warmup` | `UBLK_CACHE_WARMUP` |
 | `--cache-warmup-bytes` | `UBLK_CACHE_WARMUP_BYTES` |
+| `--io-concurrency` | `UBLK_IO_CONCURRENCY` |
 | `--download-concurrency` | `UBLK_DOWNLOAD_CONCURRENCY` |
 | `--upload-concurrency` | `UBLK_UPLOAD_CONCURRENCY` |
 | `--download-bandwidth` | `UBLK_DOWNLOAD_BANDWIDTH` |
@@ -202,23 +203,31 @@ Common CLI flags have environment-variable equivalents:
 
 Every Azure download (read) and upload (write / clear / server-side copy) is
 funnelled through a single, process-wide **I/O gateway**. It is the one place
-that bounds, *per direction independently*:
+that bounds:
 
 - **Bandwidth** — `--download-bandwidth` / `--upload-bandwidth` (bytes/sec,
-  `UBLK_DOWNLOAD_BANDWIDTH` / `UBLK_UPLOAD_BANDWIDTH`). `0` (default) = unlimited.
-- **Threads / concurrency** — `--download-concurrency` / `--upload-concurrency`
-  (`UBLK_DOWNLOAD_CONCURRENCY` / `UBLK_UPLOAD_CONCURRENCY`). `0` (default)
-  auto-sizes so that *download + upload = logical CPU count*, split evenly.
+  `UBLK_DOWNLOAD_BANDWIDTH` / `UBLK_UPLOAD_BANDWIDTH`), one limiter *per
+  direction*. `0` (default) = unlimited.
+- **Threads / concurrency** — a single shared budget `--io-concurrency`
+  (`UBLK_IO_CONCURRENCY`) across both directions. `0` (default) auto-sizes it to
+  the logical CPU count. Downloads and uploads draw from this budget
+  *dynamically*, so a busy direction can use the whole budget while the other is
+  idle (e.g. reads alone can reach the full CPU count when nothing is being
+  written). `--download-concurrency` / `--upload-concurrency`
+  (`UBLK_DOWNLOAD_CONCURRENCY` / `UBLK_UPLOAD_CONCURRENCY`) optionally cap how
+  much of the shared budget each direction may use; `0` (default) = the full
+  budget.
 
 The gateway uses a **provider/consumer** model: producers (on-demand reads,
 write-back flush, server-side copy and cache warm-up) enqueue work onto a
-priority queue that a fixed worker pool drains highest-priority-first. This stops
-background work from starving foreground I/O. The priority order is:
+priority queue that the shared worker pool drains highest-priority-first. This
+stops background work from starving foreground I/O. The priority order is:
 
 **foreground read > flush > copy > warm-up**
 
-Downloads and uploads have separate worker pools, bandwidth limiters and queues,
-so the two directions never contend with each other.
+Downloads and uploads keep separate priority queues and bandwidth limiters (the
+order above is enforced *within* each direction), but share one concurrency
+budget so neither direction's threads sit idle while the other has work.
 
 > The per-subsystem knobs `UBLK_FLUSH_CONCURRENCY`, `UBLK_CACHE_WARMUP_CONCURRENCY`
 > and `UBLK_COPY_CONCURRENCY` now only bound how many operations each producer
