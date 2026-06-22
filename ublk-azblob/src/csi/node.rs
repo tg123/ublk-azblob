@@ -31,6 +31,16 @@ const DEFAULT_FS_TYPE: &str = "ext4";
 /// How long to wait for the ublk device node to appear after spawning the child.
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Split a comma- or whitespace-separated option string into trimmed,
+/// non-empty tokens (used to parse mount-option StorageClass parameters).
+fn split_opts(opts: &str) -> Vec<String> {
+    opts.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// A currently-published volume and the resources backing it.
 struct Published {
     child: Child,
@@ -241,10 +251,28 @@ impl Node for NodeService {
             ));
         }
 
-        // Resolve filesystem type and mount flags from the volume capability.
+        // Resolve filesystem type and mount flags. The controller forwards the
+        // StorageClass `newBlobFsType` (fresh blob) and, when provisioning from a
+        // golden-image template, `templateBlobFsType` (the template's existing
+        // filesystem). The template type takes precedence — a templated volume is
+        // mounted, never formatted. The CSI `volume_capability` mount fs_type
+        // (when set) overrides either.
         let mut fs_type = req
             .volume_context
-            .get("fsType")
+            .get("templateBlobFsType")
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                req.volume_context
+                    .get("newBlobFsType")
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| {
+                // Backward compatibility: volumes provisioned by an earlier
+                // driver version stored their filesystem under the legacy
+                // `fsType` key. Fall back to it so previously-provisioned
+                // non-ext4 volumes can still be remounted after an upgrade.
+                req.volume_context.get("fsType").filter(|s| !s.is_empty())
+            })
             .cloned()
             .unwrap_or_else(|| DEFAULT_FS_TYPE.to_string());
         let mut mount_flags: Vec<String> = Vec::new();
@@ -263,6 +291,23 @@ impl Node for NodeService {
                 }
                 None => {}
             }
+        }
+        // Built-in mount options from the filesystem profile. The advanced
+        // `templateBlobMountArgsOverwrite` parameter (template volumes only) overwrites
+        // these precooked defaults when set.
+        match req
+            .volume_context
+            .get("templateBlobMountArgsOverwrite")
+            .map(|opts| split_opts(opts))
+            .filter(|over| !over.is_empty())
+        {
+            Some(over) => mount_flags.extend(over),
+            None => mount_flags.extend(
+                mount::fs_profile(&fs_type)
+                    .mount_options
+                    .iter()
+                    .map(|s| s.to_string()),
+            ),
         }
 
         let size: u64 = req
@@ -535,8 +580,25 @@ impl Node for NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::child_blob_url;
+    use super::{child_blob_url, split_opts};
     use crate::bloburl::parse_blob_url;
+
+    #[test]
+    fn split_opts_parses_mixed_separators() {
+        // Comma, space, tab and newline all separate tokens; surrounding
+        // whitespace is trimmed and empty tokens dropped.
+        assert_eq!(
+            split_opts("noatime, nodiratime\tro\nrw"),
+            vec!["noatime", "nodiratime", "ro", "rw"]
+        );
+        // Leading/trailing/duplicate separators yield no empty tokens.
+        assert_eq!(split_opts(" , noatime ,, ro , "), vec!["noatime", "ro"]);
+        // A single option.
+        assert_eq!(split_opts("ro"), vec!["ro"]);
+        // All-whitespace / empty input yields nothing.
+        assert!(split_opts("   \t\n ").is_empty());
+        assert!(split_opts("").is_empty());
+    }
 
     #[test]
     fn child_blob_url_subdomain_template_roundtrips() {
