@@ -115,6 +115,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- include "ublk-azblob-csi.ioEnv" . | nindent 12 }}
             {{- if .Values.node.useNbd }}
             # NBD mode configuration
             - name: CSI_USE_NBD

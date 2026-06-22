@@ -130,8 +130,9 @@ impl Pipeline {
 }
 
 /// Build a leaky-bucket limiter for `bandwidth_bps` bytes/sec, or `None` when
-/// unlimited. Tokens are bytes. `max` is sized to admit the largest single
-/// request (one max page write) so acquiring a full chunk can never deadlock.
+/// unlimited. Tokens are bytes. `max` is sized to at least one max page write so
+/// a single ≤`MAX_PAGE_REQUEST_BYTES` request never deadlocks; larger requests
+/// (e.g. big downloads) are charged in `max`-sized rounds by the worker.
 fn build_limiter(bandwidth_bps: u64) -> Option<Arc<RateLimiter>> {
     if bandwidth_bps == 0 {
         return None;
@@ -167,11 +168,17 @@ async fn worker_loop(
 ) {
     while let Ok((job, _priority)) = rx.recv().await {
         if let Some(rl) = &limiter {
-            if job.bytes > 0 {
-                // Clamp to the limiter's capacity so an unexpectedly large
-                // request can never wait forever for more tokens than `max`.
-                let permits = (job.bytes as usize).min(rl.max());
-                rl.acquire(permits).await;
+            // Charge the *full* byte cost against the limiter, but never request
+            // more than `rl.max()` tokens in a single `acquire` (which would
+            // wait forever). A request larger than `max` — e.g. a download of a
+            // cache page sized above `MAX_PAGE_REQUEST_BYTES` — is paid in
+            // successive `max`-sized rounds so the configured bandwidth ceiling
+            // is honoured for large reads rather than silently exceeded.
+            let mut remaining = job.bytes as usize;
+            while remaining > 0 {
+                let chunk = remaining.min(rl.max());
+                rl.acquire(chunk).await;
+                remaining -= chunk;
             }
         }
         // Held until the end of the loop body, so the request occupies one slot
@@ -521,6 +528,27 @@ mod tests {
         assert!(
             start.elapsed() >= Duration::from_millis(250),
             "bandwidth limiter should have paced the uploads, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_request_is_charged_full_byte_cost() {
+        // A request larger than the limiter's `max` must be charged its *full*
+        // byte cost (in `max`-sized rounds), not silently clamped to a single
+        // `max` charge. Here the rate is `MAX_PAGE_REQUEST_BYTES`/s, so the
+        // limiter `max` is `MAX_PAGE_REQUEST_BYTES`; a download of twice that
+        // drains the initial burst on the first round and must wait a full
+        // refill (~1s) for the second. With the old clamping bug the read was
+        // charged a single round and completed within the burst (instantly).
+        let bps = MAX_PAGE_REQUEST_BYTES; // limiter max == MAX_PAGE_REQUEST_BYTES
+        let gw = AzureIoGateway::new(cfg(1, 1, bps, 0));
+        let start = Instant::now();
+        gw.download(IoClass::ForegroundRead, 2 * MAX_PAGE_REQUEST_BYTES, async {})
+            .await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(500),
+            "an over-max request must be paced for its full size, took {:?}",
             start.elapsed()
         );
     }
