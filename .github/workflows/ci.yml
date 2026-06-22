@@ -33,11 +33,9 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
-      # Lint and test the full *shipped* feature set in one pass — we never ship
-      # a partially-compiled binary.  `ublk` and `csi` are on by default, so the
-      # plain commands cover the release binary.  The off-by-default `bench`
-      # feature (the backend microbenchmark) is owned by the `bench` workflow,
-      # which lints + unit-tests + runs it, so it is intentionally not built here.
+      # Lint and test the full shipped feature set in one pass — we never ship a
+      # partially-compiled binary, so CI checks everything together.  `ublk` and
+      # `csi` are on by default, so no extra feature flags are needed.
       - name: cargo clippy
         run: cargo clippy -- -D warnings
 
