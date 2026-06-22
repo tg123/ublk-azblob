@@ -150,24 +150,22 @@ fn build_limiter(bandwidth_bps: u64) -> Option<Arc<RateLimiter>> {
     Some(Arc::new(limiter))
 }
 
-/// Consumer loop: pull the highest-priority job, claim a shared concurrency
-/// permit, pay its bandwidth cost, then run it. The permit (held for the whole
-/// request) is what bounds *combined* download+upload parallelism to the
+/// Consumer loop: pull the highest-priority job, pay its bandwidth cost, claim a
+/// shared concurrency permit, then run it. Bandwidth tokens are acquired
+/// *before* the concurrency permit so a request throttled by a per-direction
+/// bandwidth ceiling waits for tokens *without* occupying a shared slot — this
+/// prevents token-starved workers in one direction from pinning the whole
+/// shared budget and starving the other direction. The permit (held for the
+/// whole request) is what bounds *combined* download+upload parallelism to the
 /// gateway's total budget while letting either direction borrow the other's
-/// idle capacity.
+/// idle capacity. Tradeoff: tokens are deducted slightly before the transfer
+/// actually runs (while the permit is being acquired).
 async fn worker_loop(
     rx: pc::Receiver<Job, u8>,
     concurrency: Arc<Semaphore>,
     limiter: Option<Arc<RateLimiter>>,
 ) {
     while let Ok((job, _priority)) = rx.recv().await {
-        // Held until the end of the loop body, so the request occupies one slot
-        // of the shared budget for its entire lifetime. The semaphore is never
-        // closed for a live gateway, so this acquire cannot fail.
-        let _permit = concurrency
-            .acquire()
-            .await
-            .expect("Azure I/O gateway concurrency semaphore closed");
         if let Some(rl) = &limiter {
             if job.bytes > 0 {
                 // Clamp to the limiter's capacity so an unexpectedly large
@@ -176,6 +174,13 @@ async fn worker_loop(
                 rl.acquire(permits).await;
             }
         }
+        // Held until the end of the loop body, so the request occupies one slot
+        // of the shared budget for its entire lifetime. The semaphore is never
+        // closed for a live gateway, so this acquire cannot fail.
+        let _permit = concurrency
+            .acquire()
+            .await
+            .expect("Azure I/O gateway concurrency semaphore closed");
         job.fut.await;
     }
 }
@@ -335,11 +340,23 @@ impl AzureIoGateway {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let (res_tx, res_rx) = oneshot::channel::<T>();
+        let (mut res_tx, res_rx) = oneshot::channel::<T>();
         let fut: BoxFuture<'static, ()> = Box::pin(async move {
-            let out = work.await;
-            // Receiver only gone if the submitter was cancelled; drop the result.
-            let _ = res_tx.send(out);
+            let work = std::pin::pin!(work);
+            // Race the work against the submitter dropping the result receiver.
+            // If the submitter is cancelled (e.g. a flush hits
+            // `flush_io_timeout_secs` and drops this future), `res_tx.closed()`
+            // fires and we cancel `work` instead of running it to completion —
+            // dropping the in-flight Azure request and releasing the shared
+            // concurrency permit promptly rather than after the SDK call
+            // eventually returns.
+            let out = tokio::select! {
+                out = work => Some(out),
+                _ = res_tx.closed() => None,
+            };
+            if let Some(out) = out {
+                let _ = res_tx.send(out);
+            }
         });
         let job = Job { fut, bytes };
         // The unbounded queue only rejects when closed, which never happens for a
