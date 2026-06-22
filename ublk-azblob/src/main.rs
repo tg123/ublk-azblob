@@ -3,18 +3,19 @@
 //! # Usage
 //!
 //! ```text
-//! ublk-azblob [GLOBAL OPTIONS] --account <ACCOUNT> --container <CONTAINER> --blob <BLOB> \
-//!     <run|test> --size <SIZE>
+//! ublk-azblob [GLOBAL OPTIONS] --blob-url <BLOB_URL> <run|test> --size <SIZE>
 //! ```
 //!
-//! `--size` (and other per-command options) belong to the `run`/`test`
-//! subcommands; auth and storage selectors are global options.
+//! `--blob-url` is a full Azure blob URL (e.g.
+//! `https://acct.blob.core.windows.net/container/blob.vhd`, or for Azurite
+//! `http://127.0.0.1:10000/devstoreaccount1/container/blob`) selecting the
+//! account, container and blob in one argument.  `--size` (and other per-command
+//! options) belong to the `run`/`test` subcommands; auth options are global.
 //!
 //! See `--help` and `README.md` for full documentation.
 
 mod auth;
 mod backend;
-#[cfg(feature = "csi")]
 mod bloburl;
 #[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 mod coordination;
@@ -45,39 +46,23 @@ use tracing::{error, info, warn};
     version
 )]
 struct Cli {
-    /// Azure Storage account name (e.g. `mystorageaccount`).
-    /// Not used in CSI mode (values come from StorageClass parameters).
-    #[arg(long, env = "AZURE_STORAGE_ACCOUNT", default_value = "")]
-    account: String,
-
-    /// Blob container name.
-    /// Not used in CSI mode (values come from StorageClass parameters).
-    #[arg(long, env = "AZURE_STORAGE_CONTAINER", default_value = "")]
-    container: String,
-
-    /// Page blob name (path within the container).
+    /// Full Azure blob URL selecting the account, container and blob in one
+    /// argument.
     ///
-    /// Required by the `run` and `test` subcommands.  The `csi` subcommand picks
-    /// a per-volume blob name from the Kubernetes volume id, so it is optional
-    /// there.
-    #[arg(long, env = "AZURE_STORAGE_BLOB")]
-    blob: Option<String>,
-
-    /// Target a specific blob *snapshot* (the `x-ms-snapshot` timestamp).
+    /// Examples:
+    /// `https://mystorageaccount.blob.core.windows.net/mycontainer/myblob.vhd`
+    /// or, for Azurite, `http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob`.
+    /// The URL may carry a `?snapshot=<timestamp>` and/or a SAS query.
     ///
-    /// A snapshot is an immutable, point-in-time view of the blob.  Because a
-    /// snapshot can never change, selecting one is what makes the device
+    /// Selecting a snapshot (`?snapshot=<timestamp>`) is what makes the device
     /// **read-only** (all write/discard operations are rejected) *and* makes the
-    /// local cache safe to reuse: there is no separate `--read-only` flag.
-    #[arg(long, env = "AZURE_STORAGE_SNAPSHOT")]
-    snapshot: Option<String>,
-
-    /// Azure Storage service endpoint URL.
+    /// local cache safe to reuse: there is no separate `--read-only` flag. A
+    /// snapshot is an immutable, point-in-time view of the blob.
     ///
-    /// Defaults to `https://<account>.blob.core.windows.net/`.
-    /// For Azurite use `http://127.0.0.1:10000/<account>`.
-    #[arg(long, env = "AZURE_STORAGE_ENDPOINT")]
-    endpoint: Option<String>,
+    /// Required by the `run`, `test` and `copy` subcommands.  Not used in `csi`
+    /// mode (values come from StorageClass parameters / secrets).
+    #[arg(long, env = "UBLK_BLOB_URL")]
+    blob_url: Option<String>,
 
     /// Storage account key (base64).  Enables SharedKey auth mode.
     ///
@@ -396,8 +381,8 @@ enum Command {
         size: u64,
     },
 
-    /// Copy a golden-image *template* blob into the configured target blob
-    /// (`--container` / `--blob`), then exit.
+    /// Copy a golden-image *template* blob into the target blob selected by
+    /// `--blob-url`, then exit.
     ///
     /// This is the same server-side-style streamed copy the CSI controller uses
     /// to provision a read-write volume from `templateBlobUrl`. The target blob
@@ -423,6 +408,25 @@ enum Command {
     /// `ublk` feature on the node side).
     #[cfg(feature = "csi")]
     Csi {
+        /// Default Azure Storage account name for provisioned volumes.
+        ///
+        /// Used when a StorageClass does not set `storageAccount`.  May be empty
+        /// when every StorageClass supplies its own account.
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT", default_value = "")]
+        account: String,
+
+        /// Default blob container used when a StorageClass does not set one.
+        #[arg(long, env = "AZURE_STORAGE_CONTAINER", default_value = "")]
+        container: String,
+
+        /// Azure Storage service endpoint URL template.
+        ///
+        /// Defaults to `https://<account>.blob.core.windows.net/`.  A `%s`
+        /// placeholder is substituted with the per-volume account.  For Azurite
+        /// use `http://127.0.0.1:10000/<account>`.
+        #[arg(long, env = "AZURE_STORAGE_ENDPOINT")]
+        endpoint: Option<String>,
+
         /// CSI endpoint to listen on (`unix:///csi/csi.sock` or `tcp://addr:port`).
         #[arg(long, env = "CSI_ENDPOINT", default_value = "unix:///csi/csi.sock")]
         csi_endpoint: String,
@@ -462,27 +466,6 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // The endpoint *template* may contain a `%s` placeholder for the account
-    // (subdomain-style, e.g. `http://%s.blob.localhost:10000/`). The CSI driver
-    // keeps the template verbatim and substitutes `%s` per volume in
-    // `csi::build_backend` (each volume can target a different account). The
-    // single-device `run`/`test` paths know their account up-front, so they
-    // substitute it here.
-    let endpoint_template = cli.endpoint.clone().unwrap_or_else(|| {
-        // For CSI mode with empty account, use generic endpoint (account is
-        // substituted per volume later).
-        if cli.account.is_empty() {
-            "https://blob.core.windows.net/".to_string()
-        } else {
-            format!("https://{}.blob.core.windows.net/", cli.account)
-        }
-    });
-    let endpoint = if endpoint_template.contains("%s") {
-        endpoint_template.replace("%s", &cli.account)
-    } else {
-        endpoint_template.clone()
-    };
-
     match cli.command {
         Command::Run {
             size,
@@ -514,10 +497,12 @@ async fn main() -> anyhow::Result<()> {
             flush_concurrency,
             ref nbd,
         } => {
+            let loc = cli.location()?;
+            let auth = build_auth(&cli, &loc.account, loc.sas.as_deref())?;
             // Read-only is derived solely from selecting a snapshot: a snapshot
             // is immutable, so the device is exposed read-only and its cache is
             // safe to reuse. There is no separate read-only flag.
-            let read_only = cli.snapshot.is_some();
+            let read_only = loc.snapshot.is_some();
             if read_only {
                 info!("snapshot selected: read-only mode (writes, discards, creation disabled)");
             }
@@ -528,7 +513,7 @@ async fn main() -> anyhow::Result<()> {
                      (coordination relies on the blob lock as its authoritative storage lock)"
                 );
             }
-            let azure_backend = build_azure_backend(&cli, &endpoint)?;
+            let azure_backend = build_azure_backend(&loc, &auth)?;
             if create {
                 if read_only {
                     anyhow::bail!("--create cannot be used against a snapshot (read-only)");
@@ -552,8 +537,8 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 Some(
                     acquire_lock(
-                        &cli,
-                        &endpoint,
+                        &loc,
+                        &auth,
                         coordination,
                         recovery_timeout_secs,
                         lease_duration_secs,
@@ -578,8 +563,7 @@ async fn main() -> anyhow::Result<()> {
             let backend: Arc<dyn BlobBackend> = if let Some(dir) = cache_dir.clone() {
                 // Default the blob identity and per-instance name to the
                 // container/blob.
-                let default_name =
-                    cache_file_name(&cli.container, cli.blob.as_deref().unwrap_or_default());
+                let default_name = cache_file_name(&loc.container, &loc.blob);
                 let blob_identity = cache_blob_identity
                     .clone()
                     .map(|s| sanitize_cache_component(&s))
@@ -739,7 +723,9 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Test { size } => {
-            let backend: Arc<dyn BlobBackend> = build_azure_backend(&cli, &endpoint)?;
+            let loc = cli.location()?;
+            let auth = build_auth(&cli, &loc.account, loc.sas.as_deref())?;
+            let backend: Arc<dyn BlobBackend> = build_azure_backend(&loc, &auth)?;
             run_smoke_test(backend, size).await?;
         }
 
@@ -748,11 +734,15 @@ async fn main() -> anyhow::Result<()> {
             ref template_url,
             size,
         } => {
-            run_template_copy(&cli, &endpoint, template_url, size).await?;
+            let loc = cli.location()?;
+            run_template_copy(&cli, &loc, template_url, size).await?;
         }
 
         #[cfg(feature = "csi")]
         Command::Csi {
+            account,
+            container,
+            endpoint,
             csi_endpoint,
             node_id,
             role,
@@ -760,10 +750,24 @@ async fn main() -> anyhow::Result<()> {
             nbd_host,
             nbd_port_start,
         } => {
+            // The endpoint *template* may contain a `%s` placeholder for the
+            // account (subdomain-style, e.g. `http://%s.blob.localhost:10000/`).
+            // The CSI driver keeps the template verbatim and substitutes `%s`
+            // per volume in `csi::build_backend` (each volume can target a
+            // different account).
+            let endpoint_template = endpoint.unwrap_or_else(|| {
+                // With an empty default account, use a generic endpoint (the
+                // account is substituted per volume later).
+                if account.is_empty() {
+                    "https://blob.core.windows.net/".to_string()
+                } else {
+                    format!("https://{account}.blob.core.windows.net/")
+                }
+            });
             let config = csi::DriverConfig {
-                account: cli.account.clone(),
-                endpoint: endpoint_template.clone(),
-                default_container: cli.container.clone(),
+                account: account.clone(),
+                endpoint: endpoint_template,
+                default_container: container.clone(),
                 account_key: cli.account_key.clone(),
                 use_msi: cli.msi
                     || cli.msi_client_id.is_some()
@@ -795,29 +799,71 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build an `AzurePageBlobBackend` for the blob selected by the global CLI
-/// options.  Used by the `run` and `test` subcommands (which target a single,
-/// explicitly-named blob).
-fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<AzurePageBlobBackend>> {
-    let blob = cli
-        .blob
-        .clone()
-        .context("--blob (AZURE_STORAGE_BLOB) is required for this subcommand")?;
-    let auth = build_auth(cli)?;
-    let container_client = auth::build_container_client(endpoint, &cli.container, &auth)
+/// A blob location parsed from `--blob-url`, used by the single-device
+/// `run` / `test` / `copy` subcommands.
+struct Location {
+    /// Blob service endpoint URL with a trailing `/` (what
+    /// `build_container_client` expects to append `/container` to).
+    endpoint: String,
+    /// Storage account name (derived from the URL host/path).
+    account: String,
+    /// Container name.
+    container: String,
+    /// Blob name (may contain `/`).
+    blob: String,
+    /// Snapshot timestamp from the URL's `?snapshot=` query, when present.
+    snapshot: Option<String>,
+    /// Effective SAS token (CLI `--sas-token` overrides the URL's SAS query).
+    sas: Option<String>,
+}
+
+impl Cli {
+    /// Resolve the target blob for the single-device subcommands from the
+    /// global `--blob-url` (env `UBLK_BLOB_URL`).
+    ///
+    /// The account, container, blob, endpoint, snapshot and SAS are all carried
+    /// by the URL; the CSI node plugin spawns this `run` child with a single
+    /// `UBLK_BLOB_URL` (substituting any `%s` account placeholder and
+    /// appending `?snapshot=` for read-only snapshot volumes). `--sas-token`
+    /// still overrides the URL's SAS query.
+    fn location(&self) -> anyhow::Result<Location> {
+        let url = self
+            .blob_url
+            .as_deref()
+            .context("--blob-url (or UBLK_BLOB_URL) is required")?;
+        let parsed = bloburl::parse_blob_url(url).context("parse --blob-url")?;
+        Ok(Location {
+            endpoint: format!("{}/", parsed.service_url.trim_end_matches('/')),
+            account: parsed.account,
+            container: parsed.container,
+            blob: parsed.blob,
+            snapshot: parsed.snapshot,
+            sas: self.sas_token.clone().or(parsed.sas),
+        })
+    }
+}
+
+/// Build an `AzurePageBlobBackend` for the blob selected by `--blob-url`.  Used
+/// by the `run` and `test` subcommands (which target a single, explicitly-named
+/// blob).
+fn build_azure_backend(
+    loc: &Location,
+    auth: &AuthConfig,
+) -> anyhow::Result<Arc<AzurePageBlobBackend>> {
+    let container_client = auth::build_container_client(&loc.endpoint, &loc.container, auth)
         .context("build container client")?;
     // Auth-wired pipeline for `Get Page Ranges` (sparseness query used to skip
     // downloading zero regions during cache warm-up); best-effort, so a failure
     // to build it just disables the optimization rather than the whole backend.
-    let backend = AzurePageBlobBackend::new(container_client, blob);
-    let backend = match auth::build_pipeline(&auth) {
+    let backend = AzurePageBlobBackend::new(container_client, loc.blob.clone());
+    let backend = match auth::build_pipeline(auth) {
         Ok(pipeline) => backend.with_page_list(pipeline),
         Err(err) => {
             warn!(%err, "page-ranges query disabled (could not build auth pipeline)");
             backend
         }
     };
-    let backend = match &cli.snapshot {
+    let backend = match &loc.snapshot {
         Some(snapshot) => {
             info!(snapshot = %snapshot, "targeting blob snapshot (read-only)");
             backend.with_snapshot(snapshot.clone())
@@ -827,13 +873,13 @@ fn build_azure_backend(cli: &Cli, endpoint: &str) -> anyhow::Result<Arc<AzurePag
     Ok(Arc::new(backend))
 }
 
-/// Copy a `templateBlobUrl` golden image into the configured target blob
-/// (`--container` / `--blob`) using a server-side copy. Mirrors what the CSI
-/// controller does when provisioning a read-write volume from a template.
+/// Copy a `templateBlobUrl` golden image into the target blob selected by
+/// `--blob-url` using a server-side copy. Mirrors what the CSI controller does
+/// when provisioning a read-write volume from a template.
 #[cfg(feature = "csi")]
 async fn run_template_copy(
     cli: &Cli,
-    endpoint: &str,
+    loc: &Location,
     template_url: &str,
     min_size: u64,
 ) -> anyhow::Result<()> {
@@ -845,13 +891,13 @@ async fn run_template_copy(
     // Authenticate the source with its own SAS when present; otherwise reuse the
     // CLI credentials (the template must then be reachable with them). The source
     // service URL is taken from the template URL's own host so a non-SAS template
-    // in a different account/host than `--endpoint` is read from the right place.
+    // in a different account/host than the target is read from the right place.
     let src_service_url = format!("{}/", tmpl.service_url.trim_end_matches('/'));
     let src_auth = match &tmpl.sas {
         Some(sas) => AuthConfig::Sas {
             sas_token: sas.clone(),
         },
-        None => build_auth(cli)?,
+        None => build_auth(cli, &tmpl.account, None)?,
     };
     let src_container = auth::build_container_client(&src_service_url, &tmpl.container, &src_auth)
         .context("build template container client")?;
@@ -862,11 +908,11 @@ async fn run_template_copy(
     let source_size = source.size().await.context("stat template blob")?;
     let size = round_up_512(source_size.max(min_size));
 
-    let dest = build_azure_backend(cli, endpoint)?;
-    let dest_auth = build_auth(cli)?;
+    let dest_auth = build_auth(cli, &loc.account, loc.sas.as_deref())?;
+    let dest = build_azure_backend(loc, &dest_auth)?;
     info!(
         template = %template_url, source_size, target_size = size,
-        container = %cli.container, "server-side copy of template into target blob"
+        container = %loc.container, "server-side copy of template into target blob"
     );
     dest.create(size).await.context("create target blob")?;
     copy_template(
@@ -898,8 +944,8 @@ fn hostname() -> String {
 /// requires the `coordination` build feature.
 #[allow(clippy::too_many_arguments)]
 async fn acquire_lock(
-    cli: &Cli,
-    endpoint: &str,
+    loc: &Location,
+    auth: &AuthConfig,
     coordination: bool,
     recovery_timeout_secs: u64,
     lease_duration_secs: u64,
@@ -910,12 +956,8 @@ async fn acquire_lock(
     use coordination::{CoordinationConfig, Coordinator};
     use std::time::Duration;
 
-    let blob = cli
-        .blob
-        .clone()
-        .context("--blob (AZURE_STORAGE_BLOB) is required for the blob lock")?;
-    let auth = build_auth(cli)?;
-    let container_client = auth::build_container_client(endpoint, &cli.container, &auth)
+    let blob = loc.blob.clone();
+    let container_client = auth::build_container_client(&loc.endpoint, &loc.container, auth)
         .context("build container client for blob lock")?;
     let blob_lock = Arc::new(backend::azure::AzureBlobLock::new(
         container_client,
@@ -938,7 +980,7 @@ async fn acquire_lock(
     let cluster = if coordination {
         Some(
             connect_cluster_lease(
-                &cli.container,
+                &loc.container,
                 &blob,
                 holder,
                 lease_namespace,
@@ -1040,16 +1082,16 @@ fn sanitize_cache_component(s: &str) -> String {
     out
 }
 
-fn build_auth(cli: &Cli) -> anyhow::Result<AuthConfig> {
-    if let Some(sas) = &cli.sas_token {
+fn build_auth(cli: &Cli, account: &str, sas: Option<&str>) -> anyhow::Result<AuthConfig> {
+    if let Some(sas) = sas {
         return Ok(AuthConfig::Sas {
-            sas_token: sas.clone(),
+            sas_token: sas.to_string(),
         });
     }
 
     if let Some(key) = &cli.account_key {
         return Ok(AuthConfig::SharedKey {
-            account_name: cli.account.clone(),
+            account_name: account.to_string(),
             account_key: key.clone(),
         });
     }
