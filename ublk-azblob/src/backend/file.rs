@@ -99,10 +99,11 @@ pub struct FileCacheBackend {
     /// Shared cross-process clean-page index; `None` when page sharing is off.
     index: Option<CacheIndex>,
     /// Whether the cache dir's filesystem supports `FALLOC_FL_PUNCH_HOLE`.
-    /// Eviction reclaims disk by punching holes; on a filesystem that lacks it
-    /// (NFS, some overlay / virtio-fs) we degrade to grow-only instead of
-    /// failing live writes (see [`FileCacheBackend::open`]).
-    eviction_supported: bool,
+    /// Used both to reclaim disk on eviction and to keep all-zero pages sparse
+    /// (a hole reads back as zeros); on a filesystem that lacks it (NFS, some
+    /// overlay / virtio-fs) eviction degrades to grow-only and zero pages are
+    /// written out as zeros instead. Probed once at [`FileCacheBackend::open`].
+    punch_hole_supported: bool,
     state: Mutex<CacheState>,
 }
 
@@ -279,26 +280,22 @@ impl FileCacheBackend {
             None
         };
 
-        // Eviction reclaims disk by punching holes in the data file. Probe
-        // support once (only matters when a budget is set); if the cache dir's
-        // filesystem lacks `FALLOC_FL_PUNCH_HOLE` (NFS, some overlay/virtio-fs),
-        // degrade to grow-only rather than turning the first over-budget write
-        // into a fatal I/O error.
-        let eviction_supported = if budget.is_some() {
-            let ok = probe_punch_hole(&cfg.dir);
-            if !ok {
-                warn!(
-                    dir = %cfg.dir.display(),
-                    "cache filesystem does not support FALLOC_FL_PUNCH_HOLE; \
-                     disabling eviction (cache grows without reclaiming disk and \
-                     the byte budget is not enforced)"
-                );
-            }
-            ok
-        } else {
-            // No budget → eviction never runs, so support is irrelevant.
-            true
-        };
+        // `FALLOC_FL_PUNCH_HOLE` is used both to reclaim disk on eviction and to
+        // keep all-zero pages sparse. Probe support once, unconditionally, so the
+        // zero-page path falls back to writing zeros quietly (rather than failing
+        // a punch per page) on a filesystem that lacks it (NFS, some
+        // overlay/virtio-fs). Only warn when a budget is set, since that is the
+        // case where the missing capability changes behaviour (eviction disabled
+        // → byte budget not enforced).
+        let punch_hole_supported = probe_punch_hole(&cfg.dir);
+        if budget.is_some() && !punch_hole_supported {
+            warn!(
+                dir = %cfg.dir.display(),
+                "cache filesystem does not support FALLOC_FL_PUNCH_HOLE; \
+                 disabling eviction (cache grows without reclaiming disk and \
+                 the byte budget is not enforced)"
+            );
+        }
 
         Ok((
             Self {
@@ -306,7 +303,7 @@ impl FileCacheBackend {
                 page_size: cfg.page_size,
                 budget,
                 index,
-                eviction_supported,
+                punch_hole_supported,
                 state: Mutex::new(state),
             },
             recovered_dirty,
@@ -403,7 +400,7 @@ impl FileCacheBackend {
         let Some(budget) = &self.budget else {
             return Ok(());
         };
-        if !self.eviction_supported {
+        if !self.punch_hole_supported {
             // Grow-only: this filesystem can't reclaim disk via hole-punching, so
             // we keep all pages rather than failing the live write (warned once at
             // open). The byte budget is effectively unenforced.
@@ -552,7 +549,7 @@ impl FileCacheBackend {
         let is_zero = !data.iter().any(|&b| b != 0);
         let page_len = self.page_len(state, page_idx);
         let mut is_hole = false;
-        if is_zero && self.eviction_supported {
+        if is_zero && self.punch_hole_supported {
             match punch_hole(&state.data, offset, page_len) {
                 Ok(()) => is_hole = true,
                 Err(err) => {
