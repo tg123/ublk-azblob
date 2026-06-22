@@ -1657,6 +1657,88 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A wrapper that delegates to an inner backend but reports a fixed
+    /// sparseness map via `data_ranges()` and counts reads, so the file-cache
+    /// warm-up's zero-gap skip branch can be unit-tested (MemBackend reports
+    /// `None`, which never exercises it).
+    struct SparseBackend {
+        inner: Arc<dyn BlobBackend>,
+        ranges: Vec<(u64, u64)>,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl SparseBackend {
+        fn new(inner: Arc<dyn BlobBackend>, ranges: Vec<(u64, u64)>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                ranges,
+                reads: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+        fn read_count(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for SparseBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+        async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+            Ok(Some(self.ranges.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_skips_zero_gap_pages_via_data_ranges() {
+        // With a sparse `data_ranges()` map, warm-up must populate only the
+        // pages overlapping a data range and never fetch (or make resident) the
+        // pages lying entirely in a zero gap.
+        let dir = tmp_dir("warmup-sparse");
+        let page = 1024u64;
+        let dev = 16 * page; // 16 pages
+
+        // Data lives only in pages [4, 8); the rest of the device is a zero gap.
+        let data_off = 4 * page;
+        let data_len = 4 * page;
+        let inner = Arc::new(MemBackend::new(dev).unwrap());
+        inner
+            .write(data_off, Bytes::from(vec![0x5A; data_len as usize]))
+            .await
+            .unwrap();
+        let sparse = SparseBackend::new(inner, vec![(data_off, data_len)]);
+
+        let (b, _) = open(sparse.clone(), &dir, page, dev);
+        b.warmup(dev, page, dev, 8).await;
+
+        // Only the 4 data pages are resident; the 12 zero-gap pages were skipped.
+        assert_eq!(b.present_count().await, 4);
+        // And only those 4 pages were ever fetched from the backend.
+        assert_eq!(sparse.read_count(), 4);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn dirty_writes_survive_reopen_and_flush_once() {
         // Writes that are persisted to the cache but never flushed are recovered
