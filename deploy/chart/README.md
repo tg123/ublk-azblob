@@ -130,7 +130,7 @@ A single image is shared by the controller and node plugins.
 | `storageClass.isDefault` | Set as default StorageClass | `false` |
 | `storageClass.reclaimPolicy` | Reclaim policy | `Delete` |
 | `storageClass.volumeBindingMode` | Volume binding mode | `WaitForFirstConsumer` |
-| `storageClass.allowVolumeExpansion` | Allow volume expansion | `false` |
+| `storageClass.allowVolumeExpansion` | Allow volume expansion | `true` |
 | `storageClass.parameters.storageAccount` | Storage account (supports variables) | `""` |
 | `storageClass.parameters.container` | Container name (supports variables) | `ublk-azblob-volumes` |
 | `storageClass.parameters.blobPathTemplate` | Blob path template | `${pvc.namespace}/volumes/${pv.name}` |

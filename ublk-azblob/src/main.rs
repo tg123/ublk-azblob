@@ -1264,6 +1264,9 @@ mod warmup_tests {
         async fn create(&self, _size: u64) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn resize(&self, _new_size: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
             self.reads.lock().unwrap().push((offset, len));
             Ok(Bytes::from(vec![0u8; len as usize]))

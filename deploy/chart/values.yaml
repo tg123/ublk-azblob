@@ -132,6 +132,20 @@ sidecars:
         cpu: 50m
         memory: 64Mi
 
+  resizer:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-resizer
+      tag: v1.12.0
+    # ControllerExpandVolume RPC timeout.
+    timeout: 60s
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
 # StorageClass configuration
 storageClass:
   # Create StorageClass (set to false if you want to create your own)
@@ -150,7 +164,7 @@ storageClass:
   volumeBindingMode: WaitForFirstConsumer
   
   # Allow volume expansion
-  allowVolumeExpansion: false
+  allowVolumeExpansion: true
   
   # Parameters (all support variable expansion: ${pvc.namespace}, ${pvc.name}, ${pv.name})
   parameters:

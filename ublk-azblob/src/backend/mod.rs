@@ -55,6 +55,14 @@ pub trait BlobBackend: Send + Sync {
     /// `size` must be a non-zero multiple of 512.
     async fn create(&self, size: u64) -> anyhow::Result<()>;
 
+    /// Grow the backing store to `new_size` bytes (volume expansion).
+    ///
+    /// `new_size` must be a non-zero multiple of 512 and must not be smaller
+    /// than the current size — shrinking is rejected, matching CSI and Azure
+    /// Page Blob semantics. Growing to the current size is a no-op success
+    /// (idempotent), so the CSI resize flow can safely retry.
+    async fn resize(&self, new_size: u64) -> anyhow::Result<()>;
+
     /// Read `len` bytes starting at `offset`.
     ///
     /// Both `offset` and `len` must be multiples of 512.

@@ -393,13 +393,14 @@ impl Controller for ControllerService {
         &self,
         _request: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
-        let cap = ControllerServiceCapability {
-            r#type: Some(CapType::Rpc(Rpc {
-                r#type: RpcType::CreateDeleteVolume as i32,
-            })),
-        };
+        let caps = [RpcType::CreateDeleteVolume, RpcType::ExpandVolume]
+            .into_iter()
+            .map(|t| ControllerServiceCapability {
+                r#type: Some(CapType::Rpc(Rpc { r#type: t as i32 })),
+            })
+            .collect();
         Ok(Response::new(ControllerGetCapabilitiesResponse {
-            capabilities: vec![cap],
+            capabilities: caps,
         }))
     }
 
@@ -473,9 +474,63 @@ impl Controller for ControllerService {
 
     async fn controller_expand_volume(
         &self,
-        _request: Request<ControllerExpandVolumeRequest>,
+        request: Request<ControllerExpandVolumeRequest>,
     ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
-        Err(Status::unimplemented("ControllerExpandVolume"))
+        let req = request.into_inner();
+        if req.volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume id is required"));
+        }
+        let (read_only, account, container, blob) = parse_volume_id(&req.volume_id)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+
+        // Read-only template/snapshot volumes point many PVCs at one shared
+        // golden-image blob, so growing it for one PVC would resize it for all
+        // (and snapshots are immutable). Reject expansion of these.
+        if read_only {
+            return Err(Status::failed_precondition(
+                "cannot expand a read-only template/snapshot volume",
+            ));
+        }
+
+        // Per CSI, required_bytes is the minimum target size; round up to the
+        // 512-byte page-blob alignment like CreateVolume does.
+        let requested = req
+            .capacity_range
+            .as_ref()
+            .map(|c| c.required_bytes)
+            .unwrap_or(0);
+        if requested <= 0 {
+            return Err(Status::invalid_argument(
+                "capacity_range.required_bytes must be greater than 0",
+            ));
+        }
+        let new_size = round_up_512(requested as u64);
+
+        info!(
+            volume_id = %req.volume_id, account = %account, container = %container,
+            new_size, "ControllerExpandVolume"
+        );
+
+        let backend = build_backend(&self.config, &account, &container, &blob, &req.secrets)
+            .map_err(|e| Status::internal(format!("build backend: {e:#}")))?;
+        // `resize` rejects shrink and is a no-op when already at/above the
+        // requested size, so this is idempotent under external-resizer retries.
+        backend.resize(new_size).await.map_err(|e| {
+            error!(error = %format!("{e:#}"), "resize page blob failed");
+            Status::internal(format!("resize page blob: {e:#}"))
+        })?;
+
+        // Report the actual size so the CO sees the 512-aligned capacity, and
+        // require NodeExpandVolume so the node grows the block device/filesystem.
+        let actual = backend
+            .size()
+            .await
+            .map_err(|e| Status::internal(format!("stat page blob: {e:#}")))?;
+
+        Ok(Response::new(ControllerExpandVolumeResponse {
+            capacity_bytes: actual as i64,
+            node_expansion_required: true,
+        }))
     }
 
     async fn controller_get_volume(
@@ -490,5 +545,86 @@ impl Controller for ControllerService {
         _request: Request<ControllerModifyVolumeRequest>,
     ) -> Result<Response<ControllerModifyVolumeResponse>, Status> {
         Err(Status::unimplemented("ControllerModifyVolume"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::csi::proto::CapacityRange;
+    use crate::csi::{make_volume_id, make_volume_id_ro, DriverConfig};
+
+    fn test_config() -> DriverConfig {
+        DriverConfig {
+            account: "devstoreaccount1".to_string(),
+            endpoint: "http://127.0.0.1:10000/devstoreaccount1".to_string(),
+            default_container: "vols".to_string(),
+            account_key: Some("key".to_string()),
+            use_msi: false,
+            msi_client_id: None,
+            use_workload_identity: false,
+            workload_identity_client_id: None,
+            workload_identity_tenant_id: None,
+            workload_identity_token_file: None,
+            sp_tenant_id: None,
+            sp_client_id: None,
+            sp_client_secret: None,
+            use_nbd: false,
+            nbd_host: "127.0.0.1".to_string(),
+            nbd_port_start: 10900,
+        }
+    }
+
+    fn expand_req(volume_id: &str, required_bytes: i64) -> Request<ControllerExpandVolumeRequest> {
+        Request::new(ControllerExpandVolumeRequest {
+            volume_id: volume_id.to_string(),
+            capacity_range: Some(CapacityRange {
+                required_bytes,
+                limit_bytes: 0,
+            }),
+            secrets: HashMap::new(),
+            volume_capability: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn expand_volume_advertised_as_capability() {
+        let svc = ControllerService::new(test_config());
+        let caps = svc
+            .controller_get_capabilities(Request::new(ControllerGetCapabilitiesRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .capabilities;
+        let has_expand = caps.iter().any(|c| {
+            matches!(
+                &c.r#type,
+                Some(CapType::Rpc(Rpc { r#type })) if *r#type == RpcType::ExpandVolume as i32
+            )
+        });
+        assert!(has_expand, "EXPAND_VOLUME must be advertised");
+    }
+
+    #[tokio::test]
+    async fn expand_volume_rejects_empty_id() {
+        let svc = ControllerService::new(test_config());
+        let err = svc.controller_expand_volume(expand_req("", 1024)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn expand_volume_rejects_read_only_template() {
+        let svc = ControllerService::new(test_config());
+        let id = make_volume_id_ro("acct", "cont", "blob");
+        let err = svc.controller_expand_volume(expand_req(&id, 1 << 20)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn expand_volume_rejects_zero_capacity() {
+        let svc = ControllerService::new(test_config());
+        let id = make_volume_id("acct", "cont", "blob");
+        let err = svc.controller_expand_volume(expand_req(&id, 0)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

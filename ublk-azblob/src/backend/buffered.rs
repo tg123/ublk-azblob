@@ -500,6 +500,16 @@ impl BlobBackend for BufferedBackend {
         Ok(())
     }
 
+    async fn resize(&self, new_size: u64) -> anyhow::Result<()> {
+        // Grow the underlying store first, then update the cached device size so
+        // reads/writes past the old end pass the in-bounds check. Buffered dirty
+        // pages stay valid (the grown region is appended after them).
+        self.inner.resize(new_size).await?;
+        let mut state = self.state.lock().await;
+        state.dev_size = new_size;
+        Ok(())
+    }
+
     async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
         if len == 0 {
             return Ok(Bytes::new());
@@ -734,6 +744,28 @@ mod tests {
         b.write(0, data.clone()).await.unwrap();
         let read = b.read(0, 512).await.unwrap();
         assert_eq!(read, data);
+    }
+
+    #[tokio::test]
+    async fn resize_grows_device_and_inner() {
+        let b = make_backend(4096, 1024, 4);
+        let data = Bytes::from(vec![0xAB; 512]);
+        b.write(0, data.clone()).await.unwrap();
+        // Grow the device.
+        b.resize(8192).await.unwrap();
+        assert_eq!(b.size().await.unwrap(), 8192);
+        // Existing buffered data survives.
+        assert_eq!(b.read(0, 512).await.unwrap(), data);
+        // The newly-available region is now in bounds and reads back zeroed.
+        let tail = b.read(4096, 512).await.unwrap();
+        assert!(tail.iter().all(|&x| x == 0));
+        // A write into the grown region round-trips and persists on flush.
+        let grown = Bytes::from(vec![0xCD; 512]);
+        b.write(8192 - 512, grown.clone()).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.read(8192 - 512, 512).await.unwrap(), grown);
+        // Shrink is rejected.
+        assert!(b.resize(4096).await.is_err(), "shrink rejected");
     }
 
     #[tokio::test]

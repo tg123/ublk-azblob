@@ -17,12 +17,13 @@ use tracing::{error, info, instrument, warn};
 use super::mount;
 use super::proto::node_server::Node;
 use super::proto::{
+    node_service_capability::{rpc::Type as NodeRpcType, Rpc as NodeRpc, Type as NodeCapType},
     volume_capability::AccessType, NodeExpandVolumeRequest, NodeExpandVolumeResponse,
     NodeGetCapabilitiesRequest, NodeGetCapabilitiesResponse, NodeGetInfoRequest,
     NodeGetInfoResponse, NodeGetVolumeStatsRequest, NodeGetVolumeStatsResponse,
-    NodePublishVolumeRequest, NodePublishVolumeResponse, NodeStageVolumeRequest,
-    NodeStageVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
-    NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
+    NodePublishVolumeRequest, NodePublishVolumeResponse, NodeServiceCapability,
+    NodeStageVolumeRequest, NodeStageVolumeResponse, NodeUnpublishVolumeRequest,
+    NodeUnpublishVolumeResponse, NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
 };
 use super::DriverConfig;
 
@@ -485,9 +486,16 @@ impl Node for NodeService {
         &self,
         _request: Request<NodeGetCapabilitiesRequest>,
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
-        // No staging and no online expansion: publish/unpublish do all the work.
+        // No staging: publish/unpublish do the device + mount work. We do
+        // advertise EXPAND_VOLUME so the CO calls NodeExpandVolume to grow the
+        // filesystem after the controller has resized the backing blob.
+        let cap = NodeServiceCapability {
+            r#type: Some(NodeCapType::Rpc(NodeRpc {
+                r#type: NodeRpcType::ExpandVolume as i32,
+            })),
+        };
         Ok(Response::new(NodeGetCapabilitiesResponse {
-            capabilities: Vec::new(),
+            capabilities: vec![cap],
         }))
     }
 
@@ -527,9 +535,75 @@ impl Node for NodeService {
 
     async fn node_expand_volume(
         &self,
-        _request: Request<NodeExpandVolumeRequest>,
+        request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
-        Err(Status::unimplemented("NodeExpandVolume"))
+        let req = request.into_inner();
+        if req.volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume id is required"));
+        }
+        if req.volume_path.is_empty() {
+            return Err(Status::invalid_argument("volume path is required"));
+        }
+
+        // Raw block volumes are not supported by this driver (NodePublishVolume
+        // rejects them), and a block device needs no filesystem grow, so there
+        // is nothing to do — report the device size back to the CO.
+        if let Some(cap) = &req.volume_capability {
+            if matches!(cap.access_type, Some(AccessType::Block(_))) {
+                return Err(Status::invalid_argument(
+                    "raw block volumes are not supported",
+                ));
+            }
+        }
+
+        // Resolve the backing device: prefer the in-memory publish registry, and
+        // fall back to resolving it from the mount path (e.g. after a restart).
+        let registered = self
+            .volumes
+            .lock()
+            .unwrap()
+            .get(&req.volume_id)
+            .map(|p| p.device.clone());
+
+        // Prefer the CO-provided fsType (volume capability), else detect it.
+        let cap_fs_type = req.volume_capability.as_ref().and_then(|c| {
+            if let Some(AccessType::Mount(m)) = &c.access_type {
+                Some(m.fs_type.clone()).filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        });
+
+        let volume_path = req.volume_path.clone();
+        let volume_id = req.volume_id.clone();
+
+        let capacity = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let device = match registered {
+                Some(dev) => dev,
+                None => {
+                    warn!(%volume_id, "no tracked device; resolving from mount path");
+                    mount::device_for_mount(&volume_path)?
+                }
+            };
+            let fs_type = match cap_fs_type {
+                Some(fs) => fs,
+                None => mount::fs_type_of(&device)?,
+            };
+            // Grow the filesystem to fill the (already-resized) block device.
+            mount::resize_fs(&device, &volume_path, &fs_type)?;
+            mount::device_size(&device)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("expand task panicked: {e}")))?
+        .map_err(|e| {
+            error!(error = %format!("{e:#}"), "NodeExpandVolume failed");
+            Status::internal(format!("{e:#}"))
+        })?;
+
+        info!(volume_id = %req.volume_id, capacity, "NodeExpandVolume done");
+        Ok(Response::new(NodeExpandVolumeResponse {
+            capacity_bytes: capacity as i64,
+        }))
     }
 }
 

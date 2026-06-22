@@ -435,6 +435,79 @@ pub fn mount(
     run("mount", &arg_refs)
 }
 
+/// Resolve the block device backing the filesystem mounted at `path` via
+/// `findmnt`. Used by NodeExpandVolume when the in-memory publish registry has
+/// no entry (e.g. after a node-plugin restart).
+pub fn device_for_mount(path: &str) -> anyhow::Result<String> {
+    let output = Command::new("findmnt")
+        .args(["-n", "-o", "SOURCE", "--target", path])
+        .output()
+        .with_context(|| format!("spawn `findmnt --target {path}`"))?;
+    if !output.status.success() {
+        bail!(
+            "`findmnt --target {path}` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let dev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if dev.is_empty() {
+        bail!("findmnt found no device mounted at {path}");
+    }
+    Ok(dev)
+}
+
+/// Detect the filesystem type of `dev` via `blkid` (`TYPE=` value).
+pub fn fs_type_of(dev: &str) -> anyhow::Result<String> {
+    let output = Command::new("blkid")
+        .args(["-o", "value", "-s", "TYPE", dev])
+        .output()
+        .with_context(|| format!("spawn `blkid {dev}`"))?;
+    if !output.status.success() {
+        bail!("`blkid {dev}` could not determine filesystem type");
+    }
+    let fs = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if fs.is_empty() {
+        bail!("blkid reported no filesystem type for {dev}");
+    }
+    Ok(fs)
+}
+
+/// Report the size of block device `dev` in bytes via `blockdev --getsize64`.
+pub fn device_size(dev: &str) -> anyhow::Result<u64> {
+    let output = Command::new("blockdev")
+        .arg("--getsize64")
+        .arg(dev)
+        .output()
+        .with_context(|| format!("spawn `blockdev --getsize64 {dev}`"))?;
+    if !output.status.success() {
+        bail!(
+            "`blockdev --getsize64 {dev}` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("parse size of {dev}"))
+}
+
+/// Grow the filesystem on `dev` (mounted at `mountpoint`) to fill the block
+/// device, after the underlying device has been resized.
+///
+/// `ext*` filesystems are grown online with `resize2fs <dev>` (no target size →
+/// fill the device); `xfs` is grown with `xfs_growfs <mountpoint>` (xfs can only
+/// be grown while mounted and is addressed by mount point, not device).
+pub fn resize_fs(dev: &str, mountpoint: &str, fs_type: &str) -> anyhow::Result<()> {
+    info!(dev, mountpoint, fs_type, "growing filesystem");
+    match fs_type {
+        "ext2" | "ext3" | "ext4" => run("resize2fs", &[dev]),
+        "xfs" => run("xfs_growfs", &[mountpoint]),
+        other => bail!("filesystem expansion is not supported for fs type {other:?}"),
+    }
+}
+
 /// Unmount `target` (idempotent: a "not mounted" result is treated as success).
 pub fn umount(target: &str) -> anyhow::Result<()> {
     if !Path::new(target).exists() {
