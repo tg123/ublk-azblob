@@ -45,8 +45,8 @@ parameters:
   {{- if .templateBlobFsType }}
   templateBlobFsType: {{ .templateBlobFsType | quote }}
   {{- end }}
-  {{- if .templateBlobMountArgs }}
-  templateBlobMountArgs: {{ .templateBlobMountArgs | quote }}
+  {{- if .templateBlobMountArgsOverwrite }}
+  templateBlobMountArgsOverwrite: {{ .templateBlobMountArgsOverwrite | quote }}
   {{- end }}
   {{- if .fsck }}
   fsck: {{ .fsck | quote }}
@@ -94,8 +94,8 @@ parameters:
   {{- if .templateBlobFsType }}
   templateBlobFsType: {{ .templateBlobFsType | quote }}
   {{- end }}
-  {{- if .templateBlobMountArgs }}
-  templateBlobMountArgs: {{ .templateBlobMountArgs | quote }}
+  {{- if .templateBlobMountArgsOverwrite }}
+  templateBlobMountArgsOverwrite: {{ .templateBlobMountArgsOverwrite | quote }}
   {{- end }}
   {{- if .fsck }}
   fsck: {{ .fsck | quote }}

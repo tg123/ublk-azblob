@@ -136,7 +136,7 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.blobPathTemplate` | Blob path template | `${pvc.namespace}/volumes/${pv.name}` |
 | `storageClass.parameters.newBlobFsType` | Filesystem to format a freshly-provisioned blob (formattable profiles: ext2/3/4, xfs, btrfs) | `ext4` |
 | `storageClass.parameters.templateBlobFsType` | Filesystem the node mounts a `templateBlobUrl` image as (template only; never reformatted; image-only types squashfs/zfs/ntfs are valid here) | `""` |
-| `storageClass.parameters.templateBlobMountArgs` | Advanced: override the built-in mount options of the `templateBlobFsType` profile (template only; comma/space-separated) | `""` |
+| `storageClass.parameters.templateBlobMountArgsOverwrite` | Advanced: override the built-in mount options of the `templateBlobFsType` profile (template only; comma/space-separated) | `""` |
 | `storageClass.parameters.fsck` | Run `fsck` before mounting a writable, formatted volume: `"false"`/`"off"` (default, skip), `"true"`/`"preen"` (`fsck -a`), or `"force"` (`fsck -f -y`). Skipped for freshly-formatted and read-only volumes | `""` |
 | `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS; `?snapshot=` ⇒ mount the immutable snapshot directly read-only, no copy/lock/lease; non-snapshot ⇒ copy into the per-PVC blob read-write and skip format) | `""` |
 

@@ -200,7 +200,7 @@ storageClass:
 
     # Advanced: override the built-in mount options of the templateBlobFsType
     # profile. Comma- or space-separated. Only meaningful with templateBlobUrl.
-    # templateBlobMountArgs: "noatime,nodiratime"
+    # templateBlobMountArgsOverwrite: "noatime,nodiratime"
 
 # Secret configuration for global mode
 # Only used when secretSearchMode: global

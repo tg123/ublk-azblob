@@ -259,11 +259,11 @@ impl Node for NodeService {
             }
         }
         // Built-in mount options from the filesystem profile. The advanced
-        // `templateBlobMountArgs` parameter (template volumes only) overwrites
+        // `templateBlobMountArgsOverwrite` parameter (template volumes only) overwrites
         // these precooked defaults when set.
         match req
             .volume_context
-            .get("templateBlobMountArgs")
+            .get("templateBlobMountArgsOverwrite")
             .map(|opts| split_opts(opts))
             .filter(|over| !over.is_empty())
         {
