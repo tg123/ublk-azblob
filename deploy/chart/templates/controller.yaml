@@ -55,6 +55,21 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
 
+        - name: csi-resizer
+          image: {{ .Values.sidecars.resizer.image.repository }}:{{ .Values.sidecars.resizer.image.tag }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--timeout={{ .Values.sidecars.resizer.timeout | default "60s" }}"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          {{- with .Values.sidecars.resizer.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
         - name: azblob
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
