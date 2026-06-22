@@ -543,7 +543,7 @@ The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
 (`ubuntu-24.04` is avoided because its azure kernel currently Oopses in
 `ublk_drv` — see [actions/runner-images#14175](https://github.com/actions/runner-images/issues/14175).)
 
-A separate **`bench`** workflow (on pull requests and manual `workflow_dispatch`)
+A separate **`bench`** workflow (on pushes to `main`, pull requests, and manual `workflow_dispatch`)
 runs the fio benchmark comparing the ublk-azblob device against a raw local disk,
 on the same `ubuntu-22.04` runner.
 
