@@ -16,6 +16,8 @@
 
 mod auth;
 mod backend;
+#[cfg(feature = "bench")]
+mod bench;
 mod bloburl;
 #[cfg_attr(not(feature = "coordination"), allow(dead_code))]
 mod coordination;
@@ -382,6 +384,39 @@ enum Command {
         size: u64,
     },
 
+    /// Benchmark the BlobBackend (throughput, IOPS, latency).
+    #[cfg(feature = "bench")]
+    Bench {
+        /// Size of the benchmark blob in bytes (multiple of 512).
+        #[arg(long, default_value = "67108864")]
+        size: u64,
+
+        /// I/O size per operation in bytes (multiple of 512).
+        #[arg(long, default_value = "4096")]
+        block_size: u64,
+
+        /// Number of operations to issue per phase.
+        #[arg(long, default_value = "1024")]
+        count: u64,
+
+        /// Number of concurrent in-flight operations (queue depth).
+        #[arg(long, default_value = "16")]
+        concurrency: u64,
+
+        /// Which workload(s) to run.
+        #[arg(long, value_enum, default_value_t = bench::Workload::All)]
+        workload: bench::Workload,
+
+        /// Provision (create/overwrite) the blob before benchmarking.
+        #[arg(long)]
+        create: bool,
+
+        /// Append a markdown results table to this file (used by the fio
+        /// benchmark pipeline to merge backend latency into its summary).
+        #[arg(long)]
+        markdown_out: Option<std::path::PathBuf>,
+    },
+
     /// Copy a golden-image *template* blob into the target blob selected by
     /// `--blob-url`, then exit.
     ///
@@ -732,6 +767,36 @@ async fn main() -> anyhow::Result<()> {
             let auth = build_auth(&cli, &loc.account, loc.sas.as_deref())?;
             let backend: Arc<dyn BlobBackend> = build_azure_backend(&loc, &auth)?;
             run_smoke_test(backend, size).await?;
+        }
+
+        #[cfg(feature = "bench")]
+        Command::Bench {
+            size,
+            block_size,
+            count,
+            concurrency,
+            workload,
+            create,
+            ref markdown_out,
+        } => {
+            let loc = cli.location()?;
+            let auth = build_auth(&cli, &loc.account, loc.sas.as_deref())?;
+            let backend: Arc<dyn BlobBackend> = build_azure_backend(&loc, &auth)?;
+            let cfg = bench::BenchConfig {
+                size,
+                block_size,
+                count,
+                concurrency,
+                workload,
+                create,
+            };
+            let results = bench::run_bench(backend, cfg.clone())
+                .await
+                .context("benchmark")?;
+            if let Some(path) = markdown_out {
+                std::fs::write(path, bench::results_markdown(&cfg, &results))
+                    .with_context(|| format!("write benchmark markdown to {}", path.display()))?;
+            }
         }
 
         #[cfg(feature = "csi")]
