@@ -51,11 +51,8 @@ docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
 
 # Run the built-in smoke test (create → write → read-back → clear → zero-verify)
 cargo run -p ublk-azblob -- \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob \
   test --size 4096
 ```
 
@@ -93,27 +90,20 @@ against Azurite, real Azure, or the in-memory backend used in tests.
 ```bash
 # System-assigned Managed Identity (recommended on Azure VMs / AKS)
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240
 
 # User-assigned Managed Identity by client ID
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi-client-id 00000000-0000-0000-0000-000000000000 \
   run --size 10737418240
 
 # Account key (local dev / Azurite)
 sudo ./target/release/ublk-azblob \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob.vhd \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob.vhd \
   run --size 4194304
 ```
 
@@ -129,25 +119,22 @@ sudo mount /dev/ublkb0 /mnt/azblob
 ## Read-only mode and blob snapshots
 
 A device is exposed **read-only** by mounting an immutable **point-in-time
-snapshot** of the blob: pass `--snapshot <SNAPSHOT>` (the `x-ms-snapshot`
-timestamp returned when the snapshot was created). There is no separate
-read-only flag — a snapshot is immutable, so the ublk device (or NBD export) is
-advertised read-only and every write, discard, and write-zeroes request is
-rejected, and (because the content can never change) the local cache is safe to
-reuse.
+snapshot** of the blob: append `?snapshot=<SNAPSHOT>` (the `x-ms-snapshot`
+timestamp returned when the snapshot was created) to `--blob-url`. There is no
+separate read-only flag — a snapshot is immutable, so the ublk device (or NBD
+export) is advertised read-only and every write, discard, and write-zeroes
+request is rejected, and (because the content can never change) the local cache
+is safe to reuse.
 
 ```bash
-# Mount a specific blob snapshot (read-only)
+# Mount a specific blob snapshot (read-only is implied)
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
-  --snapshot 2024-01-31T12:00:00.0000000Z \
+  --blob-url "https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd?snapshot=2024-01-31T12:00:00.0000000Z" \
   --msi \
   run --size 10737418240
 ```
 
-`--create` cannot be combined with `--snapshot` (a snapshot is immutable). A
+`--create` cannot be combined with a snapshot URL (a snapshot is immutable). A
 snapshot mount skips the write-back buffer entirely (there are no writes to
 batch); read caching via `--cache-dir` still works.
 
@@ -165,9 +152,7 @@ lapses within ≤60s).
 ```bash
 # Default: the blob lock is acquired automatically — no extra flag needed.
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240
 ```
@@ -177,11 +162,11 @@ process is using the blob:
 
 ```bash
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount --container mydisks --blob myvm.vhd --msi \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd --msi \
   run --size 10737418240 --disable-blob-lock
 ```
 
-Read-only mounts (`--snapshot`) never take the lock, since they
+Read-only snapshot mounts (a `?snapshot=` blob URL) never take the lock, since they
 never write. In Kubernetes, the CSI driver layers a cluster-wide lease on top of
 this blob lock via `--coordination` so a dead node's volume can be safely taken
 over; see [`docs/cluster-testing.md`](docs/cluster-testing.md). `--coordination`
@@ -201,11 +186,8 @@ NBD client — and does **not** require the `ublk` Cargo feature.
 ```bash
 # Start the NBD server (works on any kernel; no ublk device needed)
 ./target/release/ublk-azblob \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob.vhd \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob.vhd \
   run --size 4194304 --nbd 0.0.0.0:10809
 
 # In another shell, attach it as /dev/nbd0
@@ -225,16 +207,12 @@ in NBD mode. The local-disk / write-back cache options behave identically.
 
 ## Environment variables
 
-All CLI flags have environment-variable equivalents:
+Common CLI flags have environment-variable equivalents:
 
 | Flag | Env var |
 |------|---------|
-| `--account` | `AZURE_STORAGE_ACCOUNT` |
-| `--endpoint` | `AZURE_STORAGE_ENDPOINT` |
+| `--blob-url` | `UBLK_BLOB_URL` |
 | `--account-key` | `AZURE_STORAGE_KEY` |
-| `--container` | `AZURE_STORAGE_CONTAINER` |
-| `--blob` | `AZURE_STORAGE_BLOB` |
-| `--snapshot` | `AZURE_STORAGE_SNAPSHOT` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
 | `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
@@ -258,9 +236,7 @@ Enable it by pointing `--cache-dir` at a directory on a local disk:
 
 ```bash
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240 \
   --cache-dir /var/cache/ublk-azblob \
