@@ -540,13 +540,30 @@ impl FileCacheBackend {
         offset: u64,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        // An all-zero page is left as a sparse hole in the data file
-        // (which reads back as zeros) instead of being written, so zero regions
+        // An all-zero page is kept sparse (no blocks allocated) so zero regions
         // of the blob — e.g. an ext4 image's free space — consume no local disk.
-        // This is always safe here: this function is called only for a
-        // not-yet-present page whose data-file region is still a hole.
-        let is_hole = !data.iter().any(|&b| b != 0);
-        if !is_hole {
+        // We *punch a hole* over the region rather than merely skipping the
+        // write: skipping is unsafe because the `.dat` region may hold stale
+        // non-zero bytes from a page whose present bit was never made durable
+        // before an unclean shutdown (data is fsynced before the present bit),
+        // which would otherwise read back as garbage instead of zeros. Where
+        // hole-punching is unsupported, fall back to writing the zeros (correct,
+        // but consumes disk).
+        let is_zero = !data.iter().any(|&b| b != 0);
+        let page_len = self.page_len(state, page_idx);
+        let mut is_hole = false;
+        if is_zero && self.eviction_supported {
+            match punch_hole(&state.data, offset, page_len) {
+                Ok(()) => is_hole = true,
+                Err(err) => {
+                    warn!(page_idx, %err, "punch hole for zero page failed; writing zeros");
+                    state
+                        .data
+                        .write_all_at(data, offset)
+                        .with_context(|| format!("write zero page {page_idx} to cache file"))?;
+                }
+            }
+        } else {
             state
                 .data
                 .write_all_at(data, offset)
@@ -564,13 +581,11 @@ impl FileCacheBackend {
         }
 
         // Account the newly-resident clean page and evict if over budget. The
-        // page just loaded is protected from immediate eviction. A hole uses no
-        // disk, so it is admitted as zero bytes (charges nothing, not evictable).
-        let disk_len = if is_hole {
-            0
-        } else {
-            self.page_len(state, page_idx)
-        };
+        // page just loaded is protected from immediate eviction. A punched hole
+        // uses no disk, so it is admitted as zero bytes (charges nothing, not
+        // evictable); a written page (incl. the no-punch zero fallback) occupies
+        // a full page.
+        let disk_len = if is_hole { 0 } else { page_len };
         self.account_present(state, page_idx, true, disk_len)?;
         Ok(())
     }
@@ -1594,6 +1609,39 @@ mod tests {
             "expected a sparse data file, got {} blocks",
             meta.blocks()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn zero_page_overwrites_stale_dat_bytes() {
+        // Simulate an unclean shutdown that left non-zero bytes in the `.dat`
+        // file at a page whose present bit was never persisted (data is fsynced
+        // before the present bit). Warming that page when the blob region is zero
+        // must read back as zeros — not the stale bytes — so store_clean_page
+        // punches a hole / writes zeros rather than skipping the write.
+        use std::os::unix::fs::FileExt as _;
+        let dir = tmp_dir("stale-zero");
+        let page = 4096u64;
+        let dev = 2 * page;
+        let inner = Arc::new(MemBackend::new(dev).unwrap()); // all zeros
+        let (b, _) = open(inner, &dir, page, dev);
+
+        // Corrupt the data file: stale non-zero bytes at page 1, left un-present.
+        {
+            let dat = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("test.dat"))
+                .unwrap();
+            dat.write_all_at(&vec![0xFF; page as usize], page).unwrap();
+        }
+
+        // Warm page 1 (blob region is zero): must yield zeros, not 0xFF.
+        b.prefetch(page, page).await.unwrap();
+        assert_eq!(
+            b.read(page, page).await.unwrap(),
+            Bytes::from(vec![0u8; page as usize])
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
