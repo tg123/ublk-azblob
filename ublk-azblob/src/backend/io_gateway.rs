@@ -166,9 +166,13 @@ pub struct IoGatewayConfig {
 impl IoGatewayConfig {
     /// Auto-size concurrency so that *download + upload = logical CPU count*
     /// (split as evenly as possible, at least one worker each); bandwidth
-    /// unlimited. Environment variables, when set, override each field:
-    /// `UBLK_DOWNLOAD_CONCURRENCY`, `UBLK_UPLOAD_CONCURRENCY`,
-    /// `UBLK_DOWNLOAD_BANDWIDTH`, `UBLK_UPLOAD_BANDWIDTH` (bytes/sec).
+    /// unlimited. Environment variables, when set to a non-zero value, are used
+    /// as the defaults for each field (`UBLK_DOWNLOAD_CONCURRENCY`,
+    /// `UBLK_UPLOAD_CONCURRENCY`, `UBLK_DOWNLOAD_BANDWIDTH`,
+    /// `UBLK_UPLOAD_BANDWIDTH`, bytes/sec for bandwidth). An env concurrency of
+    /// `0` is treated as unset (falls back to the CPU-count split), matching the
+    /// CLI flags — which take precedence over these defaults when explicitly
+    /// provided (see `main.rs`).
     pub fn auto() -> Self {
         let cpu = cpu_count().max(1);
         let download = (cpu / 2).max(1);

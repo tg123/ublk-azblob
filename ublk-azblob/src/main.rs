@@ -357,13 +357,15 @@ enum Command {
         #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_BYTES")]
         cache_warmup_bytes: u64,
 
-        /// Number of blob pages the warm-up fetches concurrently.
+        /// Number of warm-up blob-page fetches the cache keeps in flight at once.
         ///
-        /// Warm-up is otherwise latency-bound (one page in flight at a time);
-        /// raising this makes it bandwidth-bound. Peak transient memory is
-        /// roughly `concurrency × --cache-page-size`, so lower it when using
-        /// large cache pages. Only used when `--cache-dir` and `--cache-warmup`
-        /// are set. `0` (the default) auto-sizes to the logical CPU count.
+        /// Each in-flight fetch submits its blob read through the centralized I/O
+        /// gateway, so this bounds peak transient memory (roughly `concurrency ×
+        /// --cache-page-size`) while the actual Azure download concurrency and
+        /// bandwidth are enforced centrally by the gateway
+        /// (`--download-concurrency` / `--download-bandwidth`). Only used when
+        /// `--cache-dir` and `--cache-warmup` are set. `0` (the default)
+        /// auto-sizes to the logical CPU count.
         #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_CONCURRENCY")]
         cache_warmup_concurrency: usize,
 
@@ -392,13 +394,15 @@ enum Command {
         #[arg(long, default_value = "0", env = "UBLK_FLUSH_IO_TIMEOUT_SECS")]
         flush_io_timeout_secs: u64,
 
-        /// Maximum number of dirty pages flushed concurrently to the backend.
+        /// Number of dirty-page write-backs the flush keeps in flight at once.
         ///
-        /// Flushing is latency-bound when the backend is remote (e.g. Azure in a
-        /// distant region), so issuing several page writes in flight at once is
-        /// the key throughput lever. Transient extra memory is bounded by
-        /// `page_size × this value`. Set to 1 for fully sequential flushing.
-        /// `0` (the default) auto-sizes to the logical CPU count.
+        /// Each in-flight write-back submits its page upload through the
+        /// centralized I/O gateway, so this bounds transient memory (`page_size ×
+        /// this value` of in-flight snapshots) while the actual Azure upload
+        /// concurrency and bandwidth are enforced centrally by the gateway
+        /// (`--upload-concurrency` / `--upload-bandwidth`). Set to 1 for fully
+        /// sequential snapshotting. `0` (the default) auto-sizes to the logical
+        /// CPU count.
         #[arg(long, default_value = "0", env = "UBLK_FLUSH_CONCURRENCY")]
         flush_concurrency: usize,
 

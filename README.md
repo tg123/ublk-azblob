@@ -212,7 +212,41 @@ All CLI flags have environment-variable equivalents:
 | `--cache-share-pages` | `UBLK_CACHE_SHARE_PAGES` |
 | `--cache-warmup` | `UBLK_CACHE_WARMUP` |
 | `--cache-warmup-bytes` | `UBLK_CACHE_WARMUP_BYTES` |
+| `--download-concurrency` | `UBLK_DOWNLOAD_CONCURRENCY` |
+| `--upload-concurrency` | `UBLK_UPLOAD_CONCURRENCY` |
+| `--download-bandwidth` | `UBLK_DOWNLOAD_BANDWIDTH` |
+| `--upload-bandwidth` | `UBLK_UPLOAD_BANDWIDTH` |
 | `--nbd` | `NBD_LISTEN` |
+
+---
+
+## Centralized Azure I/O limits (bandwidth & threads)
+
+Every Azure download (read) and upload (write / clear / server-side copy) is
+funnelled through a single, process-wide **I/O gateway**. It is the one place
+that bounds, *per direction independently*:
+
+- **Bandwidth** — `--download-bandwidth` / `--upload-bandwidth` (bytes/sec,
+  `UBLK_DOWNLOAD_BANDWIDTH` / `UBLK_UPLOAD_BANDWIDTH`). `0` (default) = unlimited.
+- **Threads / concurrency** — `--download-concurrency` / `--upload-concurrency`
+  (`UBLK_DOWNLOAD_CONCURRENCY` / `UBLK_UPLOAD_CONCURRENCY`). `0` (default)
+  auto-sizes so that *download + upload = logical CPU count*, split evenly.
+
+The gateway uses a **provider/consumer** model: producers (on-demand reads,
+write-back flush, server-side copy and cache warm-up) enqueue work onto a
+priority queue that a fixed worker pool drains highest-priority-first. This stops
+background work from starving foreground I/O. The priority order is:
+
+**foreground read > flush > copy > warm-up**
+
+Downloads and uploads have separate worker pools, bandwidth limiters and queues,
+so the two directions never contend with each other.
+
+> The per-subsystem knobs `UBLK_FLUSH_CONCURRENCY`, `UBLK_CACHE_WARMUP_CONCURRENCY`
+> and `UBLK_COPY_CONCURRENCY` now only bound how many operations each producer
+> keeps *in flight* (i.e. memory / pipeline depth); each such operation submits
+> through the gateway, which enforces the authoritative Azure thread and
+> bandwidth ceilings.
 
 ---
 

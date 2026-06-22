@@ -148,6 +148,35 @@ Phase 1: single queue, single thread.  The libublk queue handler calls
 Phase 2: spawn one Tokio task per ublk queue, use `tokio::spawn` + channel for
 back-pressure.  Map io_uring depth → parallel REST calls.
 
+#### Centralized I/O gateway (`src/backend/io_gateway.rs`)
+
+Every Azure download (read) and upload (write / clear / server-side copy) is
+issued from exactly one place — `AzurePageBlobBackend` — so routing its
+primitives through a single, process-wide `AzureIoGateway` makes it the one
+chokepoint that enforces, *per direction independently*:
+
+1. **Bandwidth** — a byte-rate ceiling backed by a leaky bucket
+   (`leaky-bucket`), one limiter per direction; `0` = unlimited.
+2. **Threads / concurrency** — a fixed pool of consumer worker tasks per
+   direction; at most that many Azure requests are in flight at once. The
+   default auto-sizes so that *download + upload = logical CPU count*.
+3. **Fairness** — a **provider/consumer** model. Producers (on-demand reads,
+   write-back flush, server-side copy, cache warm-up) enqueue work onto a
+   priority queue (`async-priority-channel`); the workers drain it
+   highest-priority-first, so background work cannot starve foreground I/O.
+
+The priority order is **foreground read > flush > copy > warm-up**. Producers
+label their traffic with a task-local `IoClass` (`with_class`); on-demand reads
+default to `ForegroundRead` and writes to `Flush`. Downloads and uploads have
+separate pools, limiters and queues, so the two directions never contend.
+
+The per-subsystem knobs (`UBLK_FLUSH_CONCURRENCY`,
+`UBLK_CACHE_WARMUP_CONCURRENCY`, `UBLK_COPY_CONCURRENCY`) now only bound how much
+work each producer keeps *enqueued* (pipeline depth / memory); the authoritative
+Azure thread and bandwidth limits live in the gateway
+(`UBLK_DOWNLOAD_CONCURRENCY` / `UBLK_UPLOAD_CONCURRENCY` /
+`UBLK_DOWNLOAD_BANDWIDTH` / `UBLK_UPLOAD_BANDWIDTH`).
+
 ### 6. Retry / back-off
 
 Phase 1: the Azure SDK's built-in retry policy handles transient 429 (throttled)
