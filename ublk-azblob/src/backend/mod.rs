@@ -7,6 +7,7 @@ pub mod azure;
 pub mod buffered;
 pub mod cache_budget;
 pub mod cache_index;
+pub mod cache_lru;
 pub mod file;
 pub mod mem;
 
