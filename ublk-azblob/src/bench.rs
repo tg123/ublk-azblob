@@ -351,6 +351,49 @@ fn next_rand(seed: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Render the benchmark phase results as a GitHub-flavoured markdown section,
+/// for appending to the fio pipeline's combined summary (`bench-results.md`).
+/// Latencies are reported in microseconds.
+pub fn results_markdown(cfg: &BenchConfig, results: &[PhaseResult]) -> String {
+    let us = |d: std::time::Duration| d.as_secs_f64() * 1e6;
+    let mut out = String::new();
+    out.push_str("## Phase 3 — backend (BlobBackend) latency\n\n");
+    out.push_str(
+        "Throughput, IOPS and latency measured directly against the Azure Page Blob \
+         backend (the `ublk-azblob bench` subcommand), bypassing the kernel block \
+         device.\n\n",
+    );
+    out.push_str(&format!(
+        "| Setting | Value |\n|---------|-------|\n\
+         | Blob size | {} bytes |\n\
+         | Block size | {} bytes |\n\
+         | Ops per phase | {} |\n\
+         | Concurrency (queue depth) | {} |\n\n",
+        cfg.size, cfg.block_size, cfg.count, cfg.concurrency,
+    ));
+    out.push_str(
+        "| Phase | Throughput (MiB/s) | IOPS | min (us) | avg (us) | p50 (us) | p95 (us) | p99 (us) | max (us) |\n",
+    );
+    out.push_str(
+        "|-------|-------------------:|-----:|---------:|---------:|---------:|---------:|---------:|---------:|\n",
+    );
+    for r in results {
+        out.push_str(&format!(
+            "| {} | {:.2} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} |\n",
+            r.name,
+            r.throughput_mib_s(),
+            r.iops(),
+            us(r.latencies.min),
+            us(r.latencies.avg),
+            us(r.latencies.p50),
+            us(r.latencies.p95),
+            us(r.latencies.p99),
+            us(r.latencies.max),
+        ));
+    }
+    out
+}
+
 fn log_result(r: &PhaseResult) {
     info!(
         phase = %r.name,

@@ -70,6 +70,15 @@ FIO_IODEPTH_LIST="${FIO_IODEPTH_LIST:-1 4 16 64 128}"
 FIO_RWMIX_LIST="${FIO_RWMIX_LIST:-100 70 50}"
 FIO_NUMJOBS_LIST="${FIO_NUMJOBS_LIST:-1 4 16 64}"
 
+# Phase 3 — backend (BlobBackend) microbenchmark via the `ublk-azblob bench`
+# subcommand (measures GET/PUT/flush latency direct to Azurite, bypassing the
+# kernel device). Set BENCH_BACKEND=0 to skip it.
+BENCH_BACKEND="${BENCH_BACKEND:-1}"
+BACKEND_BENCH_SIZE="${BACKEND_BENCH_SIZE:-67108864}"   # 64 MiB
+BACKEND_BENCH_BS="${BACKEND_BENCH_BS:-4096}"
+BACKEND_BENCH_COUNT="${BACKEND_BENCH_COUNT:-1024}"
+BACKEND_BENCH_QD="${BACKEND_BENCH_QD:-16}"
+
 # Azure / Azurite connection (mirrors tests/mount_e2e.rs defaults).
 export AZURE_STORAGE_ACCOUNT="${AZURE_STORAGE_ACCOUNT:-devstoreaccount1}"
 export AZURE_STORAGE_KEY="${AZURE_STORAGE_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}"
@@ -297,6 +306,26 @@ for jobs in $FIO_NUMJOBS_LIST; do
     run_case "4 scale" "randread jobs=$jobs" randread "$FIO_BS" "$FIO_IODEPTH" "$jobs"
 done
 
+# ── Phase 3: backend (BlobBackend) latency via the `bench` subcommand ─────────
+# Runs directly against Azurite on a separate blob, independent of the ublk
+# device.  Writes a markdown section that the summary below appends to the fio
+# table.  Requires the binary to be built with the `bench` Cargo feature.
+BACKEND_MD="$TMPDIR_BENCH/backend-bench.md"
+if [[ "$BENCH_BACKEND" == "1" ]]; then
+    backend_url="${AZURE_STORAGE_ENDPOINT%/}/${AZURE_STORAGE_CONTAINER}/${AZURE_STORAGE_BLOB}-backend"
+    log "phase 3: backend bench (BlobBackend latency) -> $backend_url"
+    if ! UBLK_BLOB_URL="$backend_url" "$BIN" bench \
+            --create \
+            --size "$BACKEND_BENCH_SIZE" \
+            --block-size "$BACKEND_BENCH_BS" \
+            --count "$BACKEND_BENCH_COUNT" \
+            --concurrency "$BACKEND_BENCH_QD" \
+            --markdown-out "$BACKEND_MD"; then
+        log "phase 3 backend bench failed (omitting its summary section)"
+        rm -f "$BACKEND_MD"
+    fi
+fi
+
 # ── Emit a comparison table (stdout + markdown file) ──────────────────────────
 {
     echo "# ublk-azblob I/O benchmark"
@@ -326,6 +355,11 @@ done
         printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
             "$phase" "$name" "$bs" "$qd" "$jobs" "$label" "$bw" "$iops" "$lat" "$pct"
     done
+    # Phase 3 — backend latency (from the `bench` subcommand), if it ran.
+    if [[ -s "$BACKEND_MD" ]]; then
+        echo
+        cat "$BACKEND_MD"
+    fi
 } | tee "$RESULT_FILE"
 
 log "benchmark complete — results written to $RESULT_FILE"

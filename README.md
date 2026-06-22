@@ -399,11 +399,13 @@ result also expressed as a **percentage of the raw-local-disk baseline** (the
   The device runs without `--cache-dir` (and `BufferedBackend` does not cache
   clean reads), so this warm/cold speed-up reflects the kernel's block-device
   page cache, not a ublk-azblob read cache.
+* **Phase 3 — backend latency:** GET/PUT/flush throughput, IOPS and latency
+  measured directly against the Azure Page Blob backend via the `bench`
+  subcommand (bypassing the kernel device). The pipeline builds the binary with
+  the `bench` feature, runs it on a separate blob, and appends its results table
+  to the same summary (set `BENCH_BACKEND=0` to skip).
 * **Phase 4 — Scalability:** the random-read workload at increasing thread
   (`numjobs`) counts.
-
-(Phase 3 — backend Azure Blob GET/PUT/flush latency — is covered by the
-`bench` subcommand above, which measures the `BlobBackend` directly.)
 
 Like the e2e test, the Rust build, `fio`, and Azurite all run inside docker
 compose:

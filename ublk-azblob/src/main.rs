@@ -409,6 +409,11 @@ enum Command {
         /// Provision (create/overwrite) the blob before benchmarking.
         #[arg(long)]
         create: bool,
+
+        /// Append a markdown results table to this file (used by the fio
+        /// benchmark pipeline to merge backend latency into its summary).
+        #[arg(long)]
+        markdown_out: Option<std::path::PathBuf>,
     },
 
     /// Copy a golden-image *template* blob into the target blob selected by
@@ -767,23 +772,26 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
             workload,
             create,
+            ref markdown_out,
         } => {
             let loc = cli.location()?;
             let auth = build_auth(&cli, &loc.account, loc.sas.as_deref())?;
             let backend: Arc<dyn BlobBackend> = build_azure_backend(&loc, &auth)?;
-            bench::run_bench(
-                backend,
-                bench::BenchConfig {
-                    size,
-                    block_size,
-                    count,
-                    concurrency,
-                    workload,
-                    create,
-                },
-            )
-            .await
-            .context("benchmark")?;
+            let cfg = bench::BenchConfig {
+                size,
+                block_size,
+                count,
+                concurrency,
+                workload,
+                create,
+            };
+            let results = bench::run_bench(backend, cfg.clone())
+                .await
+                .context("benchmark")?;
+            if let Some(path) = markdown_out {
+                std::fs::write(path, bench::results_markdown(&cfg, &results))
+                    .with_context(|| format!("write benchmark markdown to {}", path.display()))?;
+            }
         }
 
         #[cfg(feature = "csi")]

@@ -47,7 +47,12 @@ services:
       - bash
       - -ec
       - |
-        cargo build --release --no-default-features --features ublk -p ublk-azblob
+        # The `bench` Cargo feature (the backend microbenchmark + its unit
+        # tests) lives entirely in this pipeline, not the main CI: run its unit
+        # tests, then build the release binary with the feature so bench.sh's
+        # Phase 3 can invoke the `bench` subcommand.
+        cargo test --release --no-default-features --features ublk,bench -p ublk-azblob --bins bench::
+        cargo build --release --no-default-features --features ublk,bench -p ublk-azblob
         bash tests/bench/bench.sh
 
 # The extended e2e runner service still mounts the `kubeconfig` volume at
