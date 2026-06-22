@@ -35,6 +35,7 @@ use backend::{
     BlobBackend,
 };
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -546,6 +547,10 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("ublk_azblob=info".parse().unwrap()),
         )
+        // Only colorize when stdout is a real terminal; when redirected to a
+        // file or pipe (e.g. CSI logs, systemd journal, the e2e harness), emit
+        // plain text so the output stays grep/parse-friendly.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let cli = Cli::parse();
@@ -1003,7 +1008,17 @@ fn build_azure_backend(
 ) -> anyhow::Result<Arc<AzurePageBlobBackend>> {
     let container_client = auth::build_container_client(&loc.endpoint, &loc.container, auth)
         .context("build container client")?;
+    // Auth-wired pipeline for `Get Page Ranges` (sparseness query used to skip
+    // downloading zero regions during cache warm-up); best-effort, so a failure
+    // to build it just disables the optimization rather than the whole backend.
     let backend = AzurePageBlobBackend::new(container_client, loc.blob.clone());
+    let backend = match auth::build_pipeline(auth) {
+        Ok(pipeline) => backend.with_page_list(pipeline),
+        Err(err) => {
+            warn!(%err, "page-ranges query disabled (could not build auth pipeline)");
+            backend
+        }
+    };
     let backend = match &loc.snapshot {
         Some(snapshot) => {
             info!(snapshot = %snapshot, "targeting blob snapshot (read-only)");
@@ -1328,6 +1343,9 @@ mod warmup_tests {
     struct RecordingBackend {
         size: u64,
         reads: Mutex<Vec<(u64, u64)>>,
+        /// Sparseness map returned by `data_ranges`. `None` => report no map
+        /// (warm the whole device).
+        data_ranges: Option<Vec<(u64, u64)>>,
     }
 
     #[async_trait]
@@ -1344,6 +1362,9 @@ mod warmup_tests {
         }
         async fn clear(&self, _offset: u64, _len: u64) -> anyhow::Result<()> {
             Ok(())
+        }
+        async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+            Ok(self.data_ranges.clone())
         }
         async fn flush(&self) -> anyhow::Result<()> {
             Ok(())
@@ -1386,5 +1407,60 @@ mod warmup_tests {
         // limit > dev_size is clamped; last chunk is the partial tail.
         b.warmup(6144, 4096, u64::MAX, 1).await;
         assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (4096, 2048)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_skips_pages_in_zero_gaps() {
+        // Device of 4 pages; only pages 0 and 3 hold data.
+        let b = Arc::new(RecordingBackend {
+            size: 16384,
+            data_ranges: Some(vec![(0, 4096), (12288, 4096)]),
+            ..Default::default()
+        });
+        b.warmup(16384, 4096, u64::MAX, 1).await;
+        // Pages 1 and 2 (the zero gap) are never read.
+        assert_eq!(*b.reads.lock().unwrap(), vec![(0, 4096), (12288, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_reads_page_partially_covered_by_data() {
+        // A data range that touches only the first byte of page 1 still forces
+        // that page to be warmed.
+        let b = Arc::new(RecordingBackend {
+            size: 8192,
+            data_ranges: Some(vec![(4096, 512)]),
+            ..Default::default()
+        });
+        b.warmup(8192, 4096, u64::MAX, 1).await;
+        assert_eq!(*b.reads.lock().unwrap(), vec![(4096, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn warmup_empty_data_ranges_reads_nothing() {
+        let b = Arc::new(RecordingBackend {
+            size: 8192,
+            data_ranges: Some(vec![]),
+            ..Default::default()
+        });
+        b.warmup(8192, 4096, u64::MAX, 1).await;
+        assert!(b.reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn range_intersects_detects_overlap_and_gaps() {
+        use crate::backend::range_intersects;
+        let ranges = [(0u64, 512u64), (4096, 1024)];
+        // Overlaps first range.
+        assert!(range_intersects(&ranges, 0, 4096));
+        // Page fully inside the [512, 4096) gap.
+        assert!(!range_intersects(&ranges, 1024, 1024));
+        // Touches the start of the second range.
+        assert!(range_intersects(&ranges, 4096, 4096));
+        // Just past the end of the second range.
+        assert!(!range_intersects(&ranges, 5120, 512));
+        // Zero-length probe never intersects.
+        assert!(!range_intersects(&ranges, 0, 0));
+        // No ranges at all.
+        assert!(!range_intersects(&[], 0, 4096));
     }
 }

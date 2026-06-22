@@ -100,10 +100,11 @@ pub struct FileCacheBackend {
     /// Shared cross-process clean-page index; `None` when page sharing is off.
     index: Option<CacheIndex>,
     /// Whether the cache dir's filesystem supports `FALLOC_FL_PUNCH_HOLE`.
-    /// Eviction reclaims disk by punching holes; on a filesystem that lacks it
-    /// (NFS, some overlay / virtio-fs) we degrade to grow-only instead of
-    /// failing live writes (see [`FileCacheBackend::open`]).
-    eviction_supported: bool,
+    /// Used both to reclaim disk on eviction and to keep all-zero pages sparse
+    /// (a hole reads back as zeros); on a filesystem that lacks it (NFS, some
+    /// overlay / virtio-fs) eviction degrades to grow-only and zero pages are
+    /// written out as zeros instead. Probed once at [`FileCacheBackend::open`].
+    punch_hole_supported: bool,
     state: Mutex<CacheState>,
 }
 
@@ -224,9 +225,17 @@ impl FileCacheBackend {
                 if bit_get(&present, page_idx) {
                     let offset = page_idx * cfg.page_size;
                     let page_len = cfg.page_size.min(dev_size.saturating_sub(offset));
+                    let is_dirty = bit_get(&dirty, page_idx);
+                    // A recovered *clean* page whose data-file region is a sparse
+                    // hole uses no disk: keep it present but exclude it from the
+                    // budget/LRU (mirrors the live store_clean_page path), so the
+                    // seeded resident bytes reflect real disk usage.
+                    if !is_dirty && region_is_hole(&data, offset, page_len) {
+                        continue;
+                    }
                     resident_bytes = resident_bytes.saturating_add(page_len);
                     // Dirty pages are present but not evictable until flushed.
-                    lru.touch(page_idx, !bit_get(&dirty, page_idx));
+                    lru.touch(page_idx, !is_dirty);
                 }
             }
             if let Some(b) = &budget {
@@ -272,26 +281,22 @@ impl FileCacheBackend {
             None
         };
 
-        // Eviction reclaims disk by punching holes in the data file. Probe
-        // support once (only matters when a budget is set); if the cache dir's
-        // filesystem lacks `FALLOC_FL_PUNCH_HOLE` (NFS, some overlay/virtio-fs),
-        // degrade to grow-only rather than turning the first over-budget write
-        // into a fatal I/O error.
-        let eviction_supported = if budget.is_some() {
-            let ok = probe_punch_hole(&cfg.dir);
-            if !ok {
-                warn!(
-                    dir = %cfg.dir.display(),
-                    "cache filesystem does not support FALLOC_FL_PUNCH_HOLE; \
-                     disabling eviction (cache grows without reclaiming disk and \
-                     the byte budget is not enforced)"
-                );
-            }
-            ok
-        } else {
-            // No budget → eviction never runs, so support is irrelevant.
-            true
-        };
+        // `FALLOC_FL_PUNCH_HOLE` is used both to reclaim disk on eviction and to
+        // keep all-zero pages sparse. Probe support once, unconditionally, so the
+        // zero-page path falls back to writing zeros quietly (rather than failing
+        // a punch per page) on a filesystem that lacks it (NFS, some
+        // overlay/virtio-fs). Only warn when a budget is set, since that is the
+        // case where the missing capability changes behaviour (eviction disabled
+        // → byte budget not enforced).
+        let punch_hole_supported = probe_punch_hole(&cfg.dir);
+        if budget.is_some() && !punch_hole_supported {
+            warn!(
+                dir = %cfg.dir.display(),
+                "cache filesystem does not support FALLOC_FL_PUNCH_HOLE; \
+                 disabling eviction (cache grows without reclaiming disk and \
+                 the byte budget is not enforced)"
+            );
+        }
 
         Ok((
             Self {
@@ -299,7 +304,7 @@ impl FileCacheBackend {
                 page_size: cfg.page_size,
                 budget,
                 index,
-                eviction_supported,
+                punch_hole_supported,
                 state: Mutex::new(state),
             },
             recovered_dirty,
@@ -353,10 +358,20 @@ impl FileCacheBackend {
         state: &mut CacheState,
         page_idx: u64,
         clean: bool,
+        disk_len: u64,
     ) -> anyhow::Result<()> {
         let Some(budget) = &self.budget else {
             return Ok(());
         };
+
+        // A sparse hole (an all-zero clean page left unwritten) uses no local
+        // disk, so it must not charge the byte budget and must not be evictable
+        // (punching its non-existent disk reclaims nothing). It stays `present`
+        // — served as zeros and never re-fetched — but is invisible to the
+        // budget/LRU.
+        if disk_len == 0 {
+            return Ok(());
+        }
 
         let already = state.lru.contains(page_idx);
         state.lru.touch(page_idx, clean);
@@ -365,9 +380,8 @@ impl FileCacheBackend {
             return Ok(());
         }
 
-        let len = self.page_len(state, page_idx);
-        state.resident_bytes = state.resident_bytes.saturating_add(len);
-        let over = budget.admit(len).context("admit cache budget")?;
+        state.resident_bytes = state.resident_bytes.saturating_add(disk_len);
+        let over = budget.admit(disk_len).context("admit cache budget")?;
         if over > 0 {
             // Protect the page we just admitted from being evicted immediately.
             self.evict_clean(state, over, Some(page_idx))?;
@@ -387,7 +401,7 @@ impl FileCacheBackend {
         let Some(budget) = &self.budget else {
             return Ok(());
         };
-        if !self.eviction_supported {
+        if !self.punch_hole_supported {
             // Grow-only: this filesystem can't reclaim disk via hole-punching, so
             // we keep all pages rather than failing the live write (warned once at
             // open). The byte budget is effectively unenforced.
@@ -524,10 +538,35 @@ impl FileCacheBackend {
         offset: u64,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        state
-            .data
-            .write_all_at(data, offset)
-            .with_context(|| format!("write page {page_idx} to cache file"))?;
+        // An all-zero page is kept sparse (no blocks allocated) so zero regions
+        // of the blob — e.g. an ext4 image's free space — consume no local disk.
+        // We *punch a hole* over the region rather than merely skipping the
+        // write: skipping is unsafe because the `.dat` region may hold stale
+        // non-zero bytes from a page whose present bit was never made durable
+        // before an unclean shutdown (data is fsynced before the present bit),
+        // which would otherwise read back as garbage instead of zeros. Where
+        // hole-punching is unsupported, fall back to writing the zeros (correct,
+        // but consumes disk).
+        let is_zero = !data.iter().any(|&b| b != 0);
+        let page_len = self.page_len(state, page_idx);
+        let mut is_hole = false;
+        if is_zero && self.punch_hole_supported {
+            match punch_hole(&state.data, offset, page_len) {
+                Ok(()) => is_hole = true,
+                Err(err) => {
+                    warn!(page_idx, %err, "punch hole for zero page failed; writing zeros");
+                    state
+                        .data
+                        .write_all_at(data, offset)
+                        .with_context(|| format!("write zero page {page_idx} to cache file"))?;
+                }
+            }
+        } else {
+            state
+                .data
+                .write_all_at(data, offset)
+                .with_context(|| format!("write page {page_idx} to cache file"))?;
+        }
 
         bit_set(&mut state.present, page_idx, true);
         let byte = page_idx / 8;
@@ -540,8 +579,12 @@ impl FileCacheBackend {
         }
 
         // Account the newly-resident clean page and evict if over budget. The
-        // page just loaded is protected from immediate eviction.
-        self.account_present(state, page_idx, true)?;
+        // page just loaded is protected from immediate eviction. A punched hole
+        // uses no disk, so it is admitted as zero bytes (charges nothing, not
+        // evictable); a written page (incl. the no-punch zero fallback) occupies
+        // a full page.
+        let disk_len = if is_hole { 0 } else { page_len };
+        self.account_present(state, page_idx, true, disk_len)?;
         Ok(())
     }
 
@@ -694,8 +737,10 @@ impl FileCacheBackend {
         bit_set(&mut state.dirty, page_idx, true);
         Self::persist_meta_bit(state, page_idx)?;
         // Account the page as resident but *not* evictable (it is dirty).  For a
-        // page that was already present this just reclassifies it.
-        self.account_present(state, page_idx, false)?;
+        // page that was already present this just reclassifies it. A write always
+        // stores real data, so it occupies a full page on disk.
+        let disk_len = self.page_len(state, page_idx);
+        self.account_present(state, page_idx, false, disk_len)?;
         Ok(())
     }
 
@@ -765,6 +810,31 @@ fn punch_hole(file: &File, offset: u64, len: u64) -> anyhow::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn punch_hole(_file: &File, _offset: u64, _len: u64) -> anyhow::Result<()> {
     anyhow::bail!("hole punching (FALLOC_FL_PUNCH_HOLE) is only supported on Linux")
+}
+
+/// Whether `[offset, offset+len)` in `file` is entirely a sparse hole (no blocks
+/// allocated), via `lseek(SEEK_DATA)`: if the next data byte at/after `offset`
+/// lies beyond the region (or there is no data after it, `ENXIO`), the region is
+/// unallocated.  Used at recovery to exclude clean holes from the byte budget.
+#[cfg(target_os = "linux")]
+fn region_is_hole(file: &File, offset: u64, len: u64) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+    if len == 0 {
+        return true;
+    }
+    let ret = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
+    if ret < 0 {
+        // ENXIO means there is no data at/after `offset` → the region is a hole.
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO);
+    }
+    (ret as u64) >= offset.saturating_add(len)
+}
+
+/// Non-Linux fallback: without `SEEK_DATA` we cannot detect holes, so treat every
+/// region as allocated (the conservative choice — never under-counts the budget).
+#[cfg(not(target_os = "linux"))]
+fn region_is_hole(_file: &File, _offset: u64, _len: u64) -> bool {
+    false
 }
 
 /// Probe whether `dir`'s filesystem supports `FALLOC_FL_PUNCH_HOLE` by punching a
@@ -932,7 +1002,26 @@ impl BlobBackend for FileCacheBackend {
         }
         let n_pages = limit.div_ceil(page_size);
         let conc = concurrency.max(1);
+
+        // Query sparseness map to skip zero regions; best-effort, so a failure
+        // falls back to warming everything.
+        let data_ranges = match self.data_ranges().await {
+            Ok(ranges) => ranges,
+            Err(err) => {
+                warn!(%err, "data-ranges query failed; warming the whole device");
+                None
+            }
+        };
+        if let Some(ranges) = &data_ranges {
+            let data_bytes: u64 = ranges.iter().map(|&(_, len)| len).sum();
+            info!(
+                data_ranges = ranges.len(),
+                data_bytes, "warm-up using blob sparseness map (skipping zero regions)"
+            );
+        }
+
         let warmed = AtomicU64::new(0);
+        let skipped = AtomicU64::new(0);
 
         // Fetch up to `conc` pages from the blob at once (each `warm_one_page`
         // does its blob read with no state lock held, tagged `Warmup` so the I/O
@@ -941,7 +1030,17 @@ impl BlobBackend for FileCacheBackend {
         stream::iter(0..n_pages)
             .for_each_concurrent(conc, |page_idx| {
                 let warmed = &warmed;
+                let skipped = &skipped;
+                let data_ranges = &data_ranges;
                 async move {
+                    let offset = page_idx * page_size;
+                    let len = page_size.min(dev_size.saturating_sub(offset));
+                    if let Some(ranges) = data_ranges {
+                        if !super::range_intersects(ranges, offset, len) {
+                            skipped.fetch_add(len, Ordering::Relaxed);
+                            return;
+                        }
+                    }
                     match self.warm_one_page(page_idx).await {
                         Ok(n) => {
                             warmed.fetch_add(n, Ordering::Relaxed);
@@ -954,6 +1053,7 @@ impl BlobBackend for FileCacheBackend {
 
         info!(
             warmed_bytes = warmed.load(Ordering::Relaxed),
+            skipped_bytes = skipped.load(Ordering::Relaxed),
             limit_bytes = limit,
             concurrency = conc,
             "cache warm-up complete"
@@ -1028,6 +1128,11 @@ impl BlobBackend for FileCacheBackend {
         }
 
         Ok(())
+    }
+
+    async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        // Sparseness is a property of the backing blob, not the local cache.
+        self.inner.data_ranges().await
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
@@ -1480,6 +1585,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefetch_zero_page_leaves_sparse_hole() {
+        // An all-zero page is marked present and reads back as zeros,
+        // but is left as a sparse hole in the data file (no blocks allocated).
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmp_dir("zerohole");
+        // Inner backend is all zeros (MemBackend starts zero-filled).
+        let inner = Arc::new(MemBackend::new(1 << 20).unwrap());
+        let (b, _) = open(inner, &dir, 65536, 1 << 20);
+
+        b.prefetch(0, 1 << 20).await.unwrap();
+
+        // Every page is resident (so reads never hit the inner backend again)...
+        assert_eq!(b.present_count().await, 16);
+        // ...and reads back as zeros.
+        assert_eq!(b.read(0, 4096).await.unwrap(), Bytes::from(vec![0u8; 4096]));
+
+        // The data file is logically 1 MiB but allocates ~no blocks (a hole).
+        let meta = std::fs::metadata(dir.join("test.dat")).unwrap();
+        assert_eq!(meta.len(), 1 << 20);
+        // 512-byte blocks; a fully written 1 MiB file would be ~2048 blocks.
+        assert!(
+            meta.blocks() < 64,
+            "expected a sparse data file, got {} blocks",
+            meta.blocks()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn zero_page_overwrites_stale_dat_bytes() {
+        // Simulate an unclean shutdown that left non-zero bytes in the `.dat`
+        // file at a page whose present bit was never persisted (data is fsynced
+        // before the present bit). Warming that page when the blob region is zero
+        // must read back as zeros — not the stale bytes — so store_clean_page
+        // punches a hole / writes zeros rather than skipping the write.
+        use std::os::unix::fs::FileExt as _;
+        let dir = tmp_dir("stale-zero");
+        let page = 4096u64;
+        let dev = 2 * page;
+        let inner = Arc::new(MemBackend::new(dev).unwrap()); // all zeros
+        let (b, _) = open(inner, &dir, page, dev);
+
+        // Corrupt the data file: stale non-zero bytes at page 1, left un-present.
+        {
+            let dat = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("test.dat"))
+                .unwrap();
+            dat.write_all_at(&vec![0xFF; page as usize], page).unwrap();
+        }
+
+        // Warm page 1 (blob region is zero): must yield zeros, not 0xFF.
+        b.prefetch(page, page).await.unwrap();
+        assert_eq!(
+            b.read(page, page).await.unwrap(),
+            Bytes::from(vec![0u8; page as usize])
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn warmup_concurrent_populates_all_pages() {
         // The concurrent warm-up (`warmup` with concurrency > 1) fetches every
         // page from the inner backend and makes it resident as a clean page.
@@ -1508,6 +1675,88 @@ mod tests {
             b.read(0, dev).await.unwrap(),
             Bytes::from(vec![0x5A; dev as usize])
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A wrapper that delegates to an inner backend but reports a fixed
+    /// sparseness map via `data_ranges()` and counts reads, so the file-cache
+    /// warm-up's zero-gap skip branch can be unit-tested (MemBackend reports
+    /// `None`, which never exercises it).
+    struct SparseBackend {
+        inner: Arc<dyn BlobBackend>,
+        ranges: Vec<(u64, u64)>,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl SparseBackend {
+        fn new(inner: Arc<dyn BlobBackend>, ranges: Vec<(u64, u64)>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                ranges,
+                reads: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+        fn read_count(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for SparseBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+        async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+            Ok(Some(self.ranges.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_skips_zero_gap_pages_via_data_ranges() {
+        // With a sparse `data_ranges()` map, warm-up must populate only the
+        // pages overlapping a data range and never fetch (or make resident) the
+        // pages lying entirely in a zero gap.
+        let dir = tmp_dir("warmup-sparse");
+        let page = 1024u64;
+        let dev = 16 * page; // 16 pages
+
+        // Data lives only in pages [4, 8); the rest of the device is a zero gap.
+        let data_off = 4 * page;
+        let data_len = 4 * page;
+        let inner = Arc::new(MemBackend::new(dev).unwrap());
+        inner
+            .write(data_off, Bytes::from(vec![0x5A; data_len as usize]))
+            .await
+            .unwrap();
+        let sparse = SparseBackend::new(inner, vec![(data_off, data_len)]);
+
+        let (b, _) = open(sparse.clone(), &dir, page, dev);
+        b.warmup(dev, page, dev, 8).await;
+
+        // Only the 4 data pages are resident; the 12 zero-gap pages were skipped.
+        assert_eq!(b.present_count().await, 4);
+        // And only those 4 pages were ever fetched from the backend.
+        assert_eq!(sparse.read_count(), 4);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1589,6 +1838,47 @@ mod tests {
             b.read(1024, 1024).await.unwrap(),
             Bytes::from(vec![0xA1; 1024])
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn zero_hole_pages_do_not_consume_budget() {
+        // A budget of two 1 KiB pages. Page 0 has real data; pages 1..4 are zero.
+        // Warming (prefetch) leaves the zero pages as sparse holes that must
+        // charge no budget — so the one real page is never evicted for holes.
+        let dir = tmp_dir("hole-budget");
+        let page = 1024u64;
+        let dev = 4 * page;
+        let inner = Arc::new(MemBackend::new(dev).unwrap());
+        inner
+            .write(0, Bytes::from(vec![0xC3; page as usize]))
+            .await
+            .unwrap();
+        let (b, _) = open_budgeted(inner.clone(), &dir, page, dev, 2 * page);
+
+        // Prefetch the whole device: page 0 is real, pages 1..4 are zero holes.
+        b.prefetch(0, dev).await.unwrap();
+
+        // All four pages are present (none re-fetched on read), but only the
+        // single real page counts against the budget — the holes are free.
+        assert_eq!(b.present_count().await, 4);
+        assert_eq!(b.resident_bytes().await, page);
+
+        // The real page was not evicted: mutate the inner backend and confirm the
+        // cached value is still served; the holes still read back as zeros.
+        inner
+            .write(0, Bytes::from(vec![0x00; page as usize]))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.read(0, page).await.unwrap(),
+            Bytes::from(vec![0xC3; page as usize])
+        );
+        assert_eq!(
+            b.read(page, page).await.unwrap(),
+            Bytes::from(vec![0u8; page as usize])
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

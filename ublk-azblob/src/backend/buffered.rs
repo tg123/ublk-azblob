@@ -701,6 +701,10 @@ impl BlobBackend for BufferedBackend {
         self.inner.delete().await
     }
 
+    async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        self.inner.data_ranges().await
+    }
+
     async fn size(&self) -> anyhow::Result<u64> {
         self.dev_size().await
     }
