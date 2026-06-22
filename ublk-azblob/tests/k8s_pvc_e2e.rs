@@ -906,6 +906,33 @@ fn pod_node(app: &str) -> Option<String> {
     s.split_whitespace().next().map(|n| n.to_string())
 }
 
+/// Poll until no pods match `app=<app>` (or the timeout elapses, returning
+/// `false`).  Used to confirm a Job's pod is fully reaped — kubelet only removes
+/// a pod from the API after its volumes are unmounted (CSI `NodeUnpublishVolume`
+/// returns), so this is a reliable signal that the device was gracefully torn
+/// down and its dirty cache pages were flushed to the host-path cache.
+fn wait_for_no_pods(app: &str, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let out = Command::new("kubectl")
+            .args(["get", "pods", "-l", &format!("app={app}"), "-o", "name"])
+            .output();
+        let remaining = match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .count(),
+            Err(_) => usize::MAX,
+        };
+        if remaining == 0 {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 /// Capture the combined stdout/stderr logs of the node plugin's `azblob`
 /// container across all node pods.  The child `run` process forwards its own
 /// stdout/stderr to the node container (see `csi::mount::spawn_device`), so the
@@ -1045,6 +1072,26 @@ spec:
         "kubectl",
         &["delete", "job", "azblob-cache-writer", "--wait=true"],
     );
+
+    // Wait for the writer *pod* to be fully gone before restarting the node
+    // plugin.  `delete job --wait` only waits for the Job object — the pod (and
+    // the CSI `NodeUnpublishVolume` that gracefully tears the device down and
+    // flushes the dirty cache pages to the host-path cache) is reaped
+    // asynchronously.  The writer writes its 8 MiB and exits well under the
+    // write-back idle-flush window, so its data reaches the disk cache and the
+    // blob *only* during that teardown flush.  Kubelet does not remove the pod
+    // from the API until `NodeUnpublishVolume` returns, so waiting for the pod
+    // to disappear guarantees the cache is durably persisted.  Without this the
+    // `rollout restart` below races the teardown and can SIGKILL the old
+    // node-plugin pod (and its device child) mid-flush, leaving the reader an
+    // empty cache (observed flaking on the slower arm64 runner).
+    if !wait_for_no_pods("azblob-cache-writer", std::time::Duration::from_secs(120)) {
+        dump_diagnostics("azblob-cache-writer");
+        panic!(
+            "cache writer pod was not reaped (NodeUnpublishVolume did not complete) \
+             within the timeout; the cache flush may not have been persisted"
+        );
+    }
 
     // ── Restart the node plugin so a fresh pod (empty logs) takes over while the
     //    host-path cache directory persists across the restart. ───────────────
