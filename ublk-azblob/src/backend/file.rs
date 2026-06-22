@@ -650,12 +650,9 @@ impl FileCacheBackend {
         let data: Vec<u8> = match self.try_peer_page(page_idx, page_len)? {
             Some(buf) => buf,
             None => {
-                let d = with_class(
-                    IoClass::Warmup,
-                    self.inner.read(offset, page_len),
-                )
-                .await
-                .with_context(|| format!("warm-up read page {page_idx}"))?;
+                let d = with_class(IoClass::Warmup, self.inner.read(offset, page_len))
+                    .await
+                    .with_context(|| format!("warm-up read page {page_idx}"))?;
                 if d.len() as u64 != page_len {
                     bail!(
                         "inner backend returned {} bytes for page {page_idx} (expected {page_len})",

@@ -187,7 +187,11 @@ impl IoGatewayConfig {
 }
 
 fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok()?.parse::<usize>().ok().filter(|&n| n > 0)
+    std::env::var(name)
+        .ok()?
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0)
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -217,7 +221,11 @@ impl AzureIoGateway {
             cfg.download_bandwidth_bps,
             &mut workers,
         );
-        let upload = Pipeline::new(cfg.upload_concurrency, cfg.upload_bandwidth_bps, &mut workers);
+        let upload = Pipeline::new(
+            cfg.upload_concurrency,
+            cfg.upload_bandwidth_bps,
+            &mut workers,
+        );
         trace!(
             download_concurrency = cfg.download_concurrency,
             upload_concurrency = cfg.upload_concurrency,
@@ -311,7 +319,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn passes_through_results() {
         let gw = AzureIoGateway::new(cfg(2, 2, 0, 0));
-        let out: u32 = gw.download(IoClass::ForegroundRead, 0, async { 7u32 }).await;
+        let out: u32 = gw
+            .download(IoClass::ForegroundRead, 0, async { 7u32 })
+            .await;
         assert_eq!(out, 7);
         let out: u32 = gw.upload(IoClass::Flush, 0, async { 9u32 }).await;
         assert_eq!(out, 9);
@@ -341,7 +351,11 @@ mod tests {
         for t in tasks {
             t.await.unwrap();
         }
-        assert_eq!(max_seen.load(Ordering::SeqCst), 1, "single worker must serialize");
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "single worker must serialize"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -401,7 +415,10 @@ mod tests {
         }
 
         let order = order.lock().await;
-        assert_eq!(order[0], "flush", "high-priority flush must precede queued copies: {order:?}");
+        assert_eq!(
+            order[0], "flush",
+            "high-priority flush must precede queued copies: {order:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -411,7 +428,8 @@ mod tests {
         let bps = 10 * 1024;
         let gw = Arc::new(AzureIoGateway::new(cfg(4, 4, 0, bps)));
         // Drain the initial burst budget first.
-        gw.upload(IoClass::Flush, MAX_PAGE_REQUEST_BYTES, async {}).await;
+        gw.upload(IoClass::Flush, MAX_PAGE_REQUEST_BYTES, async {})
+            .await;
         let start = Instant::now();
         let mut tasks = Vec::new();
         for _ in 0..4 {

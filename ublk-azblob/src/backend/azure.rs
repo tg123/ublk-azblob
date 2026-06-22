@@ -188,7 +188,11 @@ impl AzurePageBlobBackend {
                         .upload(IoClass::Copy, len, async move {
                             page_client
                                 .upload_pages_from_url(
-                                    source_url, src_range, len, dst_range, Some(opts),
+                                    source_url,
+                                    src_range,
+                                    len,
+                                    dst_range,
+                                    Some(opts),
                                 )
                                 .await
                                 .with_context(|| {
