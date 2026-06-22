@@ -37,8 +37,19 @@ const PARAM_STORAGE_ACCOUNT: &str = "storageAccount";
 const PARAM_CONTAINER: &str = "container";
 /// Parameter key for blob path template.
 const PARAM_BLOB_PATH_TEMPLATE: &str = "blobPathTemplate";
-/// Parameter key selecting the on-disk filesystem the node should create.
-const PARAM_FS_TYPE: &str = "fsType";
+/// Parameter key (StorageClass `parameters`) selecting the on-disk filesystem
+/// the node should create when formatting a freshly-provisioned (non-template)
+/// blob.
+const PARAM_NEW_BLOB_FS_TYPE: &str = "newBlobFsType";
+/// Parameter key (StorageClass `parameters`) selecting the filesystem the node
+/// should mount when provisioning from a golden-image template (`templateBlobUrl`).
+/// The template is never reformatted, so this is the type it already carries.
+/// Only meaningful when `templateBlobUrl` is set.
+const PARAM_TEMPLATE_BLOB_FS_TYPE: &str = "templateBlobFsType";
+/// Advanced parameter key (StorageClass `parameters`) overriding the built-in
+/// mount options that the `templateBlobFsType` profile would otherwise apply.
+/// Only meaningful when `templateBlobUrl` is set.
+const PARAM_TEMPLATE_BLOB_MOUNT_ARGS: &str = "templateBlobMountArgsOverwrite";
 /// Parameter keys for the optional cluster-lease coordination, forwarded to the
 /// node via the volume context (the node's `child_env` reads them).
 const PARAM_COORDINATION: &str = "coordination";
@@ -249,8 +260,17 @@ impl Controller for ControllerService {
                 if let Some(sas) = &tmpl.sas {
                     volume_context.insert("sasToken".to_string(), sas.clone());
                 }
-                if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
-                    volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
+                if let Some(fs) = req.parameters.get(PARAM_NEW_BLOB_FS_TYPE) {
+                    volume_context.insert(PARAM_NEW_BLOB_FS_TYPE.to_string(), fs.clone());
+                }
+                // A read-only template is mounted (never formatted), so the node
+                // mounts it as `templateBlobFsType`; `templateBlobMountArgsOverwrite` lets
+                // an advanced user override the profile's built-in mount options.
+                if let Some(fs) = req.parameters.get(PARAM_TEMPLATE_BLOB_FS_TYPE) {
+                    volume_context.insert(PARAM_TEMPLATE_BLOB_FS_TYPE.to_string(), fs.clone());
+                }
+                if let Some(args) = req.parameters.get(PARAM_TEMPLATE_BLOB_MOUNT_ARGS) {
+                    volume_context.insert(PARAM_TEMPLATE_BLOB_MOUNT_ARGS.to_string(), args.clone());
                 }
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
@@ -324,8 +344,19 @@ impl Controller for ControllerService {
             // mkfs so it preserves the template's contents.
             volume_context.insert("fromTemplate".to_string(), "true".to_string());
         }
-        if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
-            volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
+        if let Some(fs) = req.parameters.get(PARAM_NEW_BLOB_FS_TYPE) {
+            volume_context.insert(PARAM_NEW_BLOB_FS_TYPE.to_string(), fs.clone());
+        }
+        // `templateBlobFsType` / `templateBlobMountArgsOverwrite` only apply when the
+        // volume is provisioned from a golden-image template (it is copied, not
+        // formatted, so the node mounts it as the template's existing filesystem).
+        if from_template {
+            if let Some(fs) = req.parameters.get(PARAM_TEMPLATE_BLOB_FS_TYPE) {
+                volume_context.insert(PARAM_TEMPLATE_BLOB_FS_TYPE.to_string(), fs.clone());
+            }
+            if let Some(args) = req.parameters.get(PARAM_TEMPLATE_BLOB_MOUNT_ARGS) {
+                volume_context.insert(PARAM_TEMPLATE_BLOB_MOUNT_ARGS.to_string(), args.clone());
+            }
         }
         // Forward the coordination opt-in (and its tuning) from the StorageClass
         // parameters into the volume context, since CSI only hands the node the

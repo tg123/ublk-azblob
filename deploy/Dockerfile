@@ -103,12 +103,21 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
 FROM debian:bookworm-slim
 
 # - e2fsprogs       : mkfs.ext4 + blkid + fsck.ext4 (e2fsck)
+# - xfsprogs        : mkfs.xfs (newBlobFsType: xfs)
+# - btrfs-progs     : mkfs.btrfs (newBlobFsType: btrfs)
+# - ntfs-3g         : mount.ntfs (templateBlobFsType: ntfs, mount-only via FUSE)
 # - util-linux      : mount / umount / blockdev / fsck
 # - ca-certificates : TLS roots for talking to Azure Storage / the Kubernetes API
 # - nbd-client      : NBD client for NBD mode (compatibility with kernels without ublk_drv)
+# squashfs mounts via the in-kernel driver (no userspace tooling). `zfs` is NOT
+# shipped: mounting it needs the ZFS kernel module (absent from a stock kernel)
+# plus zfsutils-linux, so `templateBlobFsType: zfs` requires a custom runtime image.
 # (the ublk_drv module is loaded on the host, so no kmod/modprobe is needed here)
 RUN apt-get update && apt-get install -y \
         e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
+        ntfs-3g \
         util-linux \
         ca-certificates \
         nbd-client \

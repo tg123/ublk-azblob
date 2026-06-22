@@ -16,7 +16,12 @@ ARG DOCKER_VERSION=27.5.1
 ARG KUBECTL_VERSION=v1.32.3
 ARG HELM_VERSION=v3.17.3
 
-# - e2fsprogs / util-linux : mkfs.ext4, mount/umount (run by mount_e2e directly)
+# This runner installs NO filesystem tooling of its own. The mount/umount/
+# losetup/blkid/fsck binaries the mount e2e needs come from the base image's
+# essential util-linux package, and the on-device formatters (mkfs.ext*/xfs/
+# btrfs, fsck.ext4) are bridged into the runtime image at run time (see
+# tests/e2e/docker-compose.yml) so the e2e formats devices with the exact tools
+# shipped to production rather than duplicating them here.
 # - libclang-dev           : bindgen for libublk-rs-sys (ublk feature)
 # - protobuf-compiler + libprotobuf-dev : protoc + well-known types (csi feature)
 # - fio / jq               : used by the benchmark pipeline (tests/bench/)
@@ -24,8 +29,6 @@ ARG HELM_VERSION=v3.17.3
 #  nbd-client live in the driver image, so neither is needed here.)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        e2fsprogs \
-        util-linux \
         ca-certificates \
         curl \
         libclang-dev \
