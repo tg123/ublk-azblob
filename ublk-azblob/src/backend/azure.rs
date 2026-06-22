@@ -219,37 +219,55 @@ impl AzurePageBlobBackend {
         let Some(pipeline) = &self.page_list_pipeline else {
             return Ok(None);
         };
-        // Blob URL, encoded identically to every other request this backend makes.
-        let mut url: Url = self.container.blob_client(&self.blob_name).url().clone();
-        {
-            let mut q = url.query_pairs_mut();
-            q.append_pair("comp", "pagelist");
-            if let Some(snapshot) = &self.snapshot {
-                q.append_pair("snapshot", snapshot);
+        let ctx = Context::new();
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut marker: Option<String> = None;
+        // `Get Page Ranges` is paginated: a heavily-fragmented blob returns a
+        // subset plus a `<NextMarker>`; re-issue with `&marker=` until it is
+        // empty so no data ranges are dropped (and warmed regions mistaken for
+        // zero gaps).
+        loop {
+            // Blob URL, encoded identically to every other request this backend makes.
+            let mut url: Url = self.container.blob_client(&self.blob_name).url().clone();
+            {
+                let mut q = url.query_pairs_mut();
+                q.append_pair("comp", "pagelist");
+                if let Some(snapshot) = &self.snapshot {
+                    q.append_pair("snapshot", snapshot);
+                }
+                if let Some(m) = &marker {
+                    q.append_pair("marker", m);
+                }
+            }
+            let mut request = Request::new(url, Method::Get);
+            request.insert_header("x-ms-version", PAGE_LIST_API_VERSION);
+            trace!(marker = ?marker, "querying page ranges");
+            let response = pipeline
+                .send(&ctx, &mut request, None)
+                .await
+                .with_context(|| format!("Get Page Ranges for blob '{}'", self.blob_name))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.into_body().into_string().unwrap_or_default();
+                anyhow::bail!(
+                    "Get Page Ranges for blob '{}' returned HTTP {status}: {body}",
+                    self.blob_name
+                );
+            }
+            let body = response.into_body().into_string().with_context(|| {
+                format!("read Get Page Ranges body for blob '{}'", self.blob_name)
+            })?;
+            let batch = parse_page_ranges(&body).with_context(|| {
+                format!("parse Get Page Ranges body for blob '{}'", self.blob_name)
+            })?;
+            ranges.extend(batch);
+            match parse_next_marker(&body) {
+                Some(m) => marker = Some(m),
+                None => break,
             }
         }
-        let mut request = Request::new(url, Method::Get);
-        request.insert_header("x-ms-version", PAGE_LIST_API_VERSION);
-        let ctx = Context::new();
-        trace!("querying page ranges");
-        let response = pipeline
-            .send(&ctx, &mut request, None)
-            .await
-            .with_context(|| format!("Get Page Ranges for blob '{}'", self.blob_name))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.into_body().into_string().unwrap_or_default();
-            anyhow::bail!(
-                "Get Page Ranges for blob '{}' returned HTTP {status}: {body}",
-                self.blob_name
-            );
-        }
-        let body = response
-            .into_body()
-            .into_string()
-            .with_context(|| format!("read Get Page Ranges body for blob '{}'", self.blob_name))?;
-        let ranges = parse_page_ranges(&body)
-            .with_context(|| format!("parse Get Page Ranges body for blob '{}'", self.blob_name))?;
+        // Batches arrive ordered, but re-sort defensively across pages.
+        ranges.sort_by_key(|&(start, _)| start);
         Ok(Some(ranges))
     }
 }
@@ -284,6 +302,22 @@ fn parse_page_ranges(body: &str) -> anyhow::Result<Vec<(u64, u64)>> {
     }
     ranges.sort_by_key(|&(start, _)| start);
     Ok(ranges)
+}
+
+/// Extract a non-empty `<NextMarker>` continuation token from a `Get Page
+/// Ranges` response body, if present (an empty `<NextMarker />` means the last
+/// page).
+fn parse_next_marker(body: &str) -> Option<String> {
+    let open = "<NextMarker>";
+    let close = "</NextMarker>";
+    let start = body.find(open)? + open.len();
+    let end = body[start..].find(close)? + start;
+    let marker = body[start..end].trim();
+    if marker.is_empty() {
+        None
+    } else {
+        Some(marker.to_string())
+    }
 }
 
 /// Extract the unsigned integer value of `<tag>NNN</tag>` from `segment`.
@@ -608,7 +642,24 @@ impl BlobLock for AzureBlobLock {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_tag_u64, parse_page_ranges};
+    use super::{extract_tag_u64, parse_next_marker, parse_page_ranges};
+
+    #[test]
+    fn parse_next_marker_present_and_absent() {
+        // A non-empty marker is returned for continuation.
+        let with = "<PageList><NextMarker>2!abc=</NextMarker></PageList>";
+        assert_eq!(parse_next_marker(with).as_deref(), Some("2!abc="));
+        // An empty (or self-closing) marker means the last page.
+        assert_eq!(
+            parse_next_marker("<PageList><NextMarker></NextMarker></PageList>"),
+            None
+        );
+        assert_eq!(
+            parse_next_marker("<PageList><NextMarker /></PageList>"),
+            None
+        );
+        assert_eq!(parse_next_marker("<PageList />"), None);
+    }
 
     #[test]
     fn parse_empty_page_list() {
