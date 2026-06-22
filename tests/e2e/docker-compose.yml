@@ -152,10 +152,11 @@ services:
         sed -i 's|https://127.0.0.1:6443|https://k3s-server:6443|g' /tmp/kubeconfig.yaml
         export KUBECONFIG=/tmp/kubeconfig.yaml
         kubectl wait --for=condition=Ready nodes --all --timeout=120s
-        # Binary unit tests run as root here, so the profile-driven
-        # format+mount test (mount::tests::formattable_profiles_format_and_mount)
-        # actually exercises mkfs.{ext4,xfs,btrfs} + mount on a loop device.
-        cargo test --release -p ublk-azblob --bins -- --nocapture
+        # Integration e2e (run as root): mount_e2e covers the precooked formattable
+        # filesystem profiles (ext4 via mount_roundtrip, xfs/btrfs via
+        # mount_formattable_fs_profiles) on real ublk devices; the non-root bin
+        # unit tests (e.g. mkfs_rejects_unformattable_filesystems) run in the CI
+        # `cargo test` job.
         cargo test --release -p ublk-azblob \
           --test mount_e2e --test nbd_e2e --test k8s_pvc_e2e \
           -- --nocapture --test-threads=1
