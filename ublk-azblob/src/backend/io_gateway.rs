@@ -544,8 +544,9 @@ mod tests {
         let bps = MAX_PAGE_REQUEST_BYTES; // limiter max == MAX_PAGE_REQUEST_BYTES
         let gw = AzureIoGateway::new(cfg(1, 1, bps, 0));
         let start = Instant::now();
-        gw.download(IoClass::ForegroundRead, 2 * MAX_PAGE_REQUEST_BYTES, async {})
-            .await;
+        gw.download(IoClass::ForegroundRead, 2 * MAX_PAGE_REQUEST_BYTES, async {
+        })
+        .await;
         assert!(
             start.elapsed() >= Duration::from_millis(500),
             "an over-max request must be paced for its full size, took {:?}",

@@ -302,6 +302,24 @@ so **unflushed dirty data survives a crash or restart**. On startup the cache is
 recovered from disk and any recovered dirty pages are flushed to the blob, so
 in-flight writes are never silently lost.
 
+#### Reusing the cache across restarts (ETag validation)
+
+The cache is reused across restarts in **read-write** mode as well as for
+immutable snapshots. After each flush the backing blob's current **ETag** (its
+validity token) is recorded next to the cache in a `<container>-<blob>.etag`
+file. On the next start the live ETag is fetched and compared:
+
+- **unchanged** — nothing modified the blob since this cache last wrote it, so
+  the locally cached *clean* pages are still valid and are served from local
+  disk (no re-download). This is what makes the read-write cache safe to reuse:
+  write locally, flush to the blob, and a restart picks the local cache back up.
+- **changed** — the blob was modified externally, so the stale *clean* pages are
+  discarded and transparently re-fetched on demand.
+
+Either way, *dirty* (unflushed) pages are this process's own pending writes: they
+are always recovered and flushed, never dropped. When the backend cannot report
+an ETag, validation is skipped and the cache is trusted as before.
+
 ### Bounding the cache size (shared LRU byte budget)
 
 By default the local-disk cache grows without bound. Set `--cache-max-bytes`
