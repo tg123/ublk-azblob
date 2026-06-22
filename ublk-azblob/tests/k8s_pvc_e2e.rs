@@ -1040,6 +1040,18 @@ spec:
         "cache writer ran on node {writer_node}; reader will be pinned there"
     ));
 
+    // Let the node plugin's idle-flush (UBLK_IDLE_FLUSH_SECS=15 in the e2e
+    // values) durably flush the writer's dirty pages to the blob *while the
+    // device is still mounted*, so they become clean (dirty bit cleared and
+    // persisted). This is what the post-restart recovery validates and reuses.
+    // Relying on the unpublish/shutdown flush alone is racy on slow runners
+    // (arm64): if it is cut short, the pages recover as dirty and are merely
+    // re-flushed instead of reused as clean, so the "reusing clean cache pages"
+    // assertion below would spuriously fail. Waiting > the idle interval makes
+    // the clean state deterministic.
+    log("waiting for the idle-flush to clean the writer's cache pages before teardown");
+    std::thread::sleep(std::time::Duration::from_secs(25));
+
     log("deleting cache writer (tears down device, flushes blob, leaves clean cache pages)");
     run(
         "kubectl",
