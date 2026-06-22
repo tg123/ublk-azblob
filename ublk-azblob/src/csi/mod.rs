@@ -471,8 +471,8 @@ pub fn round_up_512(n: u64) -> u64 {
     aligned.max(512)
 }
 
-/// Re-exported blob-URL parser (defined in the crate-root `bloburl` module,
-/// which is compiled only with the `csi` feature).
+/// Re-exported from [`crate::bloburl`]: a parsed Azure blob URL (used here for
+/// the StorageClass `templateBlobUrl` golden-image source).
 pub use crate::bloburl::{parse_blob_url, TemplateBlobRef};
 
 #[cfg(test)]

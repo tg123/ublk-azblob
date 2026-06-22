@@ -74,12 +74,16 @@ impl NodeService {
         let container = get("container").unwrap_or_else(|| self.config.default_container.clone());
         let blob = get("blob").ok_or_else(|| anyhow::anyhow!("volume context missing 'blob'"))?;
 
-        let mut env = vec![
-            ("AZURE_STORAGE_ACCOUNT".to_string(), account),
-            ("AZURE_STORAGE_ENDPOINT".to_string(), endpoint),
-            ("AZURE_STORAGE_CONTAINER".to_string(), container),
-            ("AZURE_STORAGE_BLOB".to_string(), blob),
-        ];
+        // Collapse the account / endpoint / container / blob (+ optional
+        // read-only snapshot) into a single `UBLK_BLOB_URL` for the
+        // child `run` process. A volume is read-only exactly when it targets a
+        // blob snapshot (a `templateBlobUrl` with `?snapshot=<timestamp>`); the
+        // child derives read-only from the URL's `?snapshot=` alone — there is
+        // no separate readOnly flag. The endpoint template's `%s` account
+        // placeholder is substituted here so the child sees a resolved URL.
+        let snapshot = get("snapshot").filter(|s| !s.is_empty());
+        let blob_url = child_blob_url(&endpoint, &account, &container, &blob, snapshot.as_deref());
+        let mut env = vec![("UBLK_BLOB_URL".to_string(), blob_url)];
 
         let account_key = secrets
             .get("accountKey")
@@ -150,14 +154,8 @@ impl NodeService {
             }
         }
 
-        // Read-only / snapshot: a volume is read-only exactly when it targets a
-        // blob snapshot (a `templateBlobUrl` with `?snapshot=<timestamp>`). A
-        // snapshot is immutable, so the child `run` process derives read-only
-        // from `AZURE_STORAGE_SNAPSHOT` alone — there is no separate readOnly
-        // flag.
-        if let Some(snapshot) = get("snapshot").filter(|s| !s.is_empty()) {
-            env.push(("AZURE_STORAGE_SNAPSHOT".to_string(), snapshot));
-        }
+        // Read-only / snapshot is carried by `UBLK_BLOB_URL`'s
+        // `?snapshot=` query (assembled above), so nothing to add here.
         // SAS token from a `templateBlobUrl` that carries its own signature; the
         // child `run` process authenticates the (possibly cross-account) template
         // blob with it instead of the driver credentials.
@@ -179,6 +177,42 @@ impl NodeService {
         }
         Ok(env)
     }
+}
+
+/// Assemble a single `UBLK_BLOB_URL` for the child `run` process from
+/// the per-volume endpoint template, account, container, blob and optional
+/// read-only snapshot.
+///
+/// The endpoint's `%s` account placeholder is substituted here so the child
+/// receives a fully-resolved, `parse_blob_url`-parseable URL: when the endpoint
+/// host already encodes the account (subdomain / production style, e.g.
+/// `<account>.blob.core.windows.net` or a custom `<account>.host...`) the path
+/// is just `/<container>/<blob>`; for path-style hosts (IP / single-label) the
+/// account is the leading path segment so it round-trips.
+fn child_blob_url(
+    endpoint: &str,
+    account: &str,
+    container: &str,
+    blob: &str,
+    snapshot: Option<&str>,
+) -> String {
+    let resolved = endpoint.replace("%s", account);
+    let base = resolved.trim_end_matches('/');
+    let account_in_host = azure_core::http::Url::parse(&format!("{base}/"))
+        .ok()
+        .and_then(|u| u.host_str().map(crate::bloburl::is_subdomain_host))
+        .unwrap_or(false);
+    let account_in_path = base.split('/').any(|seg| seg == account);
+    let mut url = if account_in_host || account_in_path {
+        format!("{base}/{container}/{blob}")
+    } else {
+        format!("{base}/{account}/{container}/{blob}")
+    };
+    if let Some(s) = snapshot {
+        url.push_str("?snapshot=");
+        url.push_str(s);
+    }
+    url
 }
 
 #[tonic::async_trait]
@@ -496,5 +530,94 @@ impl Node for NodeService {
         _request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
         Err(Status::unimplemented("NodeExpandVolume"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child_blob_url;
+    use crate::bloburl::parse_blob_url;
+
+    #[test]
+    fn child_blob_url_subdomain_template_roundtrips() {
+        let url = child_blob_url(
+            "https://%s.blob.core.windows.net/",
+            "myacct",
+            "images",
+            "golden/disk.vhd",
+            None,
+        );
+        assert_eq!(
+            url,
+            "https://myacct.blob.core.windows.net/images/golden/disk.vhd"
+        );
+        let r = parse_blob_url(&url).unwrap();
+        assert_eq!(r.account, "myacct");
+        assert_eq!(r.container, "images");
+        assert_eq!(r.blob, "golden/disk.vhd");
+        assert_eq!(r.snapshot, None);
+    }
+
+    #[test]
+    fn child_blob_url_appends_snapshot() {
+        let url = child_blob_url(
+            "http://%s.blob.localhost:10000/",
+            "devstoreaccount1",
+            "c",
+            "b",
+            Some("2026-06-20T20:06:28.7995412Z"),
+        );
+        let r = parse_blob_url(&url).unwrap();
+        assert_eq!(r.account, "devstoreaccount1");
+        assert_eq!(r.container, "c");
+        assert_eq!(r.blob, "b");
+        assert_eq!(r.snapshot.as_deref(), Some("2026-06-20T20:06:28.7995412Z"));
+    }
+
+    #[test]
+    fn child_blob_url_path_style_account_in_path() {
+        // Azurite path-style endpoint already carrying the account segment.
+        let url = child_blob_url(
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "devstoreaccount1",
+            "c",
+            "b",
+            None,
+        );
+        assert_eq!(url, "http://127.0.0.1:10000/devstoreaccount1/c/b");
+        let r = parse_blob_url(&url).unwrap();
+        assert_eq!(r.account, "devstoreaccount1");
+        assert_eq!(r.container, "c");
+        assert_eq!(r.blob, "b");
+    }
+
+    #[test]
+    fn child_blob_url_path_style_account_prepended() {
+        // Bare path-style endpoint (no account); account becomes the leading segment.
+        let url = child_blob_url("http://127.0.0.1:10000/", "acct", "c", "b", None);
+        assert_eq!(url, "http://127.0.0.1:10000/acct/c/b");
+        let r = parse_blob_url(&url).unwrap();
+        assert_eq!(r.account, "acct");
+    }
+
+    #[test]
+    fn child_blob_url_k8s_e2e_subdomain_endpoint() {
+        // Mirrors the k8s e2e endpoint: a `%s` account placeholder in the host
+        // (production/subdomain style — account read from the host).
+        let url = child_blob_url(
+            "http://%s.azurite.kube-system.svc.cluster.local:10000/",
+            "devstoreaccount1",
+            "ublk-azblob-volumes",
+            "default/volumes/pvc-abc",
+            None,
+        );
+        assert_eq!(
+            url,
+            "http://devstoreaccount1.azurite.kube-system.svc.cluster.local:10000/ublk-azblob-volumes/default/volumes/pvc-abc"
+        );
+        let r = parse_blob_url(&url).unwrap();
+        assert_eq!(r.account, "devstoreaccount1");
+        assert_eq!(r.container, "ublk-azblob-volumes");
+        assert_eq!(r.blob, "default/volumes/pvc-abc");
     }
 }
