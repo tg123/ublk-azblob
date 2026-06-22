@@ -89,7 +89,7 @@ storageClass:
     storageAccount: <dest-storage-account>
     container: ${pvc.namespace}
     blobPathTemplate: ${pvc.namespace}/volumes/${pv.name}
-    fsType: ext4
+    newBlobFsType: ext4
 
 additionalStorageClasses:
   # Read-only golden-image mount (no copy, no lock/lease; shared across PVCs).
@@ -108,7 +108,7 @@ additionalStorageClasses:
       storageAccount: <dest-storage-account>
       container: ${pvc.namespace}
       blobPathTemplate: ${pvc.namespace}/tmpl/${pv.name}
-      fsType: ext4
+      newBlobFsType: ext4
       templateBlobUrl: "https://<acct>.blob.core.windows.net/<container>/<golden-image>"
 ```
 
