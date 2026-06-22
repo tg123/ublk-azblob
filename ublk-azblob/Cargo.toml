@@ -97,6 +97,10 @@ default = ["ublk", "csi"]
 # dependency (also used by the local-disk cache), so it is not listed here.
 ublk = ["dep:libublk"]
 
+# Enable the `bench` subcommand (backend throughput/IOPS/latency benchmark).
+# Off by default so the benchmark code is not shipped in the release binary.
+bench = []
+
 # Enable cluster coordination (Kubernetes coordination.k8s.io Lease + Azure blob
 # lease) so that at most one node mounts a given page blob at a time.  The Azure
 # blob-lease half is always compiled; this feature adds the Kubernetes client.

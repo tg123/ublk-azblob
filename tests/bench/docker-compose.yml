@@ -1,0 +1,69 @@
+# docker-compose override for the ublk-azblob I/O benchmark.
+#
+# Reuses the Azurite + runner service definitions from tests/e2e/docker-compose.yml
+# so the benchmark and e2e flows share the same compose wiring and runner image.
+# This file only keeps the bench-specific deltas: published Azurite port, benchmark
+# tunables, and the runner command that builds `ublk-azblob` for `--features ublk`
+# and executes tests/bench/bench.sh.
+#
+# Usage (after `sudo modprobe ublk_drv` on the host):
+#   docker compose -f tests/bench/docker-compose.yml up \
+#     --abort-on-container-exit --exit-code-from runner
+#   docker compose -f tests/bench/docker-compose.yml down -v
+
+services:
+  azurite:
+    extends:
+      file: ../e2e/docker-compose.yml
+      service: azurite
+    ports:
+      - "10000:10000"
+
+  runner:
+    extends:
+      file: ../e2e/docker-compose.yml
+      service: runner
+    # `extends` does not propagate `depends_on`, so re-declare the Azurite
+    # dependency here to ensure the runner waits for Azurite to be healthy
+    # before bench.sh starts `ublk-azblob run --create`.
+    depends_on:
+      azurite:
+        condition: service_healthy
+    environment:
+      # Benchmark tunables (override on the `docker compose` command line).
+      DEV_SIZE_MIB: "${DEV_SIZE_MIB:-512}"
+      FIO_SIZE: "${FIO_SIZE:-256M}"
+      FIO_BS: "${FIO_BS:-4k}"
+      FIO_IODEPTH: "${FIO_IODEPTH:-16}"
+      FIO_NUMJOBS: "${FIO_NUMJOBS:-1}"
+      FIO_RUNTIME: "${FIO_RUNTIME:-10}"
+      FIO_DIRECT: "${FIO_DIRECT:-1}"
+      # Phase 1 / Phase 4 sweep lists (space-separated).
+      FIO_BS_LIST: "${FIO_BS_LIST:-4k 16k 64k 256k 1M}"
+      FIO_IODEPTH_LIST: "${FIO_IODEPTH_LIST:-1 4 16 64 128}"
+      FIO_RWMIX_LIST: "${FIO_RWMIX_LIST:-100 70 50}"
+      FIO_NUMJOBS_LIST: "${FIO_NUMJOBS_LIST:-1 4 16 64}"
+    command:
+      - bash
+      - -ec
+      - |
+        # The `bench` Cargo feature (the backend microbenchmark + its unit
+        # tests) lives entirely in this pipeline, not the main CI: run its unit
+        # tests, then build the release binary with the feature so bench.sh's
+        # Phase 3 can invoke the `bench` subcommand.
+        cargo test --release --no-default-features --features ublk,bench -p ublk-azblob --bins bench::
+        cargo build --release --no-default-features --features ublk,bench -p ublk-azblob
+        bash tests/bench/bench.sh
+
+# The extended e2e runner service still mounts the `kubeconfig` volume at
+# /kubeconfig and joins the shared bridge network, so keep the same top-level
+# resource names here.
+volumes:
+  kubeconfig:
+
+networks:
+  k3s:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
