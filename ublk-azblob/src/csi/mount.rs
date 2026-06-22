@@ -634,9 +634,12 @@ mod tests {
     /// profile), and round-trip a file through the mounted filesystem.
     ///
     /// Needs root + loop devices + the per-filesystem `mkfs.<fs>` tool; it skips
-    /// (rather than fails) when the environment cannot provide them, so it is a
-    /// no-op on the unprivileged unit-test runner and exercises the full path on
-    /// the privileged e2e runner.
+    /// (rather than fails) when the environment cannot provide them. CI's
+    /// `cargo test` job runs as a non-root user, so this skips there; it
+    /// exercises the full format+mount path only when invoked as root locally.
+    /// In CI the equivalent coverage comes from the `mount_e2e`
+    /// `mount_formattable_fs_profiles` integration test, which formats+mounts the
+    /// xfs/btrfs profiles on real ublk devices on the privileged e2e runner.
     #[test]
     fn formattable_profiles_format_and_mount() {
         if !is_root() || !have_tool("losetup") {

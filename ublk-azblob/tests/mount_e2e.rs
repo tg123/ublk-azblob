@@ -454,7 +454,8 @@ fn mount_roundtrip_file_cache_budget() {
 /// (ext4 is already exercised end-to-end by `mount_roundtrip`. The negative
 /// "format not supported" path for the mount-only profiles squashfs/zfs/ntfs is
 /// covered by the `csi::mount` `mkfs_rejects_unformattable_filesystems` unit
-/// test, which the privileged e2e runner runs as root via `cargo test --bins`.)
+/// test, which needs neither root nor any tool and runs in CI's non-root
+/// `cargo test` job.)
 #[test]
 fn mount_formattable_fs_profiles() {
     if !ublk_available() {
