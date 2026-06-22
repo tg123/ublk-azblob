@@ -18,9 +18,6 @@ ARG HELM_VERSION=v3.17.3
 
 # - e2fsprogs / util-linux : mkfs.ext4, mount/umount, losetup (run by mount_e2e
 #                            and the mount-module unit tests directly)
-# - xfsprogs / btrfs-progs  : mkfs.xfs / mkfs.btrfs, so the profile-driven
-#                            format+mount unit test and the `mount_e2e`
-#                            `mount_formattable_fs_profiles` test cover xfs/btrfs
 # - libclang-dev           : bindgen for libublk-rs-sys (ublk feature)
 # - protobuf-compiler + libprotobuf-dev : protoc + well-known types (csi feature)
 # (nbd_e2e uses an in-process TCP client and the node plugin's mkfs/mount/
@@ -28,8 +25,6 @@ ARG HELM_VERSION=v3.17.3
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         e2fsprogs \
-        xfsprogs \
-        btrfs-progs \
         util-linux \
         ca-certificates \
         curl \

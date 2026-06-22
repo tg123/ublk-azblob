@@ -103,12 +103,16 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
 FROM debian:bookworm-slim
 
 # - e2fsprogs       : mkfs.ext4 + blkid + fsck.ext4 (e2fsck)
+# - xfsprogs        : mkfs.xfs (newBlobFsType: xfs)
+# - btrfs-progs     : mkfs.btrfs (newBlobFsType: btrfs)
 # - util-linux      : mount / umount / blockdev / fsck
 # - ca-certificates : TLS roots for talking to Azure Storage / the Kubernetes API
 # - nbd-client      : NBD client for NBD mode (compatibility with kernels without ublk_drv)
 # (the ublk_drv module is loaded on the host, so no kmod/modprobe is needed here)
 RUN apt-get update && apt-get install -y \
         e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
         util-linux \
         ca-certificates \
         nbd-client \
