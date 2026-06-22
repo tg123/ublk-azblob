@@ -29,12 +29,12 @@
 
 use super::cache_budget::CacheBudget;
 use super::cache_index::CacheIndex;
+use super::cache_lru::Lru;
 use super::io_gateway::{with_class, IoClass};
 use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -88,85 +88,6 @@ impl Default for FileCacheConfig {
             blob_identity: String::new(),
             share_pages: false,
         }
-    }
-}
-
-/// In-memory LRU bookkeeping for resident (present) cache pages.
-///
-/// Tracks the recency of every present page and which of them are *evictable*
-/// (present **and** clean — dirty pages must be flushed, never dropped).  Only
-/// maintained when a [`CacheBudget`] is active.
-///
-/// # Why a purpose-built structure instead of an off-the-shelf LRU crate
-///
-/// Off-the-shelf caches (`lru`, `clru`, `quick_cache`, `moka`, `foyer`, …) own
-/// the cached *values* and evict purely by recency (optionally by a byte
-/// weight).  This cache is structurally different on three axes that none of
-/// them model:
-///
-/// - **Values live on disk, not in the map.**  Page bytes are stored in a
-///   sparse data file addressed by page index; eviction is a `PUNCH_HOLE` plus
-///   a bitmap-bit clear, so the LRU only needs to order page *indices*.
-/// - **A pinned, non-evictable subset.**  Dirty (unflushed) pages must never be
-///   dropped or data is lost; generic LRUs have no notion of "evict by recency,
-///   but only among the clean pages".  Here `evictable` is a second index that
-///   excludes dirty pages, and pages move in/out of it as they are
-///   dirtied/flushed.
-/// - **A cross-process byte budget.**  The real limit is shared between
-///   processes via the `flock`-coordinated [`CacheBudget`]; an in-process cache
-///   crate cannot enforce it.  `foyer` is the closest "disk block cache" but it
-///   owns its own on-disk format and recovery, which would replace this whole
-///   backend and still not provide the cross-process budget.
-///
-/// The structure is intentionally small: a monotonic recency clock plus two
-/// indexes giving O(log n) insert/touch and O(1)-amortised LRU selection.
-#[derive(Default)]
-struct Lru {
-    /// Monotonic access clock; higher = more recently used.
-    seq: u64,
-    /// Recency stamp of every present page.
-    by_page: HashMap<u64, u64>,
-    /// Evictable (clean, present) pages, ordered by recency stamp so the
-    /// smallest key is the least-recently-used eviction candidate.
-    evictable: BTreeMap<u64, u64>,
-}
-
-impl Lru {
-    /// Whether `page` is currently accounted as present.
-    fn contains(&self, page: u64) -> bool {
-        self.by_page.contains_key(&page)
-    }
-
-    /// Record an access to `page`, (re)classifying it as evictable iff `clean`.
-    fn touch(&mut self, page: u64, clean: bool) {
-        if let Some(old) = self.by_page.get(&page) {
-            self.evictable.remove(old);
-        }
-        self.seq += 1;
-        let s = self.seq;
-        self.by_page.insert(page, s);
-        if clean {
-            self.evictable.insert(s, page);
-        }
-    }
-
-    /// Pop the least-recently-used evictable page, skipping `protect`.
-    fn pop_lru(&mut self, protect: Option<u64>) -> Option<u64> {
-        let key = self
-            .evictable
-            .iter()
-            .find(|(_, &page)| Some(page) != protect)
-            .map(|(&seq, _)| seq)?;
-        let page = self.evictable.remove(&key)?;
-        self.by_page.remove(&page);
-        Some(page)
-    }
-
-    /// Reset to empty (used on create/delete).
-    fn clear(&mut self) {
-        self.seq = 0;
-        self.by_page.clear();
-        self.evictable.clear();
     }
 }
 
