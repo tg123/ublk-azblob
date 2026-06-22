@@ -8,6 +8,7 @@ pub mod buffered;
 pub mod cache_budget;
 pub mod cache_index;
 pub mod file;
+pub mod io_gateway;
 pub mod mem;
 
 use async_trait::async_trait;

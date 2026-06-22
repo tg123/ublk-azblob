@@ -440,21 +440,28 @@ async fn copy_blob_streamed(
     dest: &dyn BlobBackend,
     total_size: u64,
 ) -> anyhow::Result<()> {
-    let chunk = crate::backend::copy_chunk_bytes();
-    let mut offset = 0u64;
-    while offset < total_size {
-        let len = chunk.min(total_size - offset);
-        let data = source
-            .read(offset, len)
-            .await
-            .with_context(|| format!("read template offset={offset} len={len}"))?;
-        dest.write(offset, data)
-            .await
-            .with_context(|| format!("write copy offset={offset} len={len}"))?;
-        offset += len;
-    }
-    dest.flush().await.context("flush copied blob")?;
-    Ok(())
+    use crate::backend::io_gateway::{with_class, IoClass};
+    // Tag both the source reads (downloads) and destination writes (uploads) as
+    // copy traffic so the I/O gateway prioritizes foreground reads and flushes
+    // ahead of this bulk copy.
+    with_class(IoClass::Copy, async move {
+        let chunk = crate::backend::copy_chunk_bytes();
+        let mut offset = 0u64;
+        while offset < total_size {
+            let len = chunk.min(total_size - offset);
+            let data = source
+                .read(offset, len)
+                .await
+                .with_context(|| format!("read template offset={offset} len={len}"))?;
+            dest.write(offset, data)
+                .await
+                .with_context(|| format!("write copy offset={offset} len={len}"))?;
+            offset += len;
+        }
+        dest.flush().await.context("flush copied blob")?;
+        Ok(())
+    })
+    .await
 }
 
 /// Round `n` up to the next multiple of 512 (the page-blob alignment), with a

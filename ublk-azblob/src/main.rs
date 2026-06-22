@@ -142,6 +142,31 @@ struct Cli {
     #[arg(long, env = "AZURE_CLIENT_SECRET", conflicts_with_all = ["account_key", "msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
     azure_client_secret: Option<String>,
 
+    // ── Centralized Azure I/O limits (apply to every subcommand) ───────────────
+    /// Max concurrent Azure *download* (read) requests.
+    ///
+    /// One half of the centralized I/O gateway's thread budget. `0` (default)
+    /// auto-sizes so that download + upload concurrency equals the logical CPU
+    /// count (split evenly).
+    #[arg(long, default_value = "0", env = "UBLK_DOWNLOAD_CONCURRENCY")]
+    download_concurrency: usize,
+
+    /// Max concurrent Azure *upload* (write / clear / copy) requests.
+    ///
+    /// The other half of the gateway's thread budget. `0` (default) auto-sizes
+    /// so that download + upload concurrency equals the logical CPU count.
+    #[arg(long, default_value = "0", env = "UBLK_UPLOAD_CONCURRENCY")]
+    upload_concurrency: usize,
+
+    /// Azure *download* (read) bandwidth ceiling in bytes/sec. `0` = unlimited.
+    #[arg(long, default_value = "0", env = "UBLK_DOWNLOAD_BANDWIDTH")]
+    download_bandwidth: u64,
+
+    /// Azure *upload* (write / clear / copy) bandwidth ceiling in bytes/sec.
+    /// `0` = unlimited.
+    #[arg(long, default_value = "0", env = "UBLK_UPLOAD_BANDWIDTH")]
+    upload_bandwidth: u64,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -461,6 +486,30 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Initialize the process-wide Azure I/O gateway before any backend is built,
+    // so every download/upload funnels through its bandwidth, concurrency and
+    // priority controls. Zero concurrency means "auto" (download + upload =
+    // logical CPU count); zero bandwidth means unlimited.
+    {
+        let mut io_cfg = backend::io_gateway::IoGatewayConfig::auto();
+        if cli.download_concurrency > 0 {
+            io_cfg.download_concurrency = cli.download_concurrency;
+        }
+        if cli.upload_concurrency > 0 {
+            io_cfg.upload_concurrency = cli.upload_concurrency;
+        }
+        io_cfg.download_bandwidth_bps = cli.download_bandwidth;
+        io_cfg.upload_bandwidth_bps = cli.upload_bandwidth;
+        info!(
+            download_concurrency = io_cfg.download_concurrency,
+            upload_concurrency = io_cfg.upload_concurrency,
+            download_bandwidth_bps = io_cfg.download_bandwidth_bps,
+            upload_bandwidth_bps = io_cfg.upload_bandwidth_bps,
+            "centralized Azure I/O gateway configured"
+        );
+        backend::io_gateway::AzureIoGateway::init_global(io_cfg);
+    }
 
     // The endpoint *template* may contain a `%s` placeholder for the account
     // (subdomain-style, e.g. `http://%s.blob.localhost:10000/`). The CSI driver
