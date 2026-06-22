@@ -174,6 +174,18 @@ enum Command {
         #[arg(long, default_value = "64", env = "UBLK_MAX_DIRTY_PAGES")]
         max_dirty_pages: usize,
 
+        /// Maximum number of resident in-memory cache pages (clean + dirty).
+        ///
+        /// The write-back buffer doubles as an in-memory read cache: pages
+        /// fetched to serve reads stay resident so later accesses hit memory.
+        /// When the resident page count exceeds this limit the least-recently-
+        /// used *clean* pages are evicted (dirty pages are pinned until
+        /// flushed). Total memory cap ≈ `page_size × max_cached_pages`. Set to
+        /// `0` for unlimited (grow-only, no clean-page eviction). Must be `0` or
+        /// `>= max_dirty_pages`.
+        #[arg(long, default_value = "256", env = "UBLK_MAX_CACHED_PAGES")]
+        max_cached_pages: usize,
+
         /// Enable cluster coordination: acquire both the Azure blob lease
         /// ("blob lock") and a Kubernetes `coordination.k8s.io` Lease ("cluster
         /// lease") before mounting, so at most one node serves the volume.
@@ -475,6 +487,7 @@ async fn main() -> anyhow::Result<()> {
             id,
             page_size,
             max_dirty_pages,
+            max_cached_pages,
             coordination,
             disable_blob_lock,
             recovery_timeout_secs,
@@ -673,6 +686,7 @@ async fn main() -> anyhow::Result<()> {
                 info!(
                     page_size,
                     max_dirty_pages,
+                    max_cached_pages,
                     idle_flush_secs,
                     force_flush_timeout_secs,
                     flush_io_timeout_secs,
@@ -684,6 +698,7 @@ async fn main() -> anyhow::Result<()> {
                     BufferedConfig {
                         page_size,
                         max_dirty_pages,
+                        max_cached_pages,
                         idle_flush_secs,
                         force_flush_timeout_secs,
                         flush_io_timeout_secs,

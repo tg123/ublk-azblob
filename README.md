@@ -184,6 +184,8 @@ Common CLI flags have environment-variable equivalents:
 |------|---------|
 | `--blob-url` | `UBLK_BLOB_URL` |
 | `--account-key` | `AZURE_STORAGE_KEY` |
+| `--max-dirty-pages` | `UBLK_MAX_DIRTY_PAGES` |
+| `--max-cached-pages` | `UBLK_MAX_CACHED_PAGES` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
 | `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
@@ -203,7 +205,17 @@ write-back buffer and Azure, giving a three-level cache:
 BufferedBackend (memory) ──► FileCacheBackend (local disk) ──► AzurePageBlobBackend (blob)
 ```
 
-Enable it by pointing `--cache-dir` at a directory on a local disk:
+The **in-memory write-back buffer** (`BufferedBackend`) is itself a cache, not
+just a write batcher: pages fetched to satisfy reads (and pages left behind
+after a flush) stay resident so later accesses are served straight from memory.
+Its resident set is bounded by a least-recently-used budget — `--max-cached-pages`
+(`UBLK_MAX_CACHED_PAGES`, default `256`) — which evicts the least-recently-used
+**clean** pages once the count is exceeded. Dirty (unflushed) pages are pinned
+and never evicted; they are bounded separately by `--max-dirty-pages`, which
+flushes them. Set `--max-cached-pages 0` for an unbounded (grow-only) memory
+cache; any non-zero value must be `>= --max-dirty-pages`.
+
+Enable the local-disk level by pointing `--cache-dir` at a directory on a local disk:
 
 ```bash
 sudo ./target/release/ublk-azblob \
