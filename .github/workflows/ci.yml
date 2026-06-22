@@ -35,12 +35,10 @@ jobs:
 
       # Lint and test the full shipped feature set in one pass — we never ship a
       # partially-compiled binary, so CI checks everything together.  `ublk` and
-      # `csi` are on by default, so no extra feature flags are needed.
-      - name: cargo clippy
-        run: cargo clippy -- -D warnings
-
-      - name: cargo clippy (bench feature)
-        run: cargo clippy --features bench -- -D warnings
+      # `csi` are on by default; `--all-features` also pulls in the off-by-default
+      # `bench` feature, so a single step covers them all.
+      - name: cargo clippy (all features)
+        run: cargo clippy --all-features -- -D warnings
 
       - name: cargo test (all features)
         run: cargo test --all-features

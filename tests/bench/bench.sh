@@ -18,7 +18,8 @@
 #             plus sweeps over block size, queue depth, and read/write mix.
 #   Phase 2 — Cache behaviour: cold-cache vs. warm-cache read (buffered I/O),
 #             each compared against the raw-local-disk baseline, plus the
-#             ublk-azblob warm/cold read-cache speed-up.
+#             warm/cold page-cache speed-up (the kernel block-device page cache,
+#             not a ublk-azblob read cache — the device runs without --cache-dir).
 #   Phase 4 — Scalability: the same random-read workload at increasing thread
 #             (fio numjobs) counts.
 # (Phase 3 — backend Azure Blob latency/throughput — is covered separately by the
@@ -155,6 +156,14 @@ run_fio() {
         mixargs+=(--rwmixread="$rwmixread")
     fi
 
+    # libaio cannot do async *buffered* I/O: with direct=0 fio prints
+    # "disabling unsafe buffered aio" and serialises, ignoring iodepth. Use
+    # psync for the buffered (cache) phase so the engine matches the workload.
+    local ioengine="libaio"
+    if [[ "$direct" == "0" ]]; then
+        ioengine="psync"
+    fi
+
     log "fio: $label / $rw (bs=$bs, qd=$iodepth, jobs=$numjobs, mix=${rwmixread:-pure}, direct=$direct, ${FIO_RUNTIME}s)"
     fio --name="${label}-${rw}" \
         --filename="$dev" \
@@ -162,7 +171,7 @@ run_fio() {
         --bs="$bs" \
         --size="$FIO_SIZE" \
         --direct="$direct" \
-        --ioengine=libaio \
+        --ioengine="$ioengine" \
         --iodepth="$iodepth" \
         --numjobs="$numjobs" \
         --runtime="$FIO_RUNTIME" \
