@@ -580,8 +580,25 @@ impl Node for NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::child_blob_url;
+    use super::{child_blob_url, split_opts};
     use crate::bloburl::parse_blob_url;
+
+    #[test]
+    fn split_opts_parses_mixed_separators() {
+        // Comma, space, tab and newline all separate tokens; surrounding
+        // whitespace is trimmed and empty tokens dropped.
+        assert_eq!(
+            split_opts("noatime, nodiratime\tro\nrw"),
+            vec!["noatime", "nodiratime", "ro", "rw"]
+        );
+        // Leading/trailing/duplicate separators yield no empty tokens.
+        assert_eq!(split_opts(" , noatime ,, ro , "), vec!["noatime", "ro"]);
+        // A single option.
+        assert_eq!(split_opts("ro"), vec!["ro"]);
+        // All-whitespace / empty input yields nothing.
+        assert!(split_opts("   \t\n ").is_empty());
+        assert!(split_opts("").is_empty());
+    }
 
     #[test]
     fn child_blob_url_subdomain_template_roundtrips() {

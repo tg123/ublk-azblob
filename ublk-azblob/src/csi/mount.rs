@@ -672,11 +672,16 @@ mod tests {
                 .args(["--find", "--show", img_str])
                 .output()
                 .expect("spawn losetup");
-            assert!(
-                out.status.success(),
-                "losetup failed for {fs}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            if !out.status.success() {
+                // No usable loop device (e.g. a root container without loop
+                // support): skip rather than fail, matching the documented intent.
+                eprintln!(
+                    "skipping {fs}: losetup --find failed (no usable loop device): {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let _ = std::fs::remove_file(&img);
+                continue;
+            }
             let dev = String::from_utf8(out.stdout).unwrap().trim().to_string();
 
             let mount_point = tmp.join(format!("{fs}.mnt"));
