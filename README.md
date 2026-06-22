@@ -56,6 +56,32 @@ cargo run -p ublk-azblob -- \
   test --size 4096
 ```
 
+### Benchmark the backend (throughput / IOPS / latency)
+
+```bash
+# Provision a 64 MiB blob and run all four phases (seq write/read, rand write/read)
+cargo run --release --features bench -p ublk-azblob -- \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/mybench \
+  --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
+  bench --create
+```
+
+The `bench` subcommand (gated behind the off-by-default `bench` feature so it is
+not shipped in the release binary) issues a fixed number of fixed-size
+operations against the `BlobBackend` using a configurable number of concurrent
+workers (mirroring a ublk queue depth) and reports throughput (MiB/s), IOPS, and
+latency percentiles (min / avg / p50 / p95 / p99 / max) per phase. It runs
+against Azurite, real Azure, or the in-memory backend used in tests.
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--size` | `67108864` (64 MiB) | Benchmark blob size (multiple of 512) |
+| `--block-size` | `4096` | I/O size per operation (multiple of 512) |
+| `--count` | `1024` | Operations issued per phase |
+| `--concurrency` | `16` | Concurrent in-flight operations (queue depth) |
+| `--workload` | `all` | `seq`, `rand`, or `all` |
+| `--create` | _off_ | Provision/overwrite the blob before benchmarking |
+
 ### Run as a block device (requires root + ublk_drv; ublk is built in by default)
 
 ```bash
@@ -349,6 +375,74 @@ it is gated behind the `ublk` feature and skips itself when not run as root with
 
 ---
 
+## Benchmarking I/O speed (ublk-azblob vs. raw local disk)
+
+The benchmark **pipeline** measures the block-device I/O speed of `ublk-azblob`
+against a **raw local disk** baseline using [`fio`](https://fio.readthedocs.io/).
+Both targets are benchmarked as raw block devices (no filesystem):
+
+* **ublk-azblob** — a real `/dev/ublkbN` device backed by an Azure Page Blob
+  (Azurite in CI).
+* **local disk** — a loopback (`losetup`) device backed by a file on the
+  container's local filesystem, used as the reference baseline.
+
+The same fio jobs run against each target and the script prints a side-by-side
+comparison of throughput (MiB/s), IOPS, and mean latency, with each ublk-azblob
+result also expressed as a **percentage of the raw-local-disk baseline** (the
+`vs local` column). The jobs are grouped into phases:
+
+* **Phase 1 — Raw block performance:** the four base patterns (sequential and
+  random read/write) plus sweeps over block size (`4k…1M`), queue depth
+  (`1…128`), and read/write mix (`100/0`, `70/30`, `50/50`).
+* **Phase 2 — Cache behaviour:** cold-cache vs. warm-cache buffered reads, each
+  compared against the raw-local-disk baseline, plus the warm/cold speed-up.
+  The device runs without `--cache-dir` (and `BufferedBackend` does not cache
+  clean reads), so this warm/cold speed-up reflects the kernel's block-device
+  page cache, not a ublk-azblob read cache.
+* **Phase 3 — backend latency:** GET/PUT/flush throughput, IOPS and latency
+  measured directly against the Azure Page Blob backend via the `bench`
+  subcommand (bypassing the kernel device). The pipeline builds the binary with
+  the `bench` feature, runs it on a separate blob, and appends its results table
+  to the same summary (set `BENCH_BACKEND=0` to skip).
+* **Phase 4 — Scalability:** the random-read workload at increasing thread
+  (`numjobs`) counts.
+
+Like the e2e test, the Rust build, `fio`, and Azurite all run inside docker
+compose:
+
+```bash
+# 1. Load the kernel module on the host (a container can't do this for you)
+sudo modprobe ublk_drv
+
+# 2. Build + run the fio benchmark against both targets and print the comparison.
+docker compose -f tests/bench/docker-compose.yml up \
+  --build --abort-on-container-exit --exit-code-from runner
+
+# 3. Tear everything down when done
+docker compose -f tests/bench/docker-compose.yml down -v
+```
+
+The comparison table is printed to stdout and written to `bench-results.md`.
+The benchmark is tunable via environment variables — base block size, queue
+depth, threads, runtime, direct vs. buffered I/O, and the per-phase sweep lists
+(`FIO_BS_LIST`, `FIO_IODEPTH_LIST`, `FIO_RWMIX_LIST`, `FIO_NUMJOBS_LIST`) — see
+the header of [tests/bench/bench.sh](tests/bench/bench.sh) for the full list,
+e.g.:
+
+```bash
+# Trim the sweeps for a quick run.
+FIO_BS_LIST="4k 64k" FIO_IODEPTH_LIST="1 16" FIO_NUMJOBS_LIST="1 4" \
+  docker compose -f tests/bench/docker-compose.yml up \
+    --build --abort-on-container-exit --exit-code-from runner
+```
+
+In CI the benchmark runs on pushes to `main`, on every pull request, and on
+demand via the **`bench`** workflow (`workflow_dispatch` in the Actions tab, with
+tunable inputs).  Results are attached as a `bench-results` artifact and rendered
+into the run's job summary.
+
+---
+
 ## Kubernetes (CSI driver)
 
 `ublk-azblob` ships an in-tree **Container Storage Interface (CSI)** driver so
@@ -422,7 +516,6 @@ docker compose -f tests/e2e/docker-compose.yml up \
   --build --abort-on-container-exit --exit-code-from runner
 docker compose -f tests/e2e/docker-compose.yml down -v
 ```
-
 ---
 
 ## Running unit tests
@@ -450,6 +543,10 @@ The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
 (`ubuntu-24.04` is avoided because its azure kernel currently Oopses in
 `ublk_drv` — see [actions/runner-images#14175](https://github.com/actions/runner-images/issues/14175).)
 
+A separate **`bench`** workflow (on pushes to `main`, pull requests, and manual `workflow_dispatch`)
+runs the fio benchmark comparing the ublk-azblob device against a raw local disk,
+on the same `ubuntu-22.04` runner.
+
 ---
 
 ## Project structure
@@ -464,6 +561,7 @@ ublk-azblob/
 │   ├── src/
 │   │   ├── main.rs             # CLI entry point (clap)
 │   │   ├── auth.rs             # MSI + SharedKey credential factory
+│   │   ├── bench.rs            # backend throughput / IOPS / latency benchmark
 │   │   ├── ublk_target.rs      # ublk device I/O loop (default feature `ublk`)
 │   │   ├── csi/                # Kubernetes CSI driver (default feature `csi`)
 │   │   │   ├── mod.rs          # gRPC server, role/config, volume-id encoding
@@ -485,9 +583,12 @@ ublk-azblob/
 │   ├── chart/                  # Helm chart (CSIDriver, RBAC, controller, node, StorageClass)
 │   └── example/                # sample PVC + pod
 ├── tests/
-│   └── e2e/
-│       ├── docker-compose.yml  # Azurite + k3s + runner for the whole e2e suite
-│       ├── Dockerfile          # e2e runner image (rust + docker/kubectl/helm)
-│       └── k8s/                # k8s manifests for the PVC e2e (helm values, writer/reader jobs)
+│   ├── e2e/
+│   │   ├── docker-compose.yml  # Azurite + k3s + runner for the whole e2e suite
+│   │   ├── Dockerfile          # e2e runner image (rust + docker/kubectl/helm)
+│   │   └── k8s/                # k8s manifests for the PVC e2e (helm values, writer/reader jobs)
+│   └── bench/
+│       ├── bench.sh            # fio benchmark: ublk-azblob vs. raw local disk
+│       └── docker-compose.yml  # benchmark override reusing tests/e2e/docker-compose.yml
 └── LICENSE.md                  # MIT license
 ```

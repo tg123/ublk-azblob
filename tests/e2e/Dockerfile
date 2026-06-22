@@ -24,6 +24,7 @@ ARG HELM_VERSION=v3.17.3
 # shipped to production rather than duplicating them here.
 # - libclang-dev           : bindgen for libublk-rs-sys (ublk feature)
 # - protobuf-compiler + libprotobuf-dev : protoc + well-known types (csi feature)
+# - fio / jq               : used by the benchmark pipeline (tests/bench/)
 # (nbd_e2e uses an in-process TCP client and the node plugin's mkfs/mount/
 #  nbd-client live in the driver image, so neither is needed here.)
 RUN apt-get update \
@@ -33,6 +34,8 @@ RUN apt-get update \
         libclang-dev \
         protobuf-compiler \
         libprotobuf-dev \
+        fio \
+        jq \
  && rm -rf /var/lib/apt/lists/*
 
 # docker CLI (client only) + buildx plugin — talks to the host daemon via the
