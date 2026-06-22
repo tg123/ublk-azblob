@@ -16,8 +16,9 @@ ARG DOCKER_VERSION=27.5.1
 ARG KUBECTL_VERSION=v1.32.3
 ARG HELM_VERSION=v3.17.3
 
-# - e2fsprogs / util-linux : mkfs.ext4, mount/umount, losetup (run by mount_e2e
-#                            and the mount-module unit tests directly)
+# - e2fsprogs : mkfs.ext4 / fsck.ext4 (run by mount_e2e directly); not in the
+#               rust:slim base, unlike mount/umount/losetup/blkid/fsck which the
+#               base already ships via the essential util-linux package.
 # - libclang-dev           : bindgen for libublk-rs-sys (ublk feature)
 # - protobuf-compiler + libprotobuf-dev : protoc + well-known types (csi feature)
 # (nbd_e2e uses an in-process TCP client and the node plugin's mkfs/mount/
@@ -25,7 +26,6 @@ ARG HELM_VERSION=v3.17.3
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         e2fsprogs \
-        util-linux \
         ca-certificates \
         curl \
         libclang-dev \
