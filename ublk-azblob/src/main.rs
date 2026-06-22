@@ -33,6 +33,7 @@ use backend::{
     BlobBackend,
 };
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -462,6 +463,10 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("ublk_azblob=info".parse().unwrap()),
         )
+        // Only colorize when stdout is a real terminal; when redirected to a
+        // file or pipe (e.g. CSI logs, systemd journal, the e2e harness), emit
+        // plain text so the output stays grep/parse-friendly.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let cli = Cli::parse();

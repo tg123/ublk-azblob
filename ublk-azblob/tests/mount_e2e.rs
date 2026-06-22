@@ -82,9 +82,9 @@ struct DeviceSpec {
     /// backing blob into the local-disk cache on boot. Only meaningful when
     /// `cache_dir` is `Some`. Used by the sparse-image warm-up test.
     cache_warmup: bool,
-    /// When `Some`, the child's stderr (where `tracing` logs go) is redirected
+    /// When `Some`, the child's stdout (where `tracing` logs go) is redirected
     /// to this file so a test can assert on log output (e.g. that warm-up used
-    /// the blob sparseness map). `None` inherits the parent's stderr.
+    /// the blob sparseness map). `None` inherits the parent's stdout.
     log_path: Option<PathBuf>,
 }
 
