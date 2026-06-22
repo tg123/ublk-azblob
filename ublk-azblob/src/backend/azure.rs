@@ -13,7 +13,8 @@ use azure_storage_blob::{
     models::{
         BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
         BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
-        PageBlobClientCreateOptions, PageBlobClientUploadPagesFromUrlOptions,
+        PageBlobClientCreateOptions, PageBlobClientResizeOptions,
+        PageBlobClientUploadPagesFromUrlOptions,
         PageBlobClientUploadPagesOptions,
     },
     BlobClient, BlobContainerClient,
@@ -248,6 +249,46 @@ impl BlobBackend for AzurePageBlobBackend {
             .create(size, Some(opts))
             .await
             .with_context(|| format!("create page blob '{}' size={size}", self.blob_name))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name, new_size))]
+    async fn resize(&self, new_size: u64) -> anyhow::Result<()> {
+        if self.snapshot.is_some() {
+            bail!("cannot resize: backend targets a read-only blob snapshot");
+        }
+        if new_size == 0 || !new_size.is_multiple_of(512) {
+            bail!("size must be a non-zero multiple of 512 bytes, got {new_size}");
+        }
+        let blob_client = self.container.blob_client(&self.blob_name);
+        // Reject shrink and short-circuit a no-op grow so the CSI resize flow is
+        // idempotent (the external-resizer may retry ControllerExpandVolume).
+        let existing = blob_client
+            .get_properties(None)
+            .await
+            .with_context(|| format!("get_properties for blob '{}'", self.blob_name))?
+            .content_length()?
+            .unwrap_or(0);
+        if new_size == existing {
+            trace!(new_size, "page blob already at requested size");
+            return Ok(());
+        }
+        if new_size < existing {
+            bail!(
+                "cannot shrink blob '{}' from {existing} to {new_size}",
+                self.blob_name
+            );
+        }
+        let page_client = blob_client.page_blob_client();
+        trace!(existing, new_size, "resizing page blob");
+        let opts = PageBlobClientResizeOptions {
+            lease_id: self.lease_id(),
+            ..Default::default()
+        };
+        page_client
+            .resize(new_size, Some(opts))
+            .await
+            .with_context(|| format!("resize page blob '{}' size={new_size}", self.blob_name))?;
         Ok(())
     }
 

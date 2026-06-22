@@ -880,6 +880,75 @@ impl BlobBackend for FileCacheBackend {
         Ok(())
     }
 
+    async fn resize(&self, new_size: u64) -> anyhow::Result<()> {
+        if new_size == 0 || !new_size.is_multiple_of(512) {
+            bail!("size must be a non-zero multiple of 512 bytes, got {new_size}");
+        }
+        // Grow the backing blob first so the new region exists durably before we
+        // expose it locally.
+        self.inner.resize(new_size).await?;
+
+        let mut state = self.state.lock().await;
+        let old_size = state.dev_size;
+        if new_size == old_size {
+            return Ok(());
+        }
+        if new_size < old_size {
+            bail!("cannot shrink cache from {old_size} to {new_size}");
+        }
+
+        let new_num_pages = new_size.div_ceil(self.page_size);
+        // Grow the sparse data file; the appended region reads back as zeros,
+        // matching the zero-filled region the blob resize created.
+        state
+            .data
+            .set_len(new_size)
+            .context("grow cache data file")?;
+
+        // Extend the present/dirty bitmaps, preserving every existing bit so
+        // already-cached (and dirty, not-yet-flushed) pages stay valid. New
+        // pages start absent, so the first read fetches them from the blob.
+        let new_bytes = bitmap_bytes(new_num_pages);
+        if new_bytes > state.present.len() {
+            state.present.resize(new_bytes, 0);
+            state.dirty.resize(new_bytes, 0);
+        }
+
+        // The page that straddled the old end-of-device was short; after the
+        // grow it covers a full page. When that page is resident, account the
+        // extra now-valid bytes against the budget so eviction stays accurate.
+        if self.budget.is_some() {
+            let boundary = (old_size.saturating_sub(1)) / self.page_size;
+            if boundary < state.num_pages && bit_get(&state.present, boundary) {
+                let old_len = self
+                    .page_size
+                    .min(old_size.saturating_sub(boundary * self.page_size));
+                let new_len = self
+                    .page_size
+                    .min(new_size.saturating_sub(boundary * self.page_size));
+                let grew = new_len.saturating_sub(old_len);
+                if grew > 0 {
+                    state.resident_bytes = state.resident_bytes.saturating_add(grew);
+                    if let Some(b) = &self.budget {
+                        let _ = b.admit(grew).context("admit boundary page growth")?;
+                    }
+                }
+            }
+        }
+
+        state.dev_size = new_size;
+        state.num_pages = new_num_pages;
+        write_full_meta(
+            &state.meta,
+            self.page_size,
+            new_size,
+            new_num_pages,
+            &state.present,
+            &state.dirty,
+        )?;
+        Ok(())
+    }
+
     async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
         if len == 0 {
             return Ok(Bytes::new());
@@ -1629,6 +1698,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resize_grows_device_preserving_pages() {
+        let dir = tmp_dir("resize");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        let (b, _) = open(inner.clone(), &dir, 1024, 4096);
+
+        // Dirty a page, then grow the device before flushing.
+        let payload = Bytes::from(vec![0x5A; 512]);
+        b.write(0, payload.clone()).await.unwrap();
+        assert_eq!(b.dirty_count().await, 1);
+
+        // Inner must be grown for the cache resize to succeed.
+        b.resize(8192).await.unwrap();
+        assert_eq!(b.size().await.unwrap(), 8192);
+        assert_eq!(inner.size().await.unwrap(), 8192);
+        // The unflushed dirty page survived the grow.
+        assert_eq!(b.dirty_count().await, 1);
+        assert_eq!(b.read(0, 512).await.unwrap(), payload);
+
+        // The newly-available region is in bounds and reads back zeroed.
+        let tail = b.read(4096, 512).await.unwrap();
+        assert!(tail.iter().all(|&x| x == 0));
+
+        // Writes into the grown region round-trip and reach the inner backend.
+        let grown = Bytes::from(vec![0xC3; 512]);
+        b.write(8192 - 512, grown.clone()).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(inner.read(8192 - 512, 512).await.unwrap(), grown);
+        assert_eq!(inner.read(0, 512).await.unwrap(), payload);
+
+        // Shrink and unaligned sizes are rejected.
+        assert!(b.resize(4096).await.is_err(), "shrink rejected");
+        assert!(b.resize(8192 + 1).await.is_err(), "unaligned rejected");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn budget_evicts_lru_clean_pages() {
         // Budget of two 1 KiB pages.  Reading three different pages must keep the
         // cache at two resident pages, evicting the least-recently-used one.
@@ -1823,6 +1929,9 @@ mod tests {
     impl BlobBackend for CountingBackend {
         async fn create(&self, size: u64) -> anyhow::Result<()> {
             self.inner.create(size).await
+        }
+        async fn resize(&self, new_size: u64) -> anyhow::Result<()> {
+            self.inner.resize(new_size).await
         }
         async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
             self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

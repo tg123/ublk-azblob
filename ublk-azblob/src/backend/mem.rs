@@ -43,6 +43,21 @@ impl BlobBackend for MemBackend {
         Ok(())
     }
 
+    async fn resize(&self, new_size: u64) -> anyhow::Result<()> {
+        check_alignment(new_size, 512, "size")?;
+        if new_size == 0 {
+            bail!("size must be > 0");
+        }
+        let mut data = self.data.lock().map_err(|e| anyhow!("lock: {e}"))?;
+        let existing = data.len() as u64;
+        if new_size < existing {
+            bail!("cannot shrink from {existing} to {new_size}");
+        }
+        // Zero-extend in place; a no-op grow leaves the buffer untouched.
+        data.resize(new_size as usize, 0);
+        Ok(())
+    }
+
     async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
         check_alignment(offset, 512, "offset")?;
         check_alignment(len, 512, "len")?;
@@ -122,6 +137,28 @@ mod tests {
         assert_eq!(b.size().await.unwrap(), 4096);
         b.create(8192).await.unwrap();
         assert_eq!(b.size().await.unwrap(), 8192);
+    }
+
+    #[tokio::test]
+    async fn test_resize_grows_and_preserves_data() {
+        let b = MemBackend::new(4096).unwrap();
+        let payload = Bytes::from(vec![0xABu8; 512]);
+        b.write(0, payload.clone()).await.unwrap();
+        // Grow.
+        b.resize(8192).await.unwrap();
+        assert_eq!(b.size().await.unwrap(), 8192);
+        // Original data is preserved.
+        assert_eq!(b.read(0, 512).await.unwrap(), payload);
+        // Newly-added region is zeroed.
+        let tail = b.read(4096, 512).await.unwrap();
+        assert!(tail.iter().all(|&x| x == 0));
+        // Grow to the same size is an idempotent no-op.
+        b.resize(8192).await.unwrap();
+        assert_eq!(b.size().await.unwrap(), 8192);
+        // Shrink is rejected.
+        assert!(b.resize(4096).await.is_err(), "shrink rejected");
+        // Unaligned size is rejected.
+        assert!(b.resize(8192 + 1).await.is_err(), "unaligned rejected");
     }
 
     #[tokio::test]
