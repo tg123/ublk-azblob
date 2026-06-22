@@ -74,8 +74,8 @@ jobs:
           file: tests/e2e/Dockerfile
           tags: ublk-azblob-e2e-runner:local
           load: true
-          cache-from: type=gha,scope=bench-runner
-          cache-to: type=gha,mode=max,scope=bench-runner
+          cache-from: type=gha,scope=bench-runner-${{ runner.arch }}
+          cache-to: type=gha,mode=max,scope=bench-runner-${{ runner.arch }}
 
       - name: Cache cargo-home and target
         # The benchmark compile happens inside the runner container, which writes
@@ -88,9 +88,9 @@ jobs:
             .cargo-home/registry/cache
             .cargo-home/git/db
             target
-          key: bench-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: bench-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            bench-cargo-${{ runner.os }}-
+            bench-cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run benchmark (build + fio in docker compose runner)
         env:

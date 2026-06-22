@@ -42,8 +42,5 @@ jobs:
       - name: cargo clippy (bench feature)
         run: cargo clippy --features bench -- -D warnings
 
-      - name: cargo test (unit tests, MemBackend — no kernel required)
-        run: cargo test
-
       - name: cargo test (all features)
         run: cargo test --all-features
