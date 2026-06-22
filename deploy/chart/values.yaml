@@ -196,6 +196,10 @@ storageClass:
     # Filesystem the node mounts a `templateBlobUrl` image as. The template is
     # never reformatted, so this is the type it already carries (defaults to
     # newBlobFsType). Only meaningful together with templateBlobUrl.
+    # Mount-only image types: squashfs and ntfs work out of the box (squashfs via
+    # the in-kernel driver, ntfs via the shipped ntfs-3g FUSE driver). `zfs`
+    # requires a custom runtime image with the ZFS kernel module + zfsutils-linux
+    # (neither is present in a stock kernel / the default image).
     # templateBlobFsType: squashfs
 
     # Advanced: override the built-in mount options of the templateBlobFsType
