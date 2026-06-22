@@ -57,7 +57,7 @@ const DEFAULT_BLOB: &str = "mounttest";
 // High device id (away from 0,1,…) so these tests don't collide with the ublk
 // devices the k8s CSI e2e auto-assigns from 0 when the whole suite runs together.
 const DEV_ID: &str = "40";
-const BLOB_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
+const BLOB_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB (xfs needs ~300 MiB minimum)
 const NUM_FILES: usize = 8;
 
 /// Parameters identifying a single device instance for a test run.
@@ -100,6 +100,18 @@ fn ublk_available() -> bool {
     // SAFETY: `geteuid` has no preconditions and never fails.
     let is_root = unsafe { libc::geteuid() } == 0;
     is_root && Path::new("/dev/ublk-control").exists()
+}
+
+/// Whether a command-line tool is available (probed with `-V`, like the CSI
+/// node plugin's `mkfs.<fs>` tools).
+fn have_tool(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("-V")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Run a command to completion and panic if it fails.
@@ -432,6 +444,76 @@ fn mount_roundtrip_file_cache_budget() {
         disable_auto_flush: false,
     });
     let _ = fs::remove_dir_all(&cache_dir);
+}
+
+/// e2e: the *formattable* precooked filesystem profiles beyond the default
+/// ext4 — `xfs` and `btrfs` — actually `mkfs` and mount on a **real ublk
+/// device** and keep data across an unmount/remount. Skips a filesystem whose
+/// `mkfs.<fs>` tool is not installed.
+///
+/// (ext4 is already exercised end-to-end by `mount_roundtrip`. The negative
+/// "format not supported" path for the mount-only profiles squashfs/zfs/ntfs is
+/// covered by the `csi::mount` `mkfs_rejects_unformattable_filesystems` unit
+/// test, which the privileged e2e runner runs as root via `cargo test --bins`.)
+#[test]
+fn mount_formattable_fs_profiles() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_formattable_fs_profiles: requires root and a loaded \
+             ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    // (fs_type, mkfs flags matching `csi::mount::fs_profile`, dev_id). High
+    // device ids avoid colliding with the other mount_e2e tests (40-45) and the
+    // k8s CSI e2e's low auto-assigned ids.
+    let cases: &[(&str, &[&str], &str)] = &[("xfs", &["-f"], "46"), ("btrfs", &["-f"], "47")];
+
+    for &(fs, mkfs_flags, dev_id) in cases {
+        if !have_tool(&format!("mkfs.{fs}")) {
+            eprintln!("skipping {fs}: mkfs.{fs} not installed");
+            continue;
+        }
+
+        let spec = DeviceSpec {
+            dev_id: dev_id.to_string(),
+            container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+            blob: format!("{}-{fs}", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+            cache_dir: None,
+            cache_max_bytes: 0,
+            disable_auto_flush: false,
+        };
+        let dev = spec.dev_path();
+        let mnt = tempdir(&format!("ublk-azblob-{fs}"));
+        let mnt_str = mnt.to_str().unwrap().to_string();
+
+        // Provision the device and format it with the profile's mkfs flags.
+        let child = start_device(&spec, true);
+        log(&format!("mkfs.{fs} on {dev}"));
+        let mut args: Vec<&str> = mkfs_flags.to_vec();
+        args.push(&dev);
+        run(&format!("mkfs.{fs}"), &args);
+
+        // Mount, write a file, capture its checksum.
+        log(&format!("mounting {fs} {dev} at {mnt_str}"));
+        run("mount", &["-t", fs, &dev, &mnt_str]);
+        let probe = mnt.join("probe.bin");
+        write_random_file(&probe, 256 * 1024);
+        let expected = sha256_file(&probe);
+
+        // Unmount and remount the same device to prove the data is durable on
+        // the (ublk-backed) block device, then verify the checksum.
+        run("umount", &[&mnt_str]);
+        run("mount", &["-t", fs, &dev, &mnt_str]);
+        let actual = sha256_file(&probe);
+        assert_eq!(expected, actual, "{fs} round-trip mismatch after remount");
+
+        run("umount", &[&mnt_str]);
+        stop_device(&dev, child);
+        let _ = fs::remove_dir_all(&mnt);
+        log(&format!("{fs}: format + mount + remount round-trip OK"));
+    }
 }
 
 /// Drive a full mount/write/flush/remount/verify cycle for the given device.
