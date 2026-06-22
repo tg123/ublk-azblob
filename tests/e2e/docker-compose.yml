@@ -144,6 +144,18 @@ services:
         cid=$$(docker create ublk-azblob:e2e)
         docker cp "$$cid:/usr/local/bin/ublk-azblob" target/ublk-azblob-shipped
         docker rm "$$cid" >/dev/null
+        # The on-device filesystem formatters are not installed in this runner;
+        # they live only in the runtime image (deploy/Dockerfile ships
+        # e2fsprogs/xfsprogs/btrfs-progs). Bridge mkfs.*/fsck.ext4 into that image
+        # so the mount e2e formats devices with the exact tools shipped to
+        # production. They operate on the shared /dev block devices, so a sibling
+        # container with /dev bind-mounted is equivalent. mount/umount stay in
+        # this runner (they must affect the test's own mount namespace) and come
+        # from the base util-linux.
+        for tool in mkfs.ext2 mkfs.ext3 mkfs.ext4 mkfs.xfs mkfs.btrfs fsck.ext4; do
+          printf '#!/bin/sh\nexec docker run --rm --privileged -v /dev:/dev --entrypoint %s %s "$$@"\n' "$$tool" "$$E2E_IMAGE" > /usr/local/bin/"$$tool"
+          chmod +x /usr/local/bin/"$$tool"
+        done
         for i in $$(seq 1 60); do
           [ -f /kubeconfig/kubeconfig.yaml ] && break
           echo "waiting for kubeconfig... ($$i/60)"; sleep 1
