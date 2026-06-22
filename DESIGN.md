@@ -81,7 +81,7 @@ the `BlobBackend` trait:
 ```
 BlobBackend::read/write/clear/flush/size  ←  only interface the I/O loop sees
 AzurePageBlobBackend                      ←  all SDK types live here
-BufferedBackend                           ←  in-memory write-back cache (wraps any backend)
+BufferedBackend                           ←  in-memory write-back + read cache (wraps any backend)
 FileCacheBackend                          ←  persistent local-disk cache (wraps any backend)
 MemBackend                                ←  in-memory, no network, for unit tests
 ```
@@ -246,7 +246,11 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
   are never evicted. The budget is shared across every process using the same
   `--cache-dir` via a `flock`-coordinated, crash-safe `.cache-budget` file, so a
   single noisy volume cannot fill a shared CSI node's cache disk. Each process
-  evicts only its own clean pages and never touches a peer's cache files.
+  evicts only its own clean pages and never touches a peer's cache files. The
+  same LRU bookkeeping (`backend::cache_lru::Lru`) bounds the **in-memory**
+  write-back buffer too: it doubles as a read cache and evicts least-recently-
+  used clean pages once the resident set exceeds `--max-cached-pages` (dirty
+  pages stay pinned).
 - ⚠️ Cross-process clean-page sharing (`--cache-share-pages`) — **implemented but
   currently disabled in the shipped binary** (the flag is accepted but ignored;
   every cache is single-process). Design, retained for a later iteration:

@@ -1,16 +1,23 @@
-//! Write-back buffered backend.
+//! Write-back buffered backend that doubles as an in-memory page cache.
 //!
 //! `BufferedBackend` wraps any `BlobBackend` and accumulates writes in memory,
 //! flushing dirty "pages" (fixed-size regions) to the inner backend in batches.
-//! Reads are served from the buffer when the requested region overlaps dirty
-//! data, falling back to the inner backend for clean regions.
+//! It is also a read cache: a page fetched to satisfy a read (or left behind
+//! after a flush) stays resident so later accesses are served from memory
+//! instead of the inner backend. The resident set is bounded by an LRU budget
+//! (`max_cached_pages`) that evicts the least-recently-used **clean** pages;
+//! dirty pages are pinned until flushed.
 //!
 //! # Parameters
 //! - `page_size`: Size of each buffer page (e.g. 4 MiB).  Must be a multiple
 //!   of 512 bytes.
 //! - `max_dirty_pages`: When the number of dirty pages exceeds this limit,
 //!   the oldest dirty pages are auto-flushed before accepting new writes.
+//! - `max_cached_pages`: Upper bound on resident pages (clean + dirty). When
+//!   exceeded, the least-recently-used clean pages are evicted from memory.
+//!   `0` means unlimited (grow-only, no clean-page eviction).
 
+use super::cache_lru::Lru;
 use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
@@ -31,6 +38,17 @@ pub struct BufferedConfig {
     /// write-back buffer. Exceeding it triggers an immediate flush of the
     /// oldest dirty pages back down to the limit.
     pub max_dirty_pages: usize,
+    /// Maximum number of *resident* pages (clean **and** dirty) kept in memory.
+    ///
+    /// The buffer doubles as an in-memory read cache: clean pages fetched to
+    /// satisfy reads (or left behind after a flush) stay resident so later
+    /// accesses are served from memory. When the resident page count exceeds
+    /// this limit, the least-recently-used **clean** pages are evicted from
+    /// memory (dirty pages are pinned — they are bounded separately by
+    /// `max_dirty_pages`, which flushes them). `0` means unlimited (grow-only,
+    /// no clean-page eviction). Should be `>= max_dirty_pages` to leave room for
+    /// the pinned dirty working set.
+    pub max_cached_pages: usize,
     /// Idle flush timeout in seconds: flush dirty pages after N seconds of write inactivity.
     /// Set to 0 to disable idle flushing. When triggered, resets the force flush timer.
     pub idle_flush_secs: u64,
@@ -60,6 +78,7 @@ impl Default for BufferedConfig {
         Self {
             page_size: 4 * 1024 * 1024,    // 4 MiB
             max_dirty_pages: 64,           // 256 MiB total
+            max_cached_pages: 256,         // 1 GiB resident cap (clean + dirty)
             idle_flush_secs: 15,           // flush after 15s idle
             force_flush_timeout_secs: 600, // force flush after 10 minutes
             flush_io_timeout_secs: 0,      // no per-flush I/O cap by default
@@ -77,7 +96,9 @@ struct Page {
     data: BytesMut,
     /// Whether this page has been modified since the last flush.
     dirty: bool,
-    /// Sequence number for LRU eviction.
+    /// Modification sequence number. Bumped on every write/clear so a flush can
+    /// detect whether the page was re-dirtied while its bytes were in flight
+    /// (and must therefore stay dirty). Distinct from the LRU recency clock.
     seq: u64,
 }
 
@@ -91,6 +112,10 @@ pub struct BufferedBackend {
 struct BufferState {
     /// Map from page index → page data.
     pages: BTreeMap<u64, Page>,
+    /// LRU bookkeeping for clean-page eviction. Mirrors the `pages` map: every
+    /// resident page has an entry, and only *clean* pages are evictable. Used to
+    /// keep the resident set within `max_cached_pages`.
+    lru: Lru,
     /// Monotonic counter for LRU ordering.
     seq_counter: u64,
     /// Total device size (set after create/size call).
@@ -112,11 +137,19 @@ impl BufferedBackend {
         if config.max_dirty_pages == 0 {
             bail!("max_dirty_pages must be greater than 0");
         }
+        if config.max_cached_pages != 0 && config.max_cached_pages < config.max_dirty_pages {
+            bail!(
+                "max_cached_pages ({}) must be 0 (unlimited) or >= max_dirty_pages ({})",
+                config.max_cached_pages,
+                config.max_dirty_pages
+            );
+        }
         let backend = Arc::new(Self {
             inner,
             config: config.clone(),
             state: Mutex::new(BufferState {
                 pages: BTreeMap::new(),
+                lru: Lru::default(),
                 seq_counter: 0,
                 dev_size: 0,
                 last_write: None,
@@ -231,8 +264,12 @@ impl BufferedBackend {
     /// necessary.  The inner read happens **without** the state lock held; the
     /// lock is only taken briefly to check residency and to insert the page.
     ///
-    /// Pages are never removed once resident, so after this returns the page is
-    /// guaranteed to stay present for subsequent `get_mut` access.
+    /// A freshly loaded page is inserted clean and recorded in the LRU, and the
+    /// resident set is trimmed back within `max_cached_pages` (the just-loaded
+    /// page is protected from that trim).  Because clean pages may later be
+    /// evicted to honour the cache budget, callers must **not** assume the page
+    /// is still resident after re-acquiring the lock — they re-check and retry
+    /// `ensure_resident` if it was evicted in the meantime.
     async fn ensure_resident(&self, page_idx: u64, dev_size: u64) -> anyhow::Result<()> {
         {
             let state = self.state.lock().await;
@@ -279,8 +316,35 @@ impl BufferedBackend {
                     seq,
                 },
             );
+            // The newly resident page is clean and therefore evictable; record it
+            // and trim the resident set back within the cache budget, protecting
+            // the page we just loaded.
+            state.lru.touch(page_idx, true);
+            self.enforce_cache_limit(&mut state, Some(page_idx));
         }
         Ok(())
+    }
+
+    /// Evict least-recently-used **clean** pages from memory until the resident
+    /// page count is within `max_cached_pages` (a no-op when it is `0`,
+    /// i.e. unlimited).
+    ///
+    /// Dirty pages are pinned and never evicted (their unflushed bytes would be
+    /// lost); they are bounded separately by `max_dirty_pages`, which flushes
+    /// them.  `protect` is never evicted, so a caller can keep a page it is
+    /// actively serving resident.  Runs entirely under the state lock with no
+    /// `await`, so it never drops a page another task is mid-fetch on.
+    fn enforce_cache_limit(&self, state: &mut BufferState, protect: Option<u64>) {
+        let max = self.config.max_cached_pages;
+        if max == 0 {
+            return;
+        }
+        while state.pages.len() > max {
+            let Some(victim) = state.lru.pop_lru(protect) else {
+                break; // nothing else is evictable (the rest are dirty/protected)
+            };
+            state.pages.remove(&victim);
+        }
     }
 
     /// Flush the given pages to the inner backend.
@@ -349,10 +413,16 @@ impl BufferedBackend {
 
                 // Mark clean only if the page wasn't re-dirtied during the flush.
                 let mut state = self.state.lock().await;
-                if let Some(p) = state.pages.get_mut(&page_idx) {
-                    if p.seq == seq {
+                let cleaned = match state.pages.get_mut(&page_idx) {
+                    Some(p) if p.seq == seq => {
                         p.dirty = false;
+                        true
                     }
+                    _ => false,
+                };
+                if cleaned {
+                    // Now clean again: the page becomes an eviction candidate.
+                    state.lru.touch(page_idx, true);
                 }
                 Ok::<(), anyhow::Error>(())
             }))
@@ -425,6 +495,7 @@ impl BlobBackend for BufferedBackend {
         let mut state = self.state.lock().await;
         state.dev_size = size;
         state.pages.clear();
+        state.lru.clear();
         state.seq_counter = 0;
         Ok(())
     }
@@ -450,34 +521,26 @@ impl BlobBackend for BufferedBackend {
             let page_offset = abs_offset % page_size;
             let chunk_len = (page_size - page_offset).min(len - pos) as usize;
 
-            // Try to serve from the buffer under a brief lock (no await held).
-            let served = {
-                let state = self.state.lock().await;
-                if let Some(page) = state.pages.get(&page_idx) {
-                    result[pos as usize..pos as usize + chunk_len].copy_from_slice(
-                        &page.data[page_offset as usize..page_offset as usize + chunk_len],
-                    );
-                    true
-                } else {
-                    false
-                }
-            };
+            // The buffer doubles as an in-memory read cache: make the page
+            // resident (fetching from the inner backend without the lock held)
+            // and serve the chunk from memory, refreshing its LRU recency.  A
+            // clean page may be evicted between `ensure_resident` and the lock,
+            // so re-check residency and reload on the rare miss.
+            loop {
+                self.ensure_resident(page_idx, dev_size).await?;
 
-            if !served {
-                // Read directly from inner with no lock held; don't pollute the
-                // cache for pure reads.
-                let data = self
-                    .inner
-                    .read(abs_offset, chunk_len as u64)
-                    .await
-                    .with_context(|| format!("read offset={abs_offset} len={chunk_len}"))?;
-                if data.len() != chunk_len {
-                    bail!(
-                        "backend returned {} bytes for read offset={abs_offset} len={chunk_len}",
-                        data.len()
-                    );
-                }
-                result[pos as usize..pos as usize + chunk_len].copy_from_slice(&data);
+                let mut state = self.state.lock().await;
+                let Some(page) = state.pages.get(&page_idx) else {
+                    // Evicted in the race window; reload and retry.
+                    continue;
+                };
+                result[pos as usize..pos as usize + chunk_len].copy_from_slice(
+                    &page.data[page_offset as usize..page_offset as usize + chunk_len],
+                );
+                let clean = !page.dirty;
+                state.lru.touch(page_idx, clean);
+                self.enforce_cache_limit(&mut state, Some(page_idx));
+                break;
             }
 
             pos += chunk_len as u64;
@@ -510,24 +573,33 @@ impl BlobBackend for BufferedBackend {
             let page_offset = (abs_offset % page_size) as usize;
             let chunk_len = (page_size - page_offset as u64).min(len - pos) as usize;
 
-            // Load the page (inner I/O happens without the state lock held).
-            self.ensure_resident(page_idx, dev_size).await?;
+            // Load the page (inner I/O happens without the state lock held),
+            // then apply the modification under a brief lock.  A clean page can
+            // be evicted in the window between the two, so re-check residency and
+            // reload on the rare miss instead of asserting it is still present.
+            loop {
+                self.ensure_resident(page_idx, dev_size).await?;
 
-            // Apply the modification under a brief lock (no await held).
-            {
                 let mut state = self.state.lock().await;
+                if !state.pages.contains_key(&page_idx) {
+                    // Evicted in the race window; reload and retry.
+                    continue;
+                }
                 state.seq_counter += 1;
                 let seq = state.seq_counter;
                 let page = state
                     .pages
                     .get_mut(&page_idx)
-                    .expect("page resident after ensure_resident");
+                    .expect("page resident: contains_key checked above");
                 page.data[page_offset..page_offset + chunk_len]
                     .copy_from_slice(&data[pos as usize..pos as usize + chunk_len]);
                 page.dirty = true;
                 page.seq = seq;
+                // Dirty pages are pinned (not evictable) until flushed.
+                state.lru.touch(page_idx, false);
                 // Track last write time for idle flush
                 state.last_write = Some(Instant::now());
+                break;
             }
 
             // Keep the dirty-page count bounded (flushes oldest, lock released
@@ -560,21 +632,28 @@ impl BlobBackend for BufferedBackend {
             let page_offset = (abs_offset % page_size) as usize;
             let chunk_len = (page_size - page_offset as u64).min(len - pos) as usize;
 
-            self.ensure_resident(page_idx, dev_size).await?;
+            loop {
+                self.ensure_resident(page_idx, dev_size).await?;
 
-            {
                 let mut state = self.state.lock().await;
+                if !state.pages.contains_key(&page_idx) {
+                    // Evicted in the race window; reload and retry.
+                    continue;
+                }
                 state.seq_counter += 1;
                 let seq = state.seq_counter;
                 let page = state
                     .pages
                     .get_mut(&page_idx)
-                    .expect("page resident after ensure_resident");
+                    .expect("page resident: contains_key checked above");
                 page.data[page_offset..page_offset + chunk_len].fill(0);
                 page.dirty = true;
                 page.seq = seq;
+                // Dirty pages are pinned (not evictable) until flushed.
+                state.lru.touch(page_idx, false);
                 // Track last write time for idle flush
                 state.last_write = Some(Instant::now());
+                break;
             }
 
             self.enforce_dirty_limit().await?;
@@ -616,6 +695,7 @@ impl BlobBackend for BufferedBackend {
         // Drop any buffered dirty pages and delegate to the inner backend.
         let mut state = self.state.lock().await;
         state.pages.clear();
+        state.lru.clear();
         drop(state);
         self.inner.delete().await
     }
@@ -641,6 +721,7 @@ mod tests {
             BufferedConfig {
                 page_size,
                 max_dirty_pages: max_dirty,
+                max_cached_pages: 0,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
@@ -677,6 +758,7 @@ mod tests {
             BufferedConfig {
                 page_size: 1024,
                 max_dirty_pages: 4,
+                max_cached_pages: 0,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
@@ -706,6 +788,7 @@ mod tests {
             BufferedConfig {
                 page_size: 1024,
                 max_dirty_pages: 2,
+                max_cached_pages: 0,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
@@ -737,6 +820,7 @@ mod tests {
             BufferedConfig {
                 page_size,
                 max_dirty_pages: PAGES as usize, // keep them all dirty until flush()
+                max_cached_pages: 0,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
@@ -771,6 +855,7 @@ mod tests {
             BufferedConfig {
                 page_size: 1024,
                 max_dirty_pages: 8,
+                max_cached_pages: 0,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
@@ -822,6 +907,7 @@ mod tests {
             BufferedConfig {
                 page_size,
                 max_dirty_pages: 4,
+                max_cached_pages: 0,
                 idle_flush_secs: 0,
                 force_flush_timeout_secs: 0,
                 flush_io_timeout_secs: 0,
@@ -861,5 +947,229 @@ mod tests {
                 "page {p} not persisted to inner"
             );
         }
+    }
+
+    // ---- In-memory cache (read population + LRU eviction) ----
+
+    /// Inner backend that counts the number of `read` calls reaching it, so a
+    /// test can assert that a cache hit was served from memory (no inner read).
+    struct CountingBackend {
+        inner: MemBackend,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingBackend {
+        fn new(size: u64) -> Self {
+            Self {
+                inner: MemBackend::new(size).unwrap(),
+                reads: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+        fn read_count(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for CountingBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+    }
+
+    fn make_cached_backend(
+        inner: Arc<dyn BlobBackend>,
+        page_size: u64,
+        max_dirty: usize,
+        max_cached: usize,
+    ) -> Arc<BufferedBackend> {
+        BufferedBackend::new(
+            inner,
+            BufferedConfig {
+                page_size,
+                max_dirty_pages: max_dirty,
+                max_cached_pages: max_cached,
+                idle_flush_secs: 0,
+                force_flush_timeout_secs: 0,
+                flush_io_timeout_secs: 0,
+                flush_concurrency: 16,
+            },
+        )
+        .unwrap()
+    }
+
+    async fn resident_pages(b: &BufferedBackend) -> usize {
+        b.state.lock().await.pages.len()
+    }
+
+    #[tokio::test]
+    async fn read_populates_cache_and_serves_from_memory() {
+        // Seed the inner backend with a known pattern.
+        let page_size = 1024u64;
+        let inner = Arc::new(CountingBackend::new(4 * page_size));
+        inner
+            .write(0, Bytes::from(vec![0x7E; page_size as usize]))
+            .await
+            .unwrap();
+        let counter = inner.clone();
+        let b = make_cached_backend(inner, page_size, 4, 16);
+
+        // First read misses the cache and fetches the page from the inner backend.
+        let r1 = b.read(0, 512).await.unwrap();
+        assert!(r1.iter().all(|&x| x == 0x7E));
+        assert_eq!(resident_pages(&b).await, 1, "page should now be cached");
+        let after_first = counter.read_count();
+        assert!(after_first >= 1, "first read must reach inner backend");
+
+        // Subsequent reads of the same page are served from memory: no new inner
+        // reads.
+        let r2 = b.read(0, 512).await.unwrap();
+        assert!(r2.iter().all(|&x| x == 0x7E));
+        assert_eq!(
+            counter.read_count(),
+            after_first,
+            "cache hit must not reach inner backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_pages_evicted_over_cache_limit() {
+        const PAGES: u64 = 8;
+        let page_size = 1024u64;
+        let inner = Arc::new(MemBackend::new(PAGES * page_size).unwrap());
+        // Cache at most 3 pages; all pages are clean reads, so the resident set
+        // must never exceed the limit.
+        let b = make_cached_backend(inner, page_size, 3, 3);
+
+        for p in 0..PAGES {
+            let _ = b.read(p * page_size, 512).await.unwrap();
+            assert!(
+                resident_pages(&b).await <= 3,
+                "resident set exceeded the cache limit at page {p}"
+            );
+        }
+        assert_eq!(resident_pages(&b).await, 3, "cache should be full");
+    }
+
+    #[tokio::test]
+    async fn dirty_pages_are_pinned_against_eviction() {
+        const PAGES: u64 = 8;
+        let page_size = 1024u64;
+        let inner = Arc::new(MemBackend::new(PAGES * page_size).unwrap());
+        // Keep up to 4 dirty pages (no auto-flush) and cap the resident set at 4
+        // total, so admitting clean read pages must evict *clean* pages only —
+        // never the pinned dirty ones.
+        let b = make_cached_backend(inner.clone(), page_size, 4, 4);
+
+        // Dirty pages 0..4 (kept dirty: max_dirty_pages == 4).
+        for p in 0..4u64 {
+            let byte = 0xA0 + p as u8;
+            b.write(p * page_size, Bytes::from(vec![byte; page_size as usize]))
+                .await
+                .unwrap();
+        }
+        assert_eq!(resident_pages(&b).await, 4);
+
+        // Now read clean pages 4..8; each admission is over the cap and must
+        // evict a clean page — but there are no clean pages, so the dirty ones
+        // survive and the resident set may transiently exceed the cap.
+        for p in 4..PAGES {
+            let _ = b.read(p * page_size, 512).await.unwrap();
+        }
+
+        // The four dirty pages must still be resident with their unflushed data.
+        for p in 0..4u64 {
+            let byte = 0xA0 + p as u8;
+            let got = b.read(p * page_size, page_size).await.unwrap();
+            assert!(
+                got.iter().all(|&x| x == byte),
+                "dirty page {p} lost its unflushed data"
+            );
+        }
+        // And none of it reached the inner backend (never flushed).
+        for p in 0..4u64 {
+            let got = inner.read(p * page_size, page_size).await.unwrap();
+            assert!(
+                got.iter().all(|&x| x == 0),
+                "dirty page {p} must not have been flushed/evicted"
+            );
+        }
+
+        // After flushing, the now-clean pages become evictable and the resident
+        // set settles within the cap on the next admission.
+        b.flush().await.unwrap();
+        let _ = b.read(0, 512).await.unwrap();
+        assert!(
+            resident_pages(&b).await <= 4,
+            "resident set must settle within the cap once pages are clean"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_preserves_read_correctness() {
+        // With a tiny cache, a full sweep that constantly evicts must still
+        // return correct bytes for every page.
+        const PAGES: u64 = 16;
+        let page_size = 1024u64;
+        let inner = Arc::new(MemBackend::new(PAGES * page_size).unwrap());
+        for p in 0..PAGES {
+            let byte = (p as u8).wrapping_mul(17);
+            inner
+                .write(p * page_size, Bytes::from(vec![byte; page_size as usize]))
+                .await
+                .unwrap();
+        }
+        let b = make_cached_backend(inner, page_size, 2, 2);
+
+        // Two passes so the second pass hits a mix of cached and evicted pages.
+        for _ in 0..2 {
+            for p in 0..PAGES {
+                let byte = (p as u8).wrapping_mul(17);
+                let got = b.read(p * page_size, page_size).await.unwrap();
+                assert!(got.iter().all(|&x| x == byte), "wrong bytes for page {p}");
+                assert!(resident_pages(&b).await <= 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_max_cached_pages_rejected() {
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        // max_cached_pages must be 0 (unlimited) or >= max_dirty_pages.
+        let res = BufferedBackend::new(
+            inner,
+            BufferedConfig {
+                page_size: 1024,
+                max_dirty_pages: 8,
+                max_cached_pages: 4,
+                idle_flush_secs: 0,
+                force_flush_timeout_secs: 0,
+                flush_io_timeout_secs: 0,
+                flush_concurrency: 16,
+            },
+        );
+        assert!(
+            res.is_err(),
+            "max_cached_pages < max_dirty_pages must error"
+        );
     }
 }
