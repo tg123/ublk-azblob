@@ -1126,9 +1126,15 @@ spec:
     );
 
     // ── Verify the cache was reloaded (reused), not invalidated.  Only the reader
-    //    mounts after the restart, so any reuse/invalidation line in the fresh
-    //    node-plugin logs is this volume's. ────────────────────────────────────
-    let logs = node_plugin_logs(&["--tail=400"]);
+    //    mounts after the restart, and the node-plugin pods are fresh (the rollout
+    //    restart replaced them), so their logs contain only post-restart lines for
+    //    this volume.  Capture *all* of them (`--tail=-1`): the "reusing clean
+    //    cache pages" line is emitted early during the reader's mount, and the
+    //    busy per-read flush logging can otherwise push it out of a small tail
+    //    window on slower runners (observed flaking on arm64 with `--tail=400`).
+    //    The clean ETag-validated reuse path is also covered deterministically by
+    //    the `cache_reload_reuses_clean_pages_through_buffered` unit test. ────────
+    let logs = node_plugin_logs(&["--tail=-1"]);
     if logs.contains("discarded stale clean cache pages") {
         eprintln!("--- node plugin logs ---\n{logs}\n--- end ---");
         panic!(

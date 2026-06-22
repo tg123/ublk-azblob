@@ -2508,4 +2508,133 @@ mod tests {
         assert!(!lru.contains(0));
         assert!(!lru.contains(1));
     }
+
+    /// MemBackend wrapper reporting a mutable ETag (bumped on every mutation),
+    /// like Azure changing the blob ETag on each Put Page.
+    struct EtagMem {
+        inner: Arc<MemBackend>,
+        rev: std::sync::atomic::AtomicU64,
+    }
+    impl EtagMem {
+        fn new(size: u64) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(MemBackend::new(size).unwrap()),
+                rev: std::sync::atomic::AtomicU64::new(1),
+            })
+        }
+        fn bump(&self) {
+            self.rev.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl BlobBackend for EtagMem {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.bump();
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.bump();
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.bump();
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+        async fn etag(&self) -> anyhow::Result<Option<String>> {
+            Ok(Some(format!(
+                "etag-{}",
+                self.rev.load(std::sync::atomic::Ordering::SeqCst)
+            )))
+        }
+    }
+
+    fn open_with_etag(
+        inner: Arc<dyn BlobBackend>,
+        dir: &Path,
+        page_size: u64,
+        dev_size: u64,
+        current_etag: Option<String>,
+    ) -> (FileCacheBackend, u64) {
+        FileCacheBackend::open(
+            inner,
+            FileCacheConfig {
+                dir: dir.to_path_buf(),
+                name: "test".to_string(),
+                page_size,
+                max_bytes: 0,
+                blob_identity: String::new(),
+                share_pages: false,
+            },
+            dev_size,
+            current_etag,
+        )
+        .unwrap()
+    }
+
+    /// Reproduces the PR #23 cache-reload scenario WITHOUT ublk/k8s: write through
+    /// BufferedBackend -> FileCacheBackend over an etag-reporting inner, flush,
+    /// drop (simulate the node-plugin restart), reopen the FileCacheBackend, and
+    /// assert the flushed pages recover CLEAN and are reused (not dirty).
+    #[tokio::test]
+    async fn cache_reload_reuses_clean_pages_through_buffered() {
+        use crate::backend::buffered::{BufferedBackend, BufferedConfig};
+
+        let dir = tmp_dir("reload-reuse");
+        let cache_page = 1024u64;
+        let buf_page = 4096u64; // a buffered page spans 4 cache pages, like the e2e
+        let dev = 16 * cache_page;
+
+        let inner = EtagMem::new(dev);
+        inner.create(dev).await.unwrap();
+
+        // "Writer": write 8 cache pages of data through the buffer, then flush.
+        {
+            let etag0 = inner.etag().await.unwrap();
+            let (fc, recovered) = open_with_etag(inner.clone(), &dir, cache_page, dev, etag0);
+            assert_eq!(recovered, 0);
+            let fc: Arc<dyn BlobBackend> = Arc::new(fc);
+            let buffered = BufferedBackend::new(
+                fc,
+                BufferedConfig {
+                    page_size: buf_page,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            buffered
+                .write(0, Bytes::from(vec![0x5A; 8 * cache_page as usize]))
+                .await
+                .unwrap();
+            buffered.flush().await.unwrap();
+            // drop buffered + fc → simulate the process exiting after a clean flush
+        }
+
+        // "Reader" after restart: reopen the FileCacheBackend over the same dir.
+        let current = inner.etag().await.unwrap();
+        let (fc2, recovered_dirty) = open_with_etag(inner.clone(), &dir, cache_page, dev, current);
+
+        assert_eq!(
+            recovered_dirty, 0,
+            "flushed pages must recover CLEAN, but {recovered_dirty} came back dirty"
+        );
+        assert_eq!(
+            fc2.present_count().await,
+            8,
+            "expected 8 clean data pages present and reusable after reload"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
