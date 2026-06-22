@@ -504,7 +504,7 @@ pub fn resize_fs(dev: &str, mountpoint: &str, fs_type: &str) -> anyhow::Result<(
     match fs_type {
         "ext2" | "ext3" | "ext4" => run("resize2fs", &[dev]),
         "xfs" => run("xfs_growfs", &[mountpoint]),
-        other => bail!("online filesystem expansion is not supported for fs type {other:?}"),
+        other => bail!("filesystem expansion is not supported for fs type {other:?}"),
     }
 }
 
