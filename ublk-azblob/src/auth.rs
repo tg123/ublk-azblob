@@ -37,8 +37,8 @@
 use anyhow::Context as _;
 use azure_core::credentials::{Secret, TokenCredential};
 use azure_core::http::{
-    policies::{Policy, PolicyResult},
-    Context, Request,
+    policies::{auth::BearerTokenAuthorizationPolicy, Policy, PolicyResult},
+    ClientOptions, Context, Pipeline, Request,
 };
 use azure_identity::{
     ClientSecretCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
@@ -221,6 +221,47 @@ pub fn build_container_client(
                 .context("create BlobContainerClient (SAS)")
         }
     }
+}
+
+/// Build a bare [`Pipeline`] wired with the same authentication as
+/// [`build_container_client`], for issuing storage REST requests the typed SDK
+/// client does not expose (currently `Get Page Ranges`, i.e. `?comp=pagelist`).
+///
+/// SharedKey/SAS auth is injected as a per-try policy (so it re-signs on every
+/// retry, exactly like the SDK client); Entra auth (MSI / Workload Identity /
+/// Service Principal) is injected as a bearer-token policy scoped to
+/// `https://storage.azure.com/.default`, mirroring `BlobServiceClient::new`.
+pub fn build_pipeline(auth: &AuthConfig) -> anyhow::Result<Pipeline> {
+    let mut per_try_policies: Vec<Arc<dyn Policy>> = Vec::new();
+    match auth {
+        AuthConfig::SharedKey {
+            account_name,
+            account_key,
+        } => {
+            let policy = SharedKeyPolicy::new(account_name.clone(), account_key.clone())
+                .context("create SharedKeyPolicy")?;
+            per_try_policies.push(Arc::new(policy));
+        }
+        AuthConfig::Sas { sas_token } => {
+            per_try_policies.push(Arc::new(SasPolicy::new(sas_token)));
+        }
+        _ => {
+            let cred =
+                build_token_credential(auth)?.context("Entra auth produced no token credential")?;
+            per_try_policies.push(Arc::new(BearerTokenAuthorizationPolicy::new(
+                cred,
+                vec!["https://storage.azure.com/.default"],
+            )));
+        }
+    }
+    Ok(Pipeline::new(
+        option_env!("CARGO_PKG_NAME"),
+        option_env!("CARGO_PKG_VERSION"),
+        ClientOptions::default(),
+        Vec::default(),
+        per_try_policies,
+        None,
+    ))
 }
 
 /// Build an Entra (Microsoft Entra ID) token credential for `auth`, or `None`

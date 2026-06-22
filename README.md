@@ -358,6 +358,16 @@ For large, write-heavy, or sparsely-accessed blobs, leave it off — the cache
 only fetches what's actually used. In CSI deployments toggle it via the Helm
 chart's `node.cache.warmup`.
 
+**Sparse warm-up.** Before warming, the driver asks Azure for the blob's data
+ranges (`Get Page Ranges`, `?comp=pagelist`). On a sparse page blob — e.g. an
+ext4 image whose free space was never written — pages that fall entirely in a
+zero gap are **skipped**: they are never downloaded and read back as zeros on
+demand. Only the regions that actually hold data are transferred, so warming a
+mostly-empty filesystem image costs a fraction of its nominal size. Backends or
+blobs that cannot report ranges fall back to a full sequential sweep. The
+all-zero pages that are loaded are also left as **holes** in the local `.dat`
+file, so they consume no cache disk either.
+
 ---
 
 ## Auth modes
