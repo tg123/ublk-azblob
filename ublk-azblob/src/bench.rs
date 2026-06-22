@@ -437,11 +437,19 @@ mod tests {
     }
 
     #[test]
-    fn random_blocks_stay_in_range() {
+    fn next_rand_scatters_within_range() {
         let nblocks = 16u64;
-        for i in 0..1000 {
-            assert!(next_rand(i) % nblocks < nblocks);
+        let mut counts = [0u32; 16];
+        for i in 0..1000u64 {
+            let block = next_rand(i) % nblocks;
+            counts[block as usize] += 1;
         }
+        // Every block index must be hit at least once (the RNG isn't constant or
+        // stuck on a subset), which also proves the values land in `0..nblocks`.
+        assert!(
+            counts.iter().all(|&c| c > 0),
+            "next_rand did not scatter across all blocks: {counts:?}"
+        );
     }
 
     #[test]

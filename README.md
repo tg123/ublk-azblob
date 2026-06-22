@@ -61,11 +61,8 @@ cargo run -p ublk-azblob -- \
 ```bash
 # Provision a 64 MiB blob and run all four phases (seq write/read, rand write/read)
 cargo run --release --features bench -p ublk-azblob -- \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/mybench \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob mybench \
   bench --create
 ```
 
@@ -437,10 +434,10 @@ FIO_BS_LIST="4k 64k" FIO_IODEPTH_LIST="1 16" FIO_NUMJOBS_LIST="1 4" \
     --build --abort-on-container-exit --exit-code-from runner
 ```
 
-In CI the benchmark runs on every pull request and on demand via the **`bench`**
-workflow (`workflow_dispatch` in the Actions tab, with tunable inputs).  Results
-are attached as a `bench-results` artifact and rendered into the run's job
-summary.
+In CI the benchmark runs on pushes to `main`, on every pull request, and on
+demand via the **`bench`** workflow (`workflow_dispatch` in the Actions tab, with
+tunable inputs).  Results are attached as a `bench-results` artifact and rendered
+into the run's job summary.
 
 ---
 
