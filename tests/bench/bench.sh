@@ -76,6 +76,11 @@ export AZURE_STORAGE_ENDPOINT="${AZURE_STORAGE_ENDPOINT:-http://127.0.0.1:10000/
 export AZURE_STORAGE_CONTAINER="${AZURE_STORAGE_CONTAINER:-benchtest}"
 export AZURE_STORAGE_BLOB="${AZURE_STORAGE_BLOB:-benchblob}"
 
+# The single-device subcommands take the target blob as one path-style
+# `--blob-url` (env UBLK_BLOB_URL): `<endpoint>/<container>/<blob>`, where the
+# endpoint already carries the account segment (Azurite path-style).
+export UBLK_BLOB_URL="${UBLK_BLOB_URL:-${AZURE_STORAGE_ENDPOINT%/}/${AZURE_STORAGE_CONTAINER}/${AZURE_STORAGE_BLOB}}"
+
 WORKDIR="${WORKDIR:-/workspace}"
 BIN="${BIN:-$WORKDIR/target/release/ublk-azblob}"
 RESULT_FILE="${RESULT_FILE:-$WORKDIR/bench-results.md}"
