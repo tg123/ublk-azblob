@@ -1026,9 +1026,16 @@ fn dump_node_cache_dir(node: &str, when: &str) {
             "-c",
             "azblob",
             "--",
-            "ls",
-            "-la",
-            "/var/lib/ublk-azblob/cache",
+            "sh",
+            "-c",
+            // ls + hexdump each .meta (present/dirty bitmaps; present starts at
+            // byte 64) and .etag content, to show whether the writer's clean
+            // pages + etag are actually on the node's host-path at each phase.
+            "ls -la /var/lib/ublk-azblob/cache; \
+             for m in /var/lib/ublk-azblob/cache/*.meta; do \
+               echo \"== meta $m ==\"; od -An -tx1 \"$m\" 2>/dev/null; done; \
+             for e in /var/lib/ublk-azblob/cache/*.etag; do \
+               echo \"== etag $e ==\"; od -c \"$e\" 2>/dev/null; done",
         ])
         .output();
     match out {
@@ -1183,6 +1190,14 @@ spec:
     // flaky empty-cache-on-reopen failure can be attributed to either a missing
     // writer flush or the restart/host-path losing the files.
     dump_node_cache_dir(&writer_node, "before restart");
+    // Capture the writer-node pod's logs *before* bouncing it, so the writer's
+    // own "local-disk cache enabled" / "opened local disk cache" / "flushing
+    // dirty cache pages" lines are preserved — these say whether the writer
+    // actually wrote+flushed clean pages to the host-path cache for this volume.
+    log(&format!(
+        "pre-restart writer-node plugin logs:\n{}",
+        node_plugin_logs_on(&writer_node)
+    ));
     // Restart **only** the node-plugin pod on the writer's node — not the whole
     // DaemonSet. The persistent host-path cache is per-node, so the test only
     // needs a fresh node pod *there*. A full `rollout restart` tears down the
