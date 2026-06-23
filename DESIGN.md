@@ -91,11 +91,7 @@ cache — for example `BufferedBackend` (memory) → `FileCacheBackend` (local d
 → `AzurePageBlobBackend` (blob).  The local-disk cache persists its `present` /
 `dirty` page bitmaps so that **dirty pages survive a restart**: on startup the
 cache is recovered from disk and any recovered dirty pages are flushed to the
-blob.  Clean pages survive a restart too — including in read-write mode — gated
-by the backing blob's **ETag**: `FileCacheBackend` records the blob ETag (via the
-`BlobBackend::etag` accessor) after each flush and, on reopen, reuses the cached
-clean pages only when the live ETag still matches (proving no external change);
-on a mismatch the stale clean pages are dropped while dirty pages are kept.
+blob.
 
 A future SDK upgrade only requires modifying `src/backend/azure.rs`.
 
