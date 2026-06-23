@@ -15,9 +15,8 @@ use azure_storage_blob::{
     models::{
         BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
         BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
-        PageBlobClientClearPagesResultHeaders, PageBlobClientCreateOptions,
-        PageBlobClientUploadPagesFromUrlOptions, PageBlobClientUploadPagesOptions,
-        PageBlobClientUploadPagesResultHeaders,
+        PageBlobClientCreateOptions, PageBlobClientUploadPagesFromUrlOptions,
+        PageBlobClientUploadPagesOptions,
     },
     BlobClient, BlobContainerClient,
 };
@@ -134,14 +133,6 @@ impl AzurePageBlobBackend {
         self.lease_id.read().unwrap().clone()
     }
 
-    /// Record the ETag carried by a mutating response so a later [`etag`] call
-    /// can avoid a separate `get_properties` round-trip.
-    ///
-    /// [`etag`]: BlobBackend::etag
-    fn record_etag(&self, etag: Option<String>) {
-        *self.last_etag.write().unwrap() = etag;
-    }
-
     /// Server-side copy `total_size` bytes from `source_url` into this page blob
     /// using concurrent `Put Page From URL` requests.
     ///
@@ -245,10 +236,6 @@ impl AzurePageBlobBackend {
                 .await?;
             batch_start = batch_end;
         }
-        // The server-side copy mutated the blob via many concurrent requests, so
-        // any previously cached write ETag is now stale; drop it so a later
-        // `etag` call re-reads the authoritative value.
-        self.record_etag(None);
         Ok(())
     }
 
@@ -601,22 +588,6 @@ impl BlobBackend for AzurePageBlobBackend {
             )
         })?;
         Ok(len)
-    }
-
-    #[instrument(skip(self), fields(blob = %self.blob_name))]
-    async fn etag(&self) -> anyhow::Result<Option<String>> {
-        // A prior write/clear in this process already learned the blob's current
-        // ETag from its response, so reuse it instead of issuing a separate
-        // get_properties round-trip on the (latency-bound) flush completion path.
-        if let Some(etag) = self.last_etag.read().unwrap().clone() {
-            return Ok(Some(etag));
-        }
-        let blob_client = self.blob_client()?;
-        let props = blob_client
-            .get_properties(None)
-            .await
-            .with_context(|| format!("get_properties for blob '{}'", self.blob_name))?;
-        Ok(props.etag()?.map(|e| e.to_string()))
     }
 }
 
