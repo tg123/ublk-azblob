@@ -999,9 +999,18 @@ fn dump_node_cache_dir(node: &str, when: &str) {
             "-c",
             "azblob",
             "--",
-            "ls",
-            "-laR",
-            "/var/lib/ublk-azblob/cache",
+            "sh",
+            "-c",
+            // List the dir, then hexdump each .meta file's header + bitmaps so we
+            // can see the persisted present/dirty bits (HEADER_SIZE=64; present
+            // bitmap starts at byte 64). `od` ships with the debian-slim image.
+            "ls -laR /var/lib/ublk-azblob/cache; \
+             for m in /var/lib/ublk-azblob/cache/*.meta; do \
+               echo \"== meta $m ==\"; od -An -tx1 \"$m\" 2>/dev/null; \
+             done; \
+             for e in /var/lib/ublk-azblob/cache/*.etag; do \
+               echo \"== etag $e ==\"; od -c \"$e\" 2>/dev/null; \
+             done",
         ])
         .output();
     match out {
@@ -1156,6 +1165,13 @@ spec:
     // flaky empty-cache-on-reopen failure can be attributed to either a missing
     // writer flush or the restart/host-path losing the files.
     dump_node_cache_dir(&writer_node, "before restart");
+    // Capture the pre-restart node-plugin logs (the writer's open/flush/etag
+    // lines) before the rollout replaces the pods and discards them. This shows
+    // whether the writer persisted clean pages + the etag for this volume.
+    log(&format!(
+        "pre-restart node plugin logs:\n{}",
+        node_plugin_logs(&["--tail=-1"])
+    ));
     log("restarting the node plugin DaemonSet (host-path cache must survive)");
     run(
         "kubectl",
