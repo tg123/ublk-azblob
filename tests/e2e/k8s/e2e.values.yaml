@@ -66,15 +66,15 @@ node:
     - name: UBLK_FORCE_FLUSH_TIMEOUT_SECS
       value: "600"
 
-  # Persistent local-disk cache shared by every volume on the node, mounted from
-  # a host directory (survives node-plugin pod restarts).  The local-cache reload
-  # e2e (test_local_cache_reload) relies on this being enabled so cached clean
-  # pages are revalidated against the blob ETag and reused after a pod restart.
-  cache:
-    enabled: true
-    hostPath: /var/lib/ublk-azblob/cache
-    # Small page size keeps the 8 MiB e2e payload spread across many cache pages.
-    pageSize: 1048576  # 1 MiB
+  # Optional: local disk cache (commented out for basic test)
+  # volumeMounts:
+  #   - name: disk-cache
+  #     mountPath: /var/lib/ublk-cache
+  # 
+  # volumes:
+  #   - name: disk-cache
+  #     emptyDir:
+  #       sizeLimit: 1Gi
 
 storageClass:
   name: azblob-ublk

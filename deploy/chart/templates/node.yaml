@@ -131,9 +131,9 @@ spec:
             - name: UBLK_CACHE_DIR
               value: {{ .Values.node.cache.hostPath | quote }}
             - name: UBLK_CACHE_MAX_BYTES
-              value: {{ .Values.node.cache.maxBytes | int64 | quote }}
+              value: {{ .Values.node.cache.maxBytes | quote }}
             - name: UBLK_CACHE_PAGE_SIZE
-              value: {{ .Values.node.cache.pageSize | int64 | quote }}
+              value: {{ .Values.node.cache.pageSize | quote }}
             {{- if .Values.node.cache.sharePages }}
             # Cross-process clean-page sharing: volumes caching the same blob
             # serve each other's clean pages off the shared directory. The node
@@ -149,7 +149,7 @@ spec:
               value: "1"
             {{- if .Values.node.cache.warmupBytes }}
             - name: UBLK_CACHE_WARMUP_BYTES
-              value: {{ .Values.node.cache.warmupBytes | int64 | quote }}
+              value: {{ .Values.node.cache.warmupBytes | quote }}
             {{- end }}
             {{- end }}
             {{- end }}
