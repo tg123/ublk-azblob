@@ -933,36 +933,13 @@ fn wait_for_no_pods(app: &str, timeout: std::time::Duration) -> bool {
     }
 }
 
-/// Capture the combined stdout/stderr logs of the node plugin's `azblob`
-/// container across all node pods.  The child `run` process forwards its own
-/// stdout/stderr to the node container (see `csi::mount::spawn_device`), so the
-/// local-disk cache's reuse/invalidation messages surface here.
-fn node_plugin_logs(extra_args: &[&str]) -> String {
-    let mut args = vec![
-        "-n",
-        NS,
-        "logs",
-        "-l",
-        "app=csi-ublk-azblob-node",
-        "-c",
-        "azblob",
-        "--prefix",
-    ];
-    args.extend_from_slice(extra_args);
-    let out = Command::new("kubectl")
-        .args(&args)
-        .output()
-        .expect("kubectl logs node plugin");
-    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-    s.push_str(&String::from_utf8_lossy(&out.stderr));
-    s
-}
-
-/// Like [`node_plugin_logs`] but scoped to the node-plugin pod on `node`. The
-/// cache-reload test bounces only the writer-node's pod, so the reuse assertion
-/// must read that pod's (post-restart) logs rather than every node's — the other
-/// nodes' pods are not restarted and may carry stale reuse/invalidation lines
-/// from earlier tests.
+/// Capture the node-plugin `azblob` container logs, scoped to the pod on `node`.
+/// The cache-reload test bounces only the writer-node's pod, so the reuse
+/// assertion must read that pod's (post-restart) logs rather than every node's —
+/// the other nodes' pods are not restarted and may carry stale
+/// reuse/invalidation lines from earlier tests. The child `run` process forwards
+/// its stdout/stderr to the node container (see `csi::mount::spawn_device`), so
+/// the local-disk cache's reuse/invalidation messages surface here.
 fn node_plugin_logs_on(node: &str) -> String {
     let pod = {
         let out = Command::new("kubectl")
@@ -1046,18 +1023,9 @@ fn dump_node_cache_dir(node: &str, when: &str) {
             "-c",
             "azblob",
             "--",
-            "sh",
-            "-c",
-            // List the dir, then hexdump each .meta file's header + bitmaps so we
-            // can see the persisted present/dirty bits (HEADER_SIZE=64; present
-            // bitmap starts at byte 64). `od` ships with the debian-slim image.
-            "ls -laR /var/lib/ublk-azblob/cache; \
-             for m in /var/lib/ublk-azblob/cache/*.meta; do \
-               echo \"== meta $m ==\"; od -An -tx1 \"$m\" 2>/dev/null; \
-             done; \
-             for e in /var/lib/ublk-azblob/cache/*.etag; do \
-               echo \"== etag $e ==\"; od -c \"$e\" 2>/dev/null; \
-             done",
+            "ls",
+            "-la",
+            "/var/lib/ublk-azblob/cache",
         ])
         .output();
     match out {
@@ -1212,13 +1180,6 @@ spec:
     // flaky empty-cache-on-reopen failure can be attributed to either a missing
     // writer flush or the restart/host-path losing the files.
     dump_node_cache_dir(&writer_node, "before restart");
-    // Capture the pre-restart node-plugin logs (the writer's open/flush/etag
-    // lines) before the rollout replaces the pods and discards them. This shows
-    // whether the writer persisted clean pages + the etag for this volume.
-    log(&format!(
-        "pre-restart node plugin logs:\n{}",
-        node_plugin_logs(&["--tail=-1"])
-    ));
     // Restart **only** the node-plugin pod on the writer's node — not the whole
     // DaemonSet. The persistent host-path cache is per-node, so the test only
     // needs a fresh node pod *there*. A full `rollout restart` tears down the
@@ -1323,11 +1284,10 @@ spec:
         &["logs", "-l", "app=azblob-cache-reader", "--tail=50"],
     );
 
-    // Decisive co-location check: the persistent host-path cache is per-node, so
-    // the reader must land on the *exact* node the writer ran on. Log both the
-    // intended (writer_node) and actual reader node, and dump every node's cache
-    // dir, so a node mismatch (the reader scheduled elsewhere despite nodeName)
-    // is unambiguous rather than surfacing as an opaque "no reuse" failure.
+    // Co-location guard: the persistent host-path cache is per-node, so the
+    // reader must land on the exact node the writer ran on. Log both the
+    // intended (writer_node) and actual reader node so a mismatch surfaces
+    // explicitly rather than as an opaque "no reuse" failure.
     let reader_node = {
         let out = Command::new("kubectl")
             .args([
@@ -1346,21 +1306,7 @@ spec:
         "cache reader ran on node {reader_node:?}; writer/cache node was {writer_node:?} \
          (must match for the per-node host-path cache to be reused)"
     ));
-    let all_nodes = {
-        let out = Command::new("kubectl")
-            .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
-            .output();
-        out.map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .map(String::from)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-    };
-    for n in &all_nodes {
-        dump_node_cache_dir(n, "at reader-open time");
-    }
+    dump_node_cache_dir(&writer_node, "at reader-open time");
 
     // ── Verify the cache was reloaded (reused), not invalidated.  Scope the log
     //    check to the *writer's* node pod: only that pod was bounced and only it

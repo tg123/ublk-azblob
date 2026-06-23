@@ -266,27 +266,13 @@ impl FileCacheBackend {
             write_recorded_etag(&etag_path, current);
         }
 
-        // Unconditional open-time diagnostics. The cache-reload e2e has flaked
-        // with the reader seeing an empty cache (no reuse/discard/recovered
-        // message) despite the writer having flushed; this summary makes the
-        // exact on-disk state observable on every open so such failures are
-        // diagnosable from the logs (which branch above ran, and why).
+        // Unconditional open-time summary so a cache mount's reuse decision is
+        // always observable: which pages were recovered, and whether the backing
+        // blob's validity token matched the one recorded by the previous run.
         {
             let present_count = (0..num_pages).filter(|&i| bit_get(&present, i)).count();
             let dirty_count = (0..num_pages).filter(|&i| bit_get(&dirty, i)).count();
             let clean_count = count_clean_pages(&present, &dirty, num_pages);
-            let meta_len = std::fs::metadata(&meta_path).map(|m| m.len()).unwrap_or(0);
-            let data_len = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
-            let dir_entries: Vec<String> = std::fs::read_dir(&cfg.dir)
-                .map(|rd| {
-                    rd.filter_map(|e| e.ok())
-                        .map(|e| {
-                            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
-                            format!("{}={}", e.file_name().to_string_lossy(), len)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
             info!(
                 dir = %cfg.dir.display(),
                 name = %cfg.name,
@@ -294,14 +280,9 @@ impl FileCacheBackend {
                 present_count,
                 clean_count,
                 dirty_count,
-                meta_len,
-                data_len,
                 has_current_etag = current_etag.is_some(),
-                current_etag = current_etag.as_deref().unwrap_or("<none>"),
-                recorded_etag = recorded_etag.as_deref().unwrap_or("<none>"),
                 etag_matches = current_etag.is_some()
                     && recorded_etag.as_deref() == current_etag.as_deref(),
-                dir_entries = ?dir_entries,
                 "opened local disk cache"
             );
         }
