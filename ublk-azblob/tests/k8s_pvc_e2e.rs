@@ -958,6 +958,53 @@ fn node_plugin_logs(extra_args: &[&str]) -> String {
     s
 }
 
+/// Like [`node_plugin_logs`] but scoped to the node-plugin pod on `node`. The
+/// cache-reload test bounces only the writer-node's pod, so the reuse assertion
+/// must read that pod's (post-restart) logs rather than every node's — the other
+/// nodes' pods are not restarted and may carry stale reuse/invalidation lines
+/// from earlier tests.
+fn node_plugin_logs_on(node: &str) -> String {
+    let pod = {
+        let out = Command::new("kubectl")
+            .args([
+                "-n",
+                NS,
+                "get",
+                "pods",
+                "-l",
+                "app=csi-ublk-azblob-node",
+                "--field-selector",
+                &format!("spec.nodeName={node}"),
+                "-o",
+                "jsonpath={.items[0].metadata.name}",
+            ])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Err(_) => String::new(),
+        }
+    };
+    if pod.is_empty() {
+        return String::new();
+    }
+    let out = Command::new("kubectl")
+        .args([
+            "-n",
+            NS,
+            "logs",
+            &pod,
+            "-c",
+            "azblob",
+            "--prefix",
+            "--tail=-1",
+        ])
+        .output()
+        .expect("kubectl logs node plugin pod");
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    s
+}
+
 /// Best-effort listing of the host-path cache directory on `node` (via the
 /// node-plugin pod scheduled there). Used by the cache-reload test to make the
 /// on-disk cache state observable before/after the DaemonSet restart, so a flaky
@@ -1172,17 +1219,41 @@ spec:
         "pre-restart node plugin logs:\n{}",
         node_plugin_logs(&["--tail=-1"])
     ));
-    log("restarting the node plugin DaemonSet (host-path cache must survive)");
+    // Restart **only** the node-plugin pod on the writer's node — not the whole
+    // DaemonSet. The persistent host-path cache is per-node, so the test only
+    // needs a fresh node pod *there*. A full `rollout restart` tears down the
+    // CSI driver on every node at once; around that window the reader's mount
+    // (pinned to the writer's node) can be retried and end up served on the
+    // *other* node, whose host-path cache is empty — making the reuse assertion
+    // flake even though the writer's clean pages persisted correctly. Bouncing
+    // just the writer-node pod keeps every other node's CSI registration up and
+    // the reader strictly co-located with the cache it must reuse.
+    let old_pod = {
+        let out = Command::new("kubectl")
+            .args([
+                "-n",
+                NS,
+                "get",
+                "pods",
+                "-l",
+                "app=csi-ublk-azblob-node",
+                "--field-selector",
+                &format!("spec.nodeName={writer_node}"),
+                "-o",
+                "jsonpath={.items[0].metadata.name}",
+            ])
+            .output()
+            .expect("get node-plugin pod on writer node");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    log(&format!(
+        "restarting only the node plugin on the writer's node ({writer_node}, pod {old_pod})"
+    ));
     run(
         "kubectl",
-        &[
-            "-n",
-            NS,
-            "rollout",
-            "restart",
-            "daemonset/csi-ublk-azblob-node",
-        ],
+        &["-n", NS, "delete", "pod", &old_pod, "--wait=true"],
     );
+    // Wait for the DaemonSet to roll a fresh, Ready pod back onto that node.
     run(
         "kubectl",
         &[
@@ -1291,16 +1362,14 @@ spec:
         dump_node_cache_dir(n, "at reader-open time");
     }
 
-    // ── Verify the cache was reloaded (reused), not invalidated.  Only the reader
-    //    mounts after the restart, and the node-plugin pods are fresh (the rollout
-    //    restart replaced them), so their logs contain only post-restart lines for
-    //    this volume.  Capture *all* of them (`--tail=-1`): the "reusing clean
-    //    cache pages" line is emitted early during the reader's mount, and the
-    //    busy per-read flush logging can otherwise push it out of a small tail
-    //    window on slower runners (observed flaking on arm64 with `--tail=400`).
+    // ── Verify the cache was reloaded (reused), not invalidated.  Scope the log
+    //    check to the *writer's* node pod: only that pod was bounced and only it
+    //    serves the (co-located) reader, so its post-restart logs carry the
+    //    authoritative "reusing clean cache pages" line for this volume. Reading
+    //    every node's logs could pick up stale lines from un-restarted pods.
     //    The clean ETag-validated reuse path is also covered deterministically by
     //    the `cache_reload_reuses_clean_pages_through_buffered` unit test. ────────
-    let logs = node_plugin_logs(&["--tail=-1"]);
+    let logs = node_plugin_logs_on(&writer_node);
     if logs.contains("discarded stale clean cache pages") {
         eprintln!("--- node plugin logs ---\n{logs}\n--- end ---");
         panic!(
