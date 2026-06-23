@@ -987,9 +987,9 @@ fn node_plugin_logs_on(node: &str) -> String {
 
 /// Best-effort listing of the host-path cache directory on `node` (via the
 /// node-plugin pod scheduled there). Used by the cache-reload test to make the
-/// on-disk cache state observable before/after the DaemonSet restart, so a flaky
-/// "empty cache on reopen" failure shows whether the writer persisted files and
-/// whether the restart wiped them. Logs the result; never fails the test.
+/// on-disk cache state observable before/after the node-plugin pod restart, so a
+/// flaky "empty cache on reopen" failure shows whether the writer persisted files
+/// and whether the restart wiped them. Logs the result; never fails the test.
 fn dump_node_cache_dir(node: &str, when: &str) {
     let pod = {
         let out = Command::new("kubectl")
