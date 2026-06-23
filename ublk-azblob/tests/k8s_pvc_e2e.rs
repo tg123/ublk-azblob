@@ -1252,6 +1252,45 @@ spec:
         &["logs", "-l", "app=azblob-cache-reader", "--tail=50"],
     );
 
+    // Decisive co-location check: the persistent host-path cache is per-node, so
+    // the reader must land on the *exact* node the writer ran on. Log both the
+    // intended (writer_node) and actual reader node, and dump every node's cache
+    // dir, so a node mismatch (the reader scheduled elsewhere despite nodeName)
+    // is unambiguous rather than surfacing as an opaque "no reuse" failure.
+    let reader_node = {
+        let out = Command::new("kubectl")
+            .args([
+                "get",
+                "pods",
+                "-l",
+                "app=azblob-cache-reader",
+                "-o",
+                "jsonpath={.items[*].spec.nodeName}",
+            ])
+            .output();
+        out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    log(&format!(
+        "cache reader ran on node {reader_node:?}; writer/cache node was {writer_node:?} \
+         (must match for the per-node host-path cache to be reused)"
+    ));
+    let all_nodes = {
+        let out = Command::new("kubectl")
+            .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+            .output();
+        out.map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+    };
+    for n in &all_nodes {
+        dump_node_cache_dir(n, "at reader-open time");
+    }
+
     // ── Verify the cache was reloaded (reused), not invalidated.  Only the reader
     //    mounts after the restart, and the node-plugin pods are fresh (the rollout
     //    restart replaced them), so their logs contain only post-restart lines for
