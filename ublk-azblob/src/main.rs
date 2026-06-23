@@ -991,7 +991,9 @@ async fn run_template_copy(
     // source's sparseness map and skip its zero ranges; best-effort.
     match auth::build_pipeline(&src_auth) {
         Ok(pipeline) => source = source.with_page_list(pipeline),
-        Err(err) => warn!(%err, "source page-ranges query disabled (could not build auth pipeline)"),
+        Err(err) => {
+            warn!(%err, "source page-ranges query disabled (could not build auth pipeline)")
+        }
     }
     if let Some(snapshot) = &tmpl.snapshot {
         source = source.with_snapshot(snapshot.clone());

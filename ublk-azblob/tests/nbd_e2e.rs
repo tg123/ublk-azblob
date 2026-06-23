@@ -904,8 +904,13 @@ fn nbd_template_copy_skips_zero() {
     );
     let copied = parse_log_field(&logs, "copied_bytes");
     let skipped = parse_log_field(&logs, "skipped_bytes");
-    log(&format!("copy copied {copied} bytes, skipped {skipped} bytes"));
-    assert!(skipped > 0, "expected the copy to skip zero ranges, skipped 0");
+    log(&format!(
+        "copy copied {copied} bytes, skipped {skipped} bytes"
+    ));
+    assert!(
+        skipped > 0,
+        "expected the copy to skip zero ranges, skipped 0"
+    );
     assert!(
         copied < BLOB_SIZE,
         "copy copied the whole device ({copied}); zero ranges were not skipped"
@@ -970,7 +975,11 @@ fn run_copy(template_url: &str, container: &str, target_blob: &str) -> String {
     if !stderr.is_empty() {
         log(&format!("copy stderr:\n{stderr}"));
     }
-    assert!(out.status.success(), "`ublk-azblob copy` failed with {}", out.status);
+    assert!(
+        out.status.success(),
+        "`ublk-azblob copy` failed with {}",
+        out.status
+    );
     stdout
 }
 

@@ -353,7 +353,9 @@ pub fn build_template_backend(
     // source's sparseness map and skip its zero ranges; best-effort.
     match auth::build_pipeline(&auth) {
         Ok(pipeline) => backend = backend.with_page_list(pipeline),
-        Err(err) => warn!(%err, "source page-ranges query disabled (could not build auth pipeline)"),
+        Err(err) => {
+            warn!(%err, "source page-ranges query disabled (could not build auth pipeline)")
+        }
     }
     if let Some(snapshot) = &tmpl.snapshot {
         backend = backend.with_snapshot(snapshot.clone());
@@ -483,12 +485,21 @@ async fn copy_blob_streamed(
     let chunk = crate::backend::copy_chunk_bytes();
     let mut offset = 0u64;
     let mut copied_bytes = 0u64;
-    let mut skipped_bytes = 0u64;
+    let mut cleared_bytes = 0u64;
     while offset < total_size {
         let len = chunk.min(total_size - offset);
         if let Some(ranges) = source_data_ranges {
             if !crate::backend::range_intersects(ranges, offset, len) {
-                skipped_bytes += len;
+                // Zero gap in the source: clear the destination range rather than
+                // copying zeros. This avoids the source read but still guarantees
+                // the destination reads back as zero there even when it is not a
+                // freshly-created blob (create() is idempotent and does not zero
+                // an existing same-size target, so a retry could otherwise retain
+                // stale data and corrupt the clone).
+                dest.clear(offset, len)
+                    .await
+                    .with_context(|| format!("clear copy offset={offset} len={len}"))?;
+                cleared_bytes += len;
                 offset += len;
                 continue;
             }
@@ -507,7 +518,7 @@ async fn copy_blob_streamed(
     if source_data_ranges.is_some() {
         info!(
             copied_bytes,
-            skipped_bytes, total_size, "streamed copy skipped source zero ranges"
+            cleared_bytes, total_size, "streamed copy cleared source zero ranges"
         );
     }
     Ok(())

@@ -173,12 +173,12 @@ impl AzurePageBlobBackend {
             n_chunks,
             chunk,
             concurrency,
-            skip_zero_ranges = source_data_ranges.is_some(),
-            "server-side copy via Put Page From URL"
+            clear_zero_ranges = source_data_ranges.is_some(),
+            "server-side copy via Put Page From URL (zero gaps cleared, not copied)"
         );
 
         let mut copied_bytes = 0u64;
-        let mut skipped_bytes = 0u64;
+        let mut cleared_bytes = 0u64;
         let mut batch_start = 0u64;
         while batch_start < n_chunks {
             let batch_end = (batch_start + chunks_per_batch).min(n_chunks);
@@ -189,43 +189,62 @@ impl AzurePageBlobBackend {
                     .context("mint copy-source authorization token")?,
                 None => None,
             };
-            // Skip any chunk lying entirely in a source zero gap: the destination
-            // is already zero there, so issuing a Put Page From URL would only
-            // copy zeros. Chunks that partially overlap data are copied in full.
-            let copies = (batch_start..batch_end)
-                .filter_map(|i| {
-                    let offset = i * chunk;
-                    let len = chunk.min(total_size - offset);
-                    if let Some(ranges) = source_data_ranges {
-                        if !super::range_intersects(ranges, offset, len) {
-                            skipped_bytes += len;
-                            return None;
-                        }
-                    }
+            // Each chunk either carries source data — copied via Put Page From
+            // URL — or lies entirely in a source zero gap. For a zero gap we
+            // *clear* the destination range rather than skipping it: this still
+            // avoids the source round-trip, but also guarantees the destination
+            // reads back as zero there even when it is not a freshly-created
+            // blob. `create()` is idempotent and does not zero an existing
+            // same-size target, so on a retry/re-run a skipped range could
+            // otherwise retain stale data and corrupt the clone.
+            let ops = (batch_start..batch_end).map(|i| {
+                let offset = i * chunk;
+                let len = chunk.min(total_size - offset);
+                let is_data = source_data_ranges
+                    .map(|ranges| super::range_intersects(ranges, offset, len))
+                    .unwrap_or(true);
+                if is_data {
                     copied_bytes += len;
-                    Some((offset, len))
-                })
-                .map(|(offset, len)| {
-                    let src_range = HttpRange::new(offset, len);
-                    let dst_range = HttpRange::new(offset, len);
-                    let opts = PageBlobClientUploadPagesFromUrlOptions {
-                        lease_id: lease_id.clone(),
-                        copy_source_authorization: csa.clone(),
-                        ..Default::default()
-                    };
-                    let page_client = &page_client;
-                    let source_url = source_url.to_string();
-                    async move {
+                } else {
+                    cleared_bytes += len;
+                }
+                let page_client = &page_client;
+                let lease_id = lease_id.clone();
+                let csa = csa.clone();
+                let source_url = source_url.to_string();
+                async move {
+                    if is_data {
+                        let opts = PageBlobClientUploadPagesFromUrlOptions {
+                            lease_id,
+                            copy_source_authorization: csa,
+                            ..Default::default()
+                        };
                         page_client
-                            .upload_pages_from_url(source_url, src_range, len, dst_range, Some(opts))
+                            .upload_pages_from_url(
+                                source_url,
+                                HttpRange::new(offset, len),
+                                len,
+                                HttpRange::new(offset, len),
+                                Some(opts),
+                            )
                             .await
                             .with_context(|| {
                                 format!("put page from url offset={offset} len={len}")
                             })?;
-                        Ok::<(), anyhow::Error>(())
+                    } else {
+                        let opts = PageBlobClientClearPagesOptions {
+                            lease_id,
+                            ..Default::default()
+                        };
+                        page_client
+                            .clear_pages(HttpRange::new(offset, len), Some(opts))
+                            .await
+                            .with_context(|| format!("clear pages offset={offset} len={len}"))?;
                     }
-                });
-            futures::stream::iter(copies)
+                    Ok::<(), anyhow::Error>(())
+                }
+            });
+            futures::stream::iter(ops)
                 .buffer_unordered(concurrency)
                 .try_collect::<()>()
                 .await?;
@@ -234,7 +253,7 @@ impl AzurePageBlobBackend {
         if source_data_ranges.is_some() {
             info!(
                 copied_bytes,
-                skipped_bytes, total_size, "server-side copy skipped source zero ranges"
+                cleared_bytes, total_size, "server-side copy cleared source zero ranges"
             );
         }
         Ok(())
