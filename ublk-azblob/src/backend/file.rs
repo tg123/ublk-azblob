@@ -270,9 +270,21 @@ impl FileCacheBackend {
         // always observable: which pages were recovered, and whether the backing
         // blob's validity token matched the one recorded by the previous run.
         {
-            let present_count = (0..num_pages).filter(|&i| bit_get(&present, i)).count();
-            let dirty_count = (0..num_pages).filter(|&i| bit_get(&dirty, i)).count();
-            let clean_count = count_clean_pages(&present, &dirty, num_pages);
+            // Single O(N) pass over the bitmaps for all three counts.
+            let (mut present_count, mut dirty_count, mut clean_count) = (0u64, 0u64, 0u64);
+            for i in 0..num_pages {
+                let p = bit_get(&present, i);
+                let d = bit_get(&dirty, i);
+                if p {
+                    present_count += 1;
+                    if !d {
+                        clean_count += 1;
+                    }
+                }
+                if d {
+                    dirty_count += 1;
+                }
+            }
             info!(
                 dir = %cfg.dir.display(),
                 name = %cfg.name,

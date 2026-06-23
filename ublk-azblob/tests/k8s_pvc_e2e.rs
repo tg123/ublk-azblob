@@ -955,15 +955,18 @@ fn node_plugin_logs_on(node: &str) -> String {
                 "-o",
                 "jsonpath={.items[0].metadata.name}",
             ])
-            .output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(_) => String::new(),
-        }
+            .output()
+            .expect("kubectl get node-plugin pod");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
-    if pod.is_empty() {
-        return String::new();
-    }
+    // This helper backs a correctness assertion (the reuse check), so an empty
+    // lookup must fail loudly rather than silently yielding empty logs that
+    // later masquerade as a "did not report reusing" failure.
+    assert!(
+        !pod.is_empty(),
+        "no node-plugin pod found on node {node}; cannot read its logs for the \
+         cache-reload reuse assertion"
+    );
     let out = Command::new("kubectl")
         .args([
             "-n",
@@ -1207,6 +1210,10 @@ spec:
             .expect("get node-plugin pod on writer node");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
+    assert!(
+        !old_pod.is_empty(),
+        "no node-plugin pod found on the writer's node {writer_node}; cannot restart it"
+    );
     log(&format!(
         "restarting only the node plugin on the writer's node ({writer_node}, pod {old_pod})"
     ));
