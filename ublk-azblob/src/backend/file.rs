@@ -228,14 +228,18 @@ impl FileCacheBackend {
             );
         }
 
+        // The recorded validity token from the previous run (read once, before
+        // this open overwrites it below), used both for the reuse decision and
+        // the open-time diagnostics.
+        let recorded_etag = read_recorded_etag(&etag_path);
+
         // Validate the resident clean pages against the backing blob's validity
         // token.  When the live token differs from the one recorded the last
         // time this cache wrote the blob, the blob was changed externally and
         // the clean pages are stale, so drop them (dirty pages are kept and
         // re-flushed).  When the backend cannot report a token, skip validation.
         if let Some(current) = &current_etag {
-            let recorded = read_recorded_etag(&etag_path);
-            if recorded.as_deref() != Some(current.as_str()) {
+            if recorded_etag.as_deref() != Some(current.as_str()) {
                 let dropped =
                     drop_clean_pages(&meta, &mut present, &dirty, num_pages, HEADER_SIZE)?;
                 if dropped > 0 {
@@ -260,6 +264,39 @@ impl FileCacheBackend {
             }
             // Record the live token so the next restart can validate against it.
             write_recorded_etag(&etag_path, current);
+        }
+
+        // Unconditional open-time summary so a cache mount's reuse decision is
+        // always observable: which pages were recovered, and whether the backing
+        // blob's validity token matched the one recorded by the previous run.
+        {
+            // Single O(N) pass over the bitmaps for all three counts.
+            let (mut present_count, mut dirty_count, mut clean_count) = (0u64, 0u64, 0u64);
+            for i in 0..num_pages {
+                let p = bit_get(&present, i);
+                let d = bit_get(&dirty, i);
+                if p {
+                    present_count += 1;
+                    if !d {
+                        clean_count += 1;
+                    }
+                }
+                if d {
+                    dirty_count += 1;
+                }
+            }
+            info!(
+                dir = %cfg.dir.display(),
+                name = %cfg.name,
+                num_pages,
+                present_count,
+                clean_count,
+                dirty_count,
+                has_current_etag = current_etag.is_some(),
+                etag_matches = current_etag.is_some()
+                    && recorded_etag.as_deref() == current_etag.as_deref(),
+                "opened local disk cache"
+            );
         }
 
         // Optional shared cross-process byte budget.  When active, seed the LRU
