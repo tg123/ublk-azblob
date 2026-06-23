@@ -628,4 +628,48 @@ mod tests {
             max_seen.load(Ordering::SeqCst)
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_submission_cancels_work_and_frees_permit() {
+        // Restores the documented `flush_io_timeout_secs` abort semantics: when a
+        // submitter drops its `submit` future (e.g. a flush times out), the
+        // in-flight work must be cancelled and its shared concurrency permit
+        // released promptly, rather than pinning the budget until the underlying
+        // call eventually returns.
+        //
+        // Single shared permit: job A occupies it and never completes on its own.
+        // After A's work is observably running, drop A's submission; a follow-up
+        // job B must then acquire the freed permit and complete.
+        let gw = Arc::new(AzureIoGateway::new(cfg_total(1, 1, 1, 0, 0)));
+        let started = Arc::new(tokio::sync::Notify::new());
+
+        let gw_a = gw.clone();
+        let started_a = started.clone();
+        let task_a = tokio::spawn(async move {
+            gw_a.upload(IoClass::Flush, 0, async move {
+                started_a.notify_one();
+                // Never completes; only cancellation (res_tx.closed()) ends it.
+                std::future::pending::<()>().await;
+            })
+            .await;
+        });
+
+        // Wait until A holds the permit and is actually running.
+        started.notified().await;
+
+        // Drop A's submission. The worker should observe `res_tx.closed()`,
+        // cancel A's work, and release the shared permit.
+        task_a.abort();
+
+        // B can only run if the permit was freed. With the bug (work runs to
+        // completion regardless), the single permit stays pinned by A forever and
+        // this times out.
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            gw.upload(IoClass::Flush, 0, async { 42u32 }),
+        )
+        .await
+        .expect("permit was not freed after the dropped submission was cancelled; B timed out");
+        assert_eq!(out, 42);
+    }
 }
