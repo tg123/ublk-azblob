@@ -958,6 +958,62 @@ fn node_plugin_logs(extra_args: &[&str]) -> String {
     s
 }
 
+/// Best-effort listing of the host-path cache directory on `node` (via the
+/// node-plugin pod scheduled there). Used by the cache-reload test to make the
+/// on-disk cache state observable before/after the DaemonSet restart, so a flaky
+/// "empty cache on reopen" failure shows whether the writer persisted files and
+/// whether the restart wiped them. Logs the result; never fails the test.
+fn dump_node_cache_dir(node: &str, when: &str) {
+    let pod = {
+        let out = Command::new("kubectl")
+            .args([
+                "-n",
+                NS,
+                "get",
+                "pods",
+                "-l",
+                "app=csi-ublk-azblob-node",
+                "--field-selector",
+                &format!("spec.nodeName={node}"),
+                "-o",
+                "jsonpath={.items[0].metadata.name}",
+            ])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Err(_) => String::new(),
+        }
+    };
+    if pod.is_empty() {
+        log(&format!(
+            "cache-dir dump ({when}): no node-plugin pod found on node {node}"
+        ));
+        return;
+    }
+    let out = Command::new("kubectl")
+        .args([
+            "-n",
+            NS,
+            "exec",
+            &pod,
+            "-c",
+            "azblob",
+            "--",
+            "ls",
+            "-laR",
+            "/var/lib/ublk-azblob/cache",
+        ])
+        .output();
+    match out {
+        Ok(o) => log(&format!(
+            "cache-dir dump ({when}) on node {node} via pod {pod}:\n{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr),
+        )),
+        Err(e) => log(&format!("cache-dir dump ({when}) exec failed: {e}")),
+    }
+}
+
 /// Test 4: the persistent local-disk cache survives a node-plugin pod restart.
 ///
 /// A writer populates the host-path cache (clean pages + the blob ETag validity
@@ -1095,6 +1151,11 @@ spec:
 
     // ── Restart the node plugin so a fresh pod (empty logs) takes over while the
     //    host-path cache directory persists across the restart. ───────────────
+    // Snapshot the on-disk cache on the writer's node *before* the restart: this
+    // pins down whether the writer persisted clean pages and the etag file, so a
+    // flaky empty-cache-on-reopen failure can be attributed to either a missing
+    // writer flush or the restart/host-path losing the files.
+    dump_node_cache_dir(&writer_node, "before restart");
     log("restarting the node plugin DaemonSet (host-path cache must survive)");
     run(
         "kubectl",
@@ -1117,6 +1178,9 @@ spec:
             "--timeout=180s",
         ],
     );
+    // And again *after* the restart, before the reader mounts: if the files were
+    // present before but gone now, the restart/host-path is at fault.
+    dump_node_cache_dir(&writer_node, "after restart");
 
     // ── Reader: remount the same PVC; reads must be served from the reused cache.
     let reader_yaml = format!(

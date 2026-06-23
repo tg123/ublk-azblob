@@ -228,14 +228,18 @@ impl FileCacheBackend {
             );
         }
 
+        // The recorded validity token from the previous run (read once, before
+        // this open overwrites it below), used both for the reuse decision and
+        // the open-time diagnostics.
+        let recorded_etag = read_recorded_etag(&etag_path);
+
         // Validate the resident clean pages against the backing blob's validity
         // token.  When the live token differs from the one recorded the last
         // time this cache wrote the blob, the blob was changed externally and
         // the clean pages are stale, so drop them (dirty pages are kept and
         // re-flushed).  When the backend cannot report a token, skip validation.
         if let Some(current) = &current_etag {
-            let recorded = read_recorded_etag(&etag_path);
-            if recorded.as_deref() != Some(current.as_str()) {
+            if recorded_etag.as_deref() != Some(current.as_str()) {
                 let dropped =
                     drop_clean_pages(&meta, &mut present, &dirty, num_pages, HEADER_SIZE)?;
                 if dropped > 0 {
@@ -260,6 +264,46 @@ impl FileCacheBackend {
             }
             // Record the live token so the next restart can validate against it.
             write_recorded_etag(&etag_path, current);
+        }
+
+        // Unconditional open-time diagnostics. The cache-reload e2e has flaked
+        // with the reader seeing an empty cache (no reuse/discard/recovered
+        // message) despite the writer having flushed; this summary makes the
+        // exact on-disk state observable on every open so such failures are
+        // diagnosable from the logs (which branch above ran, and why).
+        {
+            let present_count = (0..num_pages).filter(|&i| bit_get(&present, i)).count();
+            let dirty_count = (0..num_pages).filter(|&i| bit_get(&dirty, i)).count();
+            let clean_count = count_clean_pages(&present, &dirty, num_pages);
+            let meta_len = std::fs::metadata(&meta_path).map(|m| m.len()).unwrap_or(0);
+            let data_len = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+            let dir_entries: Vec<String> = std::fs::read_dir(&cfg.dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| {
+                            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                            format!("{}={}", e.file_name().to_string_lossy(), len)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            info!(
+                dir = %cfg.dir.display(),
+                name = %cfg.name,
+                num_pages,
+                present_count,
+                clean_count,
+                dirty_count,
+                meta_len,
+                data_len,
+                has_current_etag = current_etag.is_some(),
+                current_etag = current_etag.as_deref().unwrap_or("<none>"),
+                recorded_etag = recorded_etag.as_deref().unwrap_or("<none>"),
+                etag_matches = current_etag.is_some()
+                    && recorded_etag.as_deref() == current_etag.as_deref(),
+                dir_entries = ?dir_entries,
+                "opened local disk cache"
+            );
         }
 
         // Optional shared cross-process byte budget.  When active, seed the LRU
