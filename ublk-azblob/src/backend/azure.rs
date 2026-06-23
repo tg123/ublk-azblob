@@ -53,15 +53,6 @@ pub struct AzurePageBlobBackend {
     /// writes/clears/copies (uploads) funnel through, enforcing the per-direction
     /// bandwidth ceiling, concurrency cap and priority scheduling.
     gateway: Arc<AzureIoGateway>,
-    /// ETag returned by the most recent mutating request (Put Page / Clear
-    /// Pages).
-    ///
-    /// Every page-blob write response already carries the blob's new ETag, so we
-    /// cache it here to let [`BlobBackend::etag`] return the post-write validity
-    /// token without a separate `get_properties` round-trip. `None` until the
-    /// first write of this process's lifetime, in which case `etag` falls back
-    /// to `get_properties`.
-    last_etag: RwLock<Option<String>>,
     /// Optional auth-wired pipeline for `Get Page Ranges` (`?comp=pagelist`),
     /// which the typed SDK 1.0 client no longer exposes.  `None` disables the
     /// [`BlobBackend::data_ranges`] sparseness query (callers then assume every
@@ -82,7 +73,6 @@ impl AzurePageBlobBackend {
             snapshot: None,
             lease_id: RwLock::new(None),
             gateway: AzureIoGateway::global(),
-            last_etag: RwLock::new(None),
             page_list_pipeline: None,
         }
     }
@@ -485,14 +475,9 @@ impl BlobBackend for AzurePageBlobBackend {
             lease_id: self.lease_id(),
             ..Default::default()
         };
-        // Capture the ETag from the Put Page response *inside* the gateway
-        // closure (which runs `'static` on a worker and cannot borrow `self`),
-        // then record it after awaiting so a follow-up flush can read the
-        // validity token without an extra get_properties round-trip.
-        let new_etag = self
-            .gateway
+        self.gateway
             .upload(class, len, async move {
-                let resp = page_client
+                page_client
                     .upload_pages(
                         azure_core::http::RequestContent::from(data.to_vec()),
                         len,
@@ -503,10 +488,9 @@ impl BlobBackend for AzurePageBlobBackend {
                     .with_context(|| {
                         format!("upload_pages blob '{blob_name}' offset={offset} len={len}")
                     })?;
-                Ok::<_, anyhow::Error>(resp.etag().ok().flatten().map(|e| e.to_string()))
+                Ok::<_, anyhow::Error>(())
             })
             .await?;
-        self.record_etag(new_etag);
         Ok(())
     }
 
@@ -531,23 +515,17 @@ impl BlobBackend for AzurePageBlobBackend {
             lease_id: self.lease_id(),
             ..Default::default()
         };
-        // Clear Pages transfers no payload, so it is not charged against the
-        // bandwidth limiter (bytes = 0), but it still passes through the upload
-        // concurrency/priority pipeline. Capture the new ETag in the closure and
-        // record it after awaiting (see `write` for why this can't borrow self).
-        let new_etag = self
-            .gateway
+        self.gateway
             .upload(class, 0, async move {
-                let resp = page_client
+                page_client
                     .clear_pages(range, Some(opts))
                     .await
                     .with_context(|| {
                         format!("clear_pages blob '{blob_name}' offset={offset} len={len}")
                     })?;
-                Ok::<_, anyhow::Error>(resp.etag().ok().flatten().map(|e| e.to_string()))
+                Ok::<_, anyhow::Error>(())
             })
             .await?;
-        self.record_etag(new_etag);
         Ok(())
     }
 
