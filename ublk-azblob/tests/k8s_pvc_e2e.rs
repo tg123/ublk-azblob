@@ -933,6 +933,30 @@ fn wait_for_no_pods(app: &str, timeout: std::time::Duration) -> bool {
     }
 }
 
+/// Name of the node-plugin (`app=csi-ublk-azblob-node`) pod scheduled on `node`,
+/// or `None` if the lookup returns no item. Centralizes the selector so the
+/// callers (log capture, cache-dir dump, cache-present check, pod restart) stay
+/// in sync; each applies its own empty-handling (assert vs. skip).
+fn node_plugin_pod_on(node: &str) -> Option<String> {
+    let out = Command::new("kubectl")
+        .args([
+            "-n",
+            NS,
+            "get",
+            "pods",
+            "-l",
+            "app=csi-ublk-azblob-node",
+            "--field-selector",
+            &format!("spec.nodeName={node}"),
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Capture the node-plugin `azblob` container logs, scoped to the pod on `node`.
 /// The cache-reload test bounces only the writer-node's pod, so the reuse
 /// assertion must read that pod's (post-restart) logs rather than every node's —
@@ -941,32 +965,12 @@ fn wait_for_no_pods(app: &str, timeout: std::time::Duration) -> bool {
 /// its stdout/stderr to the node container (see `csi::mount::spawn_device`), so
 /// the local-disk cache's reuse/invalidation messages surface here.
 fn node_plugin_logs_on(node: &str) -> String {
-    let pod = {
-        let out = Command::new("kubectl")
-            .args([
-                "-n",
-                NS,
-                "get",
-                "pods",
-                "-l",
-                "app=csi-ublk-azblob-node",
-                "--field-selector",
-                &format!("spec.nodeName={node}"),
-                "-o",
-                "jsonpath={.items[0].metadata.name}",
-            ])
-            .output()
-            .expect("kubectl get node-plugin pod");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
     // This helper backs a correctness assertion (the reuse check), so an empty
     // lookup must fail loudly rather than silently yielding empty logs that
     // later masquerade as a "did not report reusing" failure.
-    assert!(
-        !pod.is_empty(),
-        "no node-plugin pod found on node {node}; cannot read its logs for the \
-         cache-reload reuse assertion"
-    );
+    let pod = node_plugin_pod_on(node).unwrap_or_else(|| {
+        panic!("no node-plugin pod found on node {node}; cannot read its logs for the cache-reload reuse assertion")
+    });
     let out = Command::new("kubectl")
         .args([
             "-n",
@@ -991,32 +995,12 @@ fn node_plugin_logs_on(node: &str) -> String {
 /// flaky "empty cache on reopen" failure shows whether the writer persisted files
 /// and whether the restart wiped them. Logs the result; never fails the test.
 fn dump_node_cache_dir(node: &str, when: &str) {
-    let pod = {
-        let out = Command::new("kubectl")
-            .args([
-                "-n",
-                NS,
-                "get",
-                "pods",
-                "-l",
-                "app=csi-ublk-azblob-node",
-                "--field-selector",
-                &format!("spec.nodeName={node}"),
-                "-o",
-                "jsonpath={.items[0].metadata.name}",
-            ])
-            .output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(_) => String::new(),
-        }
-    };
-    if pod.is_empty() {
+    let Some(pod) = node_plugin_pod_on(node) else {
         log(&format!(
             "cache-dir dump ({when}): no node-plugin pod found on node {node}"
         ));
         return;
-    }
+    };
     let out = Command::new("kubectl")
         .args([
             "-n",
@@ -1060,29 +1044,9 @@ fn pvc_volume_name(pvc: &str) -> String {
 /// node-plugin pod churn, so this can legitimately be false; the caller then
 /// skips the reuse assertion (data integrity is still verified separately).
 fn cache_clean_present_on(node: &str, pvc_uid: &str) -> bool {
-    let pod = {
-        let out = Command::new("kubectl")
-            .args([
-                "-n",
-                NS,
-                "get",
-                "pods",
-                "-l",
-                "app=csi-ublk-azblob-node",
-                "--field-selector",
-                &format!("spec.nodeName={node}"),
-                "-o",
-                "jsonpath={.items[0].metadata.name}",
-            ])
-            .output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(_) => String::new(),
-        }
-    };
-    if pod.is_empty() {
+    let Some(pod) = node_plugin_pod_on(node) else {
         return false;
-    }
+    };
     // Emit PRESENT iff a matching .meta exists and any byte of its 32-byte
     // present bitmap (offset 64) is non-zero. HEADER_SIZE is 64 in file.rs.
     let script = format!(
@@ -1252,28 +1216,9 @@ spec:
     // flake even though the writer's clean pages persisted correctly. Bouncing
     // just the writer-node pod keeps every other node's CSI registration up and
     // the reader strictly co-located with the cache it must reuse.
-    let old_pod = {
-        let out = Command::new("kubectl")
-            .args([
-                "-n",
-                NS,
-                "get",
-                "pods",
-                "-l",
-                "app=csi-ublk-azblob-node",
-                "--field-selector",
-                &format!("spec.nodeName={writer_node}"),
-                "-o",
-                "jsonpath={.items[0].metadata.name}",
-            ])
-            .output()
-            .expect("get node-plugin pod on writer node");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    assert!(
-        !old_pod.is_empty(),
-        "no node-plugin pod found on the writer's node {writer_node}; cannot restart it"
-    );
+    let old_pod = node_plugin_pod_on(&writer_node).unwrap_or_else(|| {
+        panic!("no node-plugin pod found on the writer's node {writer_node}; cannot restart it")
+    });
     log(&format!(
         "restarting only the node plugin on the writer's node ({writer_node}, pod {old_pod})"
     ));
