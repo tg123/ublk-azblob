@@ -765,7 +765,10 @@ mod tests {
     fn overlay_dirs_sanitize_volume_id_for_scratch_base() {
         // A volume id with path separators must not escape the scratch base.
         let dirs = overlay_dirs("/tgt/mount", Some("/mnt/ssd"), "../../etc/evil");
-        assert_eq!(dirs.scratch_root.as_deref(), Some("/mnt/ssd/______etc_evil"));
+        assert_eq!(
+            dirs.scratch_root.as_deref(),
+            Some("/mnt/ssd/______etc_evil")
+        );
         assert!(dirs.upper.starts_with("/mnt/ssd/______etc_evil/"));
     }
 
