@@ -22,7 +22,7 @@ use azure_storage_blob::{
 use bytes::Bytes;
 use futures::stream::{StreamExt as _, TryStreamExt as _};
 use std::sync::RwLock;
-use tracing::{error, instrument, trace};
+use tracing::{error, info, instrument, trace};
 
 /// Azure Page Blob backend.
 ///
@@ -131,11 +131,22 @@ impl AzurePageBlobBackend {
     /// wall-clock time exceeds the (~1 h) token lifetime does not start failing
     /// late chunks with HTTP 403. Ranges are 512-aligned; sparse source ranges
     /// copy as zeros.
+    ///
+    /// `source_data_ranges` is the source blob's sparseness map (from
+    /// [`BlobBackend::data_ranges`]); when `Some`, any chunk lying entirely in a
+    /// zero gap is **cleared** on the destination (`Clear Pages`) instead of
+    /// being copied — no `Put Page From URL` is issued for it, so the storage
+    /// service never copies the source's unwritten free space, yet the
+    /// destination is still guaranteed to read back as zero there. This is safe
+    /// even when copying into a blob that already holds data (e.g. a retry
+    /// against an idempotently-created same-size target). `None` copies every
+    /// chunk.
     pub async fn copy_pages_from_url(
         &self,
         source_url: &str,
         total_size: u64,
         copy_source_auth: Option<crate::auth::AuthConfig>,
+        source_data_ranges: Option<&[(u64, u64)]>,
     ) -> anyhow::Result<()> {
         if !total_size.is_multiple_of(512) {
             bail!("copy size {total_size} is not 512-byte aligned");
@@ -164,9 +175,12 @@ impl AzurePageBlobBackend {
             n_chunks,
             chunk,
             concurrency,
-            "server-side copy via Put Page From URL"
+            clear_zero_ranges = source_data_ranges.is_some(),
+            "server-side copy via Put Page From URL (zero gaps cleared, not copied)"
         );
 
+        let mut copied_bytes = 0u64;
+        let mut cleared_bytes = 0u64;
         let mut batch_start = 0u64;
         while batch_start < n_chunks {
             let batch_end = (batch_start + chunks_per_batch).min(n_chunks);
@@ -177,31 +191,72 @@ impl AzurePageBlobBackend {
                     .context("mint copy-source authorization token")?,
                 None => None,
             };
-            let copies = (batch_start..batch_end).map(|i| {
+            // Each chunk either carries source data — copied via Put Page From
+            // URL — or lies entirely in a source zero gap. For a zero gap we
+            // *clear* the destination range rather than skipping it: this still
+            // avoids the source round-trip, but also guarantees the destination
+            // reads back as zero there even when it is not a freshly-created
+            // blob. `create()` is idempotent and does not zero an existing
+            // same-size target, so on a retry/re-run a skipped range could
+            // otherwise retain stale data and corrupt the clone.
+            let ops = (batch_start..batch_end).map(|i| {
                 let offset = i * chunk;
                 let len = chunk.min(total_size - offset);
-                let src_range = HttpRange::new(offset, len);
-                let dst_range = HttpRange::new(offset, len);
-                let opts = PageBlobClientUploadPagesFromUrlOptions {
-                    lease_id: lease_id.clone(),
-                    copy_source_authorization: csa.clone(),
-                    ..Default::default()
-                };
+                let is_data = source_data_ranges
+                    .map(|ranges| super::range_intersects(ranges, offset, len))
+                    .unwrap_or(true);
+                if is_data {
+                    copied_bytes += len;
+                } else {
+                    cleared_bytes += len;
+                }
                 let page_client = &page_client;
+                let lease_id = lease_id.clone();
+                let csa = csa.clone();
                 let source_url = source_url.to_string();
                 async move {
-                    page_client
-                        .upload_pages_from_url(source_url, src_range, len, dst_range, Some(opts))
-                        .await
-                        .with_context(|| format!("put page from url offset={offset} len={len}"))?;
+                    if is_data {
+                        let opts = PageBlobClientUploadPagesFromUrlOptions {
+                            lease_id,
+                            copy_source_authorization: csa,
+                            ..Default::default()
+                        };
+                        page_client
+                            .upload_pages_from_url(
+                                source_url,
+                                HttpRange::new(offset, len),
+                                len,
+                                HttpRange::new(offset, len),
+                                Some(opts),
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("put page from url offset={offset} len={len}")
+                            })?;
+                    } else {
+                        let opts = PageBlobClientClearPagesOptions {
+                            lease_id,
+                            ..Default::default()
+                        };
+                        page_client
+                            .clear_pages(HttpRange::new(offset, len), Some(opts))
+                            .await
+                            .with_context(|| format!("clear pages offset={offset} len={len}"))?;
+                    }
                     Ok::<(), anyhow::Error>(())
                 }
             });
-            futures::stream::iter(copies)
+            futures::stream::iter(ops)
                 .buffer_unordered(concurrency)
                 .try_collect::<()>()
                 .await?;
             batch_start = batch_end;
+        }
+        if source_data_ranges.is_some() {
+            info!(
+                copied_bytes,
+                cleared_bytes, total_size, "server-side copy cleared source zero ranges"
+            );
         }
         Ok(())
     }
