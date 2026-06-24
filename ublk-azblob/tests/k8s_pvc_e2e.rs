@@ -1311,23 +1311,11 @@ spec:
     );
 
     // Co-location guard: the persistent host-path cache is per-node, so the
-    // reader must land on the exact node the writer ran on. Log both the
-    // intended (writer_node) and actual reader node so a mismatch surfaces
-    // explicitly rather than as an opaque "no reuse" failure.
-    let reader_node = {
-        let out = Command::new("kubectl")
-            .args([
-                "get",
-                "pods",
-                "-l",
-                "app=azblob-cache-reader",
-                "-o",
-                "jsonpath={.items[*].spec.nodeName}",
-            ])
-            .output();
-        out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
-    };
+    // reader must land on the exact node the writer ran on. Use `pod_node`
+    // (first pod's nodeName) for both lookups so a reader `backoffLimit` retry
+    // — which would make a raw `jsonpath={.items[*]...}` emit two node names —
+    // can't spuriously make `reader_node != writer_node`.
+    let reader_node = pod_node("azblob-cache-reader").unwrap_or_default();
     log(&format!(
         "cache reader ran on node {reader_node:?}; writer/cache node was {writer_node:?} \
          (must match for the per-node host-path cache to be reused)"
