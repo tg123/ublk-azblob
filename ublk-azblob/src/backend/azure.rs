@@ -5,6 +5,7 @@
 //! trait.  The Azure SDK is **completely isolated** inside this module — no SDK
 //! type crosses the `BlobBackend` boundary into the rest of the crate.
 
+use super::io_gateway::{current_class, AzureIoGateway, IoClass};
 use super::BlobBackend;
 use crate::coordination::{BlobLock, LockError};
 use anyhow::{bail, Context as _};
@@ -22,6 +23,7 @@ use azure_storage_blob::{
 };
 use bytes::Bytes;
 use futures::stream::{StreamExt as _, TryStreamExt as _};
+use std::sync::Arc;
 use std::sync::RwLock;
 use tracing::{error, info, instrument, trace};
 
@@ -48,6 +50,10 @@ pub struct AzurePageBlobBackend {
     /// before any I/O is served. `None` means no lease is held (coordination
     /// disabled), and requests are sent without a lease condition.
     lease_id: RwLock<Option<String>>,
+    /// Shared, process-wide I/O gateway that all reads (downloads) and
+    /// writes/clears/copies (uploads) funnel through, enforcing the per-direction
+    /// bandwidth ceiling, concurrency cap and priority scheduling.
+    gateway: Arc<AzureIoGateway>,
     /// ETag returned by the most recent mutating request (Put Page / Clear
     /// Pages).
     ///
@@ -76,6 +82,7 @@ impl AzurePageBlobBackend {
             blob_name: blob_name.into(),
             snapshot: None,
             lease_id: RwLock::new(None),
+            gateway: AzureIoGateway::global(),
             last_etag: RwLock::new(None),
             page_list_pipeline: None,
         }
@@ -175,25 +182,28 @@ impl AzurePageBlobBackend {
         // Per-request size (override with `UBLK_COPY_CHUNK_BYTES`); `Put Page From
         // URL` caps it at 4 MiB.
         let chunk = crate::backend::copy_chunk_bytes();
-        // Default concurrency to the logical CPU count (same auto-sizing as the
-        // cache warm-up path), overridable with `UBLK_COPY_CONCURRENCY`.
-        let concurrency = std::env::var("UBLK_COPY_CONCURRENCY")
+        // How many copy chunks to pipeline into the I/O gateway at once. This
+        // only bounds in-flight *enqueued* work (and thus memory); the actual
+        // server-side upload concurrency and bandwidth are enforced centrally by
+        // the gateway's upload pipeline. Overridable with `UBLK_COPY_CONCURRENCY`.
+        let pipeline_depth = std::env::var("UBLK_COPY_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or_else(crate::backend::cpu_count);
 
         let blob_client = self.container.blob_client(&self.blob_name);
-        let page_client = blob_client.page_blob_client();
+        let page_client = Arc::new(blob_client.page_blob_client());
         let lease_id = self.lease_id();
+        let gateway = self.gateway.clone();
 
         let n_chunks = total_size.div_ceil(chunk);
-        let chunks_per_batch = (BATCH_BYTES / chunk).max(concurrency as u64);
+        let chunks_per_batch = (BATCH_BYTES / chunk).max(pipeline_depth as u64);
         trace!(
             total_size,
             n_chunks,
             chunk,
-            concurrency,
+            pipeline_depth,
             clear_zero_ranges = source_data_ranges.is_some(),
             "server-side copy via Put Page From URL (zero gaps cleared, not copied)"
         );
@@ -229,44 +239,51 @@ impl AzurePageBlobBackend {
                 } else {
                     cleared_bytes += len;
                 }
-                let page_client = &page_client;
+                let page_client = page_client.clone();
                 let lease_id = lease_id.clone();
                 let csa = csa.clone();
                 let source_url = source_url.to_string();
+                let gateway = gateway.clone();
                 async move {
-                    if is_data {
-                        let opts = PageBlobClientUploadPagesFromUrlOptions {
-                            lease_id,
-                            copy_source_authorization: csa,
-                            ..Default::default()
-                        };
-                        page_client
-                            .upload_pages_from_url(
-                                source_url,
-                                HttpRange::new(offset, len),
-                                len,
-                                HttpRange::new(offset, len),
-                                Some(opts),
-                            )
-                            .await
-                            .with_context(|| {
-                                format!("put page from url offset={offset} len={len}")
-                            })?;
-                    } else {
-                        let opts = PageBlobClientClearPagesOptions {
-                            lease_id,
-                            ..Default::default()
-                        };
-                        page_client
-                            .clear_pages(HttpRange::new(offset, len), Some(opts))
-                            .await
-                            .with_context(|| format!("clear pages offset={offset} len={len}"))?;
-                    }
-                    Ok::<(), anyhow::Error>(())
+                    gateway
+                        .upload(IoClass::Copy, len, async move {
+                            if is_data {
+                                let opts = PageBlobClientUploadPagesFromUrlOptions {
+                                    lease_id,
+                                    copy_source_authorization: csa,
+                                    ..Default::default()
+                                };
+                                page_client
+                                    .upload_pages_from_url(
+                                        source_url,
+                                        HttpRange::new(offset, len),
+                                        len,
+                                        HttpRange::new(offset, len),
+                                        Some(opts),
+                                    )
+                                    .await
+                                    .with_context(|| {
+                                        format!("put page from url offset={offset} len={len}")
+                                    })?;
+                            } else {
+                                let opts = PageBlobClientClearPagesOptions {
+                                    lease_id,
+                                    ..Default::default()
+                                };
+                                page_client
+                                    .clear_pages(HttpRange::new(offset, len), Some(opts))
+                                    .await
+                                    .with_context(|| {
+                                        format!("clear pages offset={offset} len={len}")
+                                    })?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        })
+                        .await
                 }
             });
             futures::stream::iter(ops)
-                .buffer_unordered(concurrency)
+                .buffer_unordered(pipeline_depth)
                 .try_collect::<()>()
                 .await?;
             batch_start = batch_end;
@@ -485,24 +502,27 @@ impl BlobBackend for AzurePageBlobBackend {
         if !len.is_multiple_of(512) {
             bail!("len {len} is not 512-byte aligned");
         }
-        let blob_client = self.blob_client()?;
+        let blob_client = Arc::new(self.blob_client()?);
+        let blob_name = self.blob_name.clone();
+        let class = current_class().unwrap_or(IoClass::ForegroundRead);
         trace!(offset, len, "downloading range");
-        let opts = BlobClientDownloadOptions {
-            range: Some(HttpRange::new(offset, len)),
-            ..Default::default()
-        };
-        let result = blob_client.download(Some(opts)).await.with_context(|| {
-            format!(
-                "download blob '{}' offset={offset} len={len}",
-                self.blob_name
-            )
-        })?;
-        let data = result
-            .body
-            .collect()
+        self.gateway
+            .download(class, len, async move {
+                let opts = BlobClientDownloadOptions {
+                    range: Some(HttpRange::new(offset, len)),
+                    ..Default::default()
+                };
+                let result = blob_client.download(Some(opts)).await.with_context(|| {
+                    format!("download blob '{blob_name}' offset={offset} len={len}")
+                })?;
+                let data = result
+                    .body
+                    .collect()
+                    .await
+                    .with_context(|| format!("collect body for blob '{blob_name}'"))?;
+                Ok(data)
+            })
             .await
-            .with_context(|| format!("collect body for blob '{}'", self.blob_name))?;
-        Ok(data)
     }
 
     #[instrument(skip(self, data), fields(blob = %self.blob_name, offset, len = data.len()))]
@@ -518,33 +538,36 @@ impl BlobBackend for AzurePageBlobBackend {
             bail!("data length {len} is not 512-byte aligned");
         }
         let blob_client = self.container.blob_client(&self.blob_name);
-        let page_client = blob_client.page_blob_client();
+        let page_client = Arc::new(blob_client.page_blob_client());
+        let blob_name = self.blob_name.clone();
         let range = HttpRange::new(offset, len);
+        let class = current_class().unwrap_or(IoClass::Flush);
         trace!(offset, len, "uploading pages");
         let opts = PageBlobClientUploadPagesOptions {
             lease_id: self.lease_id(),
             ..Default::default()
         };
-        page_client
-            .upload_pages(
-                azure_core::http::RequestContent::from(data.to_vec()),
-                len,
-                range,
-                Some(opts),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "upload_pages blob '{}' offset={offset} len={len}",
-                    self.blob_name
-                )
+        let etag = self
+            .gateway
+            .upload(class, len, async move {
+                let resp = page_client
+                    .upload_pages(
+                        azure_core::http::RequestContent::from(data.to_vec()),
+                        len,
+                        range,
+                        Some(opts),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("upload_pages blob '{blob_name}' offset={offset} len={len}")
+                    })?;
+                Ok::<_, anyhow::Error>(resp.etag().ok().flatten().map(|e| e.to_string()))
             })
-            .map(|resp| {
-                // The Put Page response already carries the blob's new ETag;
-                // cache it so a follow-up flush can read the validity token
-                // without an extra get_properties round-trip.
-                self.record_etag(resp.etag().ok().flatten().map(|e| e.to_string()));
-            })?;
+            .await?;
+        // The Put Page response already carries the blob's new ETag; cache it so
+        // a follow-up flush can read the validity token without an extra
+        // get_properties round-trip.
+        self.record_etag(etag);
         Ok(())
     }
 
@@ -560,27 +583,30 @@ impl BlobBackend for AzurePageBlobBackend {
             bail!("len {len} is not 512-byte aligned");
         }
         let blob_client = self.container.blob_client(&self.blob_name);
-        let page_client = blob_client.page_blob_client();
+        let page_client = Arc::new(blob_client.page_blob_client());
+        let blob_name = self.blob_name.clone();
         let range = HttpRange::new(offset, len);
+        let class = current_class().unwrap_or(IoClass::Flush);
         trace!(offset, len, "clearing pages");
         let opts = PageBlobClientClearPagesOptions {
             lease_id: self.lease_id(),
             ..Default::default()
         };
-        page_client
-            .clear_pages(range, Some(opts))
-            .await
-            .with_context(|| {
-                format!(
-                    "clear_pages blob '{}' offset={offset} len={len}",
-                    self.blob_name
-                )
+        let etag = self
+            .gateway
+            .upload(class, 0, async move {
+                let resp = page_client
+                    .clear_pages(range, Some(opts))
+                    .await
+                    .with_context(|| {
+                        format!("clear_pages blob '{blob_name}' offset={offset} len={len}")
+                    })?;
+                Ok::<_, anyhow::Error>(resp.etag().ok().flatten().map(|e| e.to_string()))
             })
-            .map(|resp| {
-                // Clear Pages also mutates the blob and returns the new ETag;
-                // keep the cached validity token current.
-                self.record_etag(resp.etag().ok().flatten().map(|e| e.to_string()));
-            })?;
+            .await?;
+        // Clear Pages also mutates the blob and returns the new ETag; keep the
+        // cached validity token current.
+        self.record_etag(etag);
         Ok(())
     }
 

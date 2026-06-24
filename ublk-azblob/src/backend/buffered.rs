@@ -18,6 +18,7 @@
 //!   `0` means unlimited (grow-only, no clean-page eviction).
 
 use super::cache_lru::Lru;
+use super::io_gateway::{with_class, IoClass};
 use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
@@ -370,7 +371,7 @@ impl BufferedBackend {
             None
         };
 
-        let flush_task = async {
+        let flush_task = with_class(IoClass::Flush, async {
             futures::stream::iter(indices.iter().copied().map(|page_idx| async move {
                 // Snapshot the dirty page under a brief lock (no await held).
                 let snapshot = {
@@ -429,7 +430,7 @@ impl BufferedBackend {
             .buffer_unordered(concurrency)
             .try_collect::<()>()
             .await
-        };
+        });
 
         if let Some(timeout_duration) = timeout {
             match tokio::time::timeout(timeout_duration, flush_task).await {

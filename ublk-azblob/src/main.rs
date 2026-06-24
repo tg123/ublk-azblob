@@ -130,6 +130,39 @@ struct Cli {
     #[arg(long, env = "AZURE_CLIENT_SECRET", conflicts_with_all = ["account_key", "msi", "msi_client_id", "msi_object_id", "msi_resource_id"])]
     azure_client_secret: Option<String>,
 
+    // ── Centralized Azure I/O limits (apply to every subcommand) ───────────────
+    /// Total concurrent Azure requests shared across download and upload.
+    ///
+    /// The gateway's overall thread budget. Downloads and uploads draw from it
+    /// dynamically, so either direction can use the whole budget while the other
+    /// is idle. `0` (default) auto-sizes to the logical CPU count.
+    #[arg(long, default_value = "0", env = "UBLK_IO_CONCURRENCY")]
+    io_concurrency: usize,
+
+    /// Per-direction ceiling on concurrent Azure *download* (read) requests.
+    ///
+    /// Caps how much of the shared `--io-concurrency` budget downloads may use.
+    /// `0` (default) lets downloads use the entire budget when uploads are idle.
+    #[arg(long, default_value = "0", env = "UBLK_DOWNLOAD_CONCURRENCY")]
+    download_concurrency: usize,
+
+    /// Per-direction ceiling on concurrent Azure *upload* (write / clear / copy)
+    /// requests.
+    ///
+    /// Caps how much of the shared `--io-concurrency` budget uploads may use.
+    /// `0` (default) lets uploads use the entire budget when downloads are idle.
+    #[arg(long, default_value = "0", env = "UBLK_UPLOAD_CONCURRENCY")]
+    upload_concurrency: usize,
+
+    /// Azure *download* (read) bandwidth ceiling in bytes/sec. `0` = unlimited.
+    #[arg(long, default_value = "0", env = "UBLK_DOWNLOAD_BANDWIDTH")]
+    download_bandwidth: u64,
+
+    /// Azure *upload* (write / clear / copy) bandwidth ceiling in bytes/sec.
+    /// `0` = unlimited.
+    #[arg(long, default_value = "0", env = "UBLK_UPLOAD_BANDWIDTH")]
+    upload_bandwidth: u64,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -332,13 +365,15 @@ enum Command {
         #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_BYTES")]
         cache_warmup_bytes: u64,
 
-        /// Number of blob pages the warm-up fetches concurrently.
+        /// Number of warm-up blob-page fetches the cache keeps in flight at once.
         ///
-        /// Warm-up is otherwise latency-bound (one page in flight at a time);
-        /// raising this makes it bandwidth-bound. Peak transient memory is
-        /// roughly `concurrency × --cache-page-size`, so lower it when using
-        /// large cache pages. Only used when `--cache-dir` and `--cache-warmup`
-        /// are set. `0` (the default) auto-sizes to the logical CPU count.
+        /// Each in-flight fetch submits its blob read through the centralized I/O
+        /// gateway, so this bounds peak transient memory (roughly `concurrency ×
+        /// --cache-page-size`) while the actual Azure download concurrency and
+        /// bandwidth are enforced centrally by the gateway
+        /// (`--download-concurrency` / `--download-bandwidth`). Only used when
+        /// `--cache-dir` and `--cache-warmup` are set. `0` (the default)
+        /// auto-sizes to the logical CPU count.
         #[arg(long, default_value = "0", env = "UBLK_CACHE_WARMUP_CONCURRENCY")]
         cache_warmup_concurrency: usize,
 
@@ -367,13 +402,15 @@ enum Command {
         #[arg(long, default_value = "0", env = "UBLK_FLUSH_IO_TIMEOUT_SECS")]
         flush_io_timeout_secs: u64,
 
-        /// Maximum number of dirty pages flushed concurrently to the backend.
+        /// Number of dirty-page write-backs the flush keeps in flight at once.
         ///
-        /// Flushing is latency-bound when the backend is remote (e.g. Azure in a
-        /// distant region), so issuing several page writes in flight at once is
-        /// the key throughput lever. Transient extra memory is bounded by
-        /// `page_size × this value`. Set to 1 for fully sequential flushing.
-        /// `0` (the default) auto-sizes to the logical CPU count.
+        /// Each in-flight write-back submits its page upload through the
+        /// centralized I/O gateway, so this bounds transient memory (`page_size ×
+        /// this value` of in-flight snapshots) while the actual Azure upload
+        /// concurrency and bandwidth are enforced centrally by the gateway
+        /// (`--upload-concurrency` / `--upload-bandwidth`). Set to 1 for fully
+        /// sequential snapshotting. `0` (the default) auto-sizes to the logical
+        /// CPU count.
         #[arg(long, default_value = "0", env = "UBLK_FLUSH_CONCURRENCY")]
         flush_concurrency: usize,
 
@@ -517,6 +554,40 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Initialize the process-wide Azure I/O gateway before any backend is built,
+    // so every download/upload funnels through its bandwidth, concurrency and
+    // priority controls. Zero concurrency means "auto": the shared budget
+    // defaults to the logical CPU count and each direction may use all of it
+    // when the other is idle. Zero bandwidth means unlimited.
+    {
+        let mut io_cfg = backend::io_gateway::IoGatewayConfig::auto();
+        if cli.io_concurrency > 0 {
+            io_cfg.concurrency = cli.io_concurrency;
+            // Keep the per-direction ceilings in step with an explicit total
+            // unless the user overrode them below, so a raised budget is usable
+            // by either direction.
+            io_cfg.download_concurrency = cli.io_concurrency;
+            io_cfg.upload_concurrency = cli.io_concurrency;
+        }
+        if cli.download_concurrency > 0 {
+            io_cfg.download_concurrency = cli.download_concurrency;
+        }
+        if cli.upload_concurrency > 0 {
+            io_cfg.upload_concurrency = cli.upload_concurrency;
+        }
+        io_cfg.download_bandwidth_bps = cli.download_bandwidth;
+        io_cfg.upload_bandwidth_bps = cli.upload_bandwidth;
+        info!(
+            concurrency = io_cfg.concurrency,
+            download_concurrency = io_cfg.download_concurrency,
+            upload_concurrency = io_cfg.upload_concurrency,
+            download_bandwidth_bps = io_cfg.download_bandwidth_bps,
+            upload_bandwidth_bps = io_cfg.upload_bandwidth_bps,
+            "centralized Azure I/O gateway configured"
+        );
+        backend::io_gateway::AzureIoGateway::init_global(io_cfg);
+    }
 
     match cli.command {
         Command::Run {
