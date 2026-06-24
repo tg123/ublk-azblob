@@ -41,6 +41,11 @@ tar -xzf ublk-azblob-<tag>-x86_64-unknown-linux-musl.tar.gz
 Each archive ships a `.sha256` checksum next to it. The binaries are built with
 the `ublk` and `csi` features enabled.
 
+The release binary is the **exact same artifact** shipped inside the container
+image (`ghcr.io/tg123/ublk-azblob`): both are extracted from the `binary` stage
+of [`deploy/Dockerfile`](deploy/Dockerfile), so the downloaded binary and the
+one in the image are byte-for-byte identical (same SHA256).
+
 > The CSI node plugin still shells out to host utilities (`mkfs.ext4`,
 > `mount`/`umount`, `blkid`, `nbd-client`); those must be present on the host.
 
