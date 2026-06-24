@@ -105,11 +105,18 @@ pub fn list_available_nbd_devices() -> HashSet<String> {
 ///
 /// `env` carries the storage selectors and credentials (`AZURE_STORAGE_*`).
 /// `nbd_listen` optionally enables NBD mode with the given listen address (e.g. `127.0.0.1:10809`).
+/// `ublk_id` pins the ublk device id (ublk mode only); `None` lets the kernel
+/// auto-allocate. `recover` re-attaches to an existing quiesced device at
+/// `ublk_id` (user-recovery) instead of creating a fresh one — used to resume a
+/// device after a node-local restart of the node plugin without disrupting the
+/// kubelet's mount.
 /// The child keeps the device alive until it is signalled.
 pub fn spawn_device(
     size: u64,
     env: &[(String, String)],
     nbd_listen: Option<String>,
+    ublk_id: Option<i32>,
+    recover: bool,
 ) -> anyhow::Result<Child> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut cmd = Command::new(exe);
@@ -124,7 +131,17 @@ pub fn spawn_device(
         info!(listen = %listen, "spawning NBD server");
         cmd.arg("--nbd").arg(listen);
     } else {
-        info!("spawning ublk device");
+        // ublk mode. Pin the device id when recovering (or otherwise requested)
+        // so the kernel re-attaches the new server to the exact quiesced device.
+        if let Some(id) = ublk_id {
+            cmd.arg("--id").arg(id.to_string());
+        }
+        if recover {
+            cmd.arg("--recover");
+            info!(ublk_id = ?ublk_id, "spawning ublk device in recovery mode");
+        } else {
+            info!("spawning ublk device");
+        }
     }
 
     for (k, v) in env {
@@ -134,6 +151,7 @@ pub fn spawn_device(
     info!(
         pid = child.id(),
         nbd_mode = nbd_listen.is_some(),
+        recover = recover,
         "spawned device process"
     );
     Ok(child)
@@ -290,6 +308,159 @@ pub fn wait_and_connect_nbd(
         "NBD device {} did not report a non-zero size (last={last_size}) before timeout",
         nbd_dev
     );
+}
+
+/// Parse the numeric ublk device id from a `/dev/ublkbN` path (returns `N`).
+///
+/// The node plugin persists this id so a restart can re-attach to the same
+/// quiesced device via user-recovery.
+pub fn dev_id_from_path(dev: &str) -> Option<i32> {
+    dev.rsplit('/')
+        .next()
+        .and_then(|name| name.strip_prefix("ublkb"))
+        .and_then(|n| n.parse::<i32>().ok())
+}
+
+/// Wait until an *already-existing* block device reports a non-zero size and the
+/// owning `child` is still alive — used when recovering a ublk device (the
+/// `/dev/ublkbN` node persists while quiesced, so there is no "new device" to
+/// wait for; we only need to confirm the re-attached server brought it live).
+pub fn wait_for_existing_device(
+    dev: &str,
+    child: &mut Child,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_size: u64 = 0;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("ublk-azblob exited before recovering device {dev}: {status}");
+        }
+        if Path::new(dev).exists() {
+            if let Ok(output) = Command::new("blockdev").arg("--getsize64").arg(dev).output() {
+                if output.status.success() {
+                    last_size = String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    if last_size > 0 {
+                        info!(device = %dev, size = last_size, "ublk device recovered");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    bail!("ublk device {dev} did not become ready (last size={last_size}) before timeout");
+}
+
+/// Re-attach an NBD client to an *existing* `/dev/nbdN` device after the backing
+/// server was restarted. NBD has no kernel-side quiesce/recovery, so on a
+/// restart we re-spawn the server (on a possibly new port) and reconnect
+/// `nbd-client` to the *same* device node, keeping the existing mount's
+/// `major:minor` valid. The stale connection is torn down first (`-d`).
+pub fn reconnect_nbd(
+    nbd_listen: &str,
+    device: &str,
+    child: &mut Child,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let (host, port) = nbd_listen
+        .split_once(':')
+        .with_context(|| format!("invalid NBD listen address: {nbd_listen}"))?;
+    let port_num: u16 = port
+        .parse()
+        .with_context(|| format!("invalid NBD port in listen address: {nbd_listen}"))?;
+    let addr = (host, port_num)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve NBD listen address: {nbd_listen}"))?
+        .next()
+        .with_context(|| format!("no address resolved for NBD listen address: {nbd_listen}"))?;
+
+    let deadline = Instant::now() + timeout;
+
+    // Wait for the freshly-spawned server to start listening (or exit).
+    loop {
+        if Instant::now() >= deadline {
+            bail!("NBD server {nbd_listen} did not start listening before timeout");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("ublk-azblob NBD server exited before reconnecting: {status}");
+        }
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            drop(stream);
+            break;
+        }
+    }
+
+    // Drop any stale kernel-side connection on this device, then reconnect to
+    // the new server. The `-d` may fail harmlessly if nothing is connected.
+    let _ = Command::new("nbd-client")
+        .arg("-d")
+        .arg(device)
+        .output();
+
+    info!(device = %device, host = %host, port = %port_num, "reconnecting NBD client");
+    let output = Command::new("nbd-client")
+        .arg(host)
+        .arg(port_num.to_string())
+        .arg(device)
+        .arg("-L")
+        .output()
+        .context("failed to run nbd-client")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("nbd-client reconnect failed: {stderr}");
+    }
+
+    // Confirm the kernel published a non-zero size again before declaring success.
+    let mut last_size: u64 = 0;
+    while Instant::now() < deadline {
+        if Path::new(device).exists() {
+            if let Ok(output) = Command::new("blockdev")
+                .arg("--getsize64")
+                .arg(device)
+                .output()
+            {
+                if output.status.success() {
+                    last_size = String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    if last_size > 0 {
+                        info!(device = %device, size = last_size, "NBD device reconnected");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    bail!("NBD device {device} did not report a non-zero size (last={last_size}) after reconnect");
+}
+
+/// True if `target` is currently a mount point (checked against `/proc/mounts`).
+///
+/// Used on node-plugin startup to decide whether a recovered volume's filesystem
+/// is still mounted at the CSI target (it normally is — the kernel keeps the
+/// mount across a node-plugin restart) or needs to be re-mounted.
+pub fn is_mounted(target: &str) -> bool {
+    let target = target.trim_end_matches('/');
+    if let Ok(contents) = std::fs::read_to_string("/proc/mounts") {
+        for line in contents.lines() {
+            // Fields: <spec> <mountpoint> <fstype> <opts> ...; the mountpoint is
+            // the 2nd field, with octal-escaped spaces we don't need to decode
+            // for our plugin-controlled, space-free target paths.
+            if let Some(mp) = line.split_whitespace().nth(1) {
+                if mp.trim_end_matches('/') == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// True if `dev` already carries a recognised filesystem (via `blkid`).
@@ -511,7 +682,7 @@ pub fn mount(
 ///     under an operator-chosen base (`overlayScratchDir`), on that base's
 ///     filesystem — not on the target's — and are pruned explicitly via
 ///     `scratch_root` on teardown so nothing leaks.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OverlayDirs {
     /// Read-only mount point of the immutable lower filesystem.
     pub lower: String,

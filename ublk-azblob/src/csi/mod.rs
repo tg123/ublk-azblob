@@ -31,6 +31,7 @@ pub mod controller;
 pub mod identity;
 pub mod mount;
 pub mod node;
+pub mod state;
 
 /// Generated CSI v1 protobuf / gRPC bindings (`csi.v1` package).
 #[allow(
@@ -149,6 +150,10 @@ pub async fn run_csi(
     if matches!(role, Role::Node | Role::All) {
         info!(node_id = %node_id, "enabling CSI node service");
         let node = node::NodeService::new(node_id, config);
+        // Re-attach to any volumes this node previously published before serving
+        // new requests, so a node-local restart of the plugin (crash / OOM /
+        // DaemonSet upgrade) does not disrupt the kubelet's existing mounts.
+        node.recover().await;
         builder = builder.add_service(NodeServer::new(node));
     }
 

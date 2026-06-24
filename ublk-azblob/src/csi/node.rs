@@ -16,6 +16,7 @@ use tracing::{error, info, instrument, warn};
 
 use super::mount;
 use super::proto::node_server::Node;
+use super::state;
 use super::proto::{
     volume_capability::AccessType, NodeExpandVolumeRequest, NodeExpandVolumeResponse,
     NodeGetCapabilitiesRequest, NodeGetCapabilitiesResponse, NodeGetInfoRequest,
@@ -191,6 +192,131 @@ impl NodeService {
             env.push(("UBLK_CACHE_INSTANCE".to_string(), volume_id.to_string()));
         }
         Ok(env)
+    }
+
+    /// Re-attach to every volume this node previously published, using the
+    /// persisted state records, so a node-local restart of the plugin (crash,
+    /// OOM, or a DaemonSet upgrade) is transparent to running pods.
+    ///
+    /// For ublk volumes the kernel kept `/dev/ublkbN` quiesced while the old
+    /// server was gone (user-recovery); we spawn a fresh `run --recover` child
+    /// bound to the same device id. For NBD volumes we re-spawn the server and
+    /// reconnect `nbd-client` to the same device node. In both cases the existing
+    /// filesystem mount (same `major:minor`) stays valid; if the mount was
+    /// somehow lost we re-mount it. Records that can't be recovered (e.g. after a
+    /// full node reboot that destroyed the devices) are pruned so the kubelet can
+    /// re-publish from scratch.
+    pub async fn recover(&self) {
+        let records = state::load_all();
+        if records.is_empty() {
+            return;
+        }
+        info!(count = records.len(), "recovering previously-published volumes");
+        for record in records {
+            let volume_id = record.volume_id.clone();
+            let volumes = self.volumes.clone();
+            let publish_lock = self.publish_lock.clone();
+            let nbd_host = self.config.nbd_host.clone();
+            let nbd_port_start = self.config.nbd_port_start;
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let _guard = publish_lock.lock().unwrap();
+                let (mut child, device) = match &record.device_mode {
+                    state::DeviceMode::Ublk { dev_id } => {
+                        let device = format!("/dev/ublkb{dev_id}");
+                        info!(volume_id = %record.volume_id, device = %device, "recovering ublk device");
+                        let mut child = mount::spawn_device(
+                            record.size,
+                            &record.env,
+                            None,
+                            Some(*dev_id),
+                            true,
+                        )?;
+                        if let Err(e) =
+                            mount::wait_for_existing_device(&device, &mut child, DEVICE_TIMEOUT)
+                        {
+                            mount::signal_pid(child.id(), libc::SIGINT);
+                            let _ = child.wait();
+                            return Err(e);
+                        }
+                        (child, device)
+                    }
+                    state::DeviceMode::Nbd { device, listen } => {
+                        // NBD has no kernel quiesce; re-serve on a fresh free port
+                        // and reconnect the client to the same /dev/nbdN.
+                        let host = listen.split_once(':').map(|(h, _)| h).unwrap_or(&nbd_host);
+                        let port = mount::find_free_port(host, nbd_port_start, 1024)?;
+                        let new_listen = format!("{host}:{port}");
+                        info!(volume_id = %record.volume_id, device = %device, listen = %new_listen, "recovering NBD device");
+                        let mut child = mount::spawn_device(
+                            record.size,
+                            &record.env,
+                            Some(new_listen.clone()),
+                            None,
+                            false,
+                        )?;
+                        if let Err(e) =
+                            mount::reconnect_nbd(&new_listen, device, &mut child, DEVICE_TIMEOUT)
+                        {
+                            mount::signal_pid(child.id(), libc::SIGINT);
+                            let _ = child.wait();
+                            return Err(e);
+                        }
+                        (child, device.clone())
+                    }
+                };
+
+                // The mount normally survives the plugin restart; re-establish it
+                // only if it was lost.
+                if !mount::is_mounted(&record.target) {
+                    warn!(target = %record.target, "mount lost across restart; re-mounting");
+                    let outcome = match &record.overlay {
+                        Some(dirs) => mount::mount_overlay(
+                            &device,
+                            &record.target,
+                            &record.fs_type,
+                            &record.mount_flags,
+                            dirs,
+                        ),
+                        None => mount::mount(
+                            &device,
+                            &record.target,
+                            &record.fs_type,
+                            &record.mount_flags,
+                            record.readonly,
+                        ),
+                    };
+                    if let Err(e) = outcome {
+                        mount::signal_pid(child.id(), libc::SIGINT);
+                        let _ = child.wait();
+                        return Err(e);
+                    }
+                }
+
+                mount::drain_child_output(&mut child);
+                volumes.lock().unwrap().insert(
+                    record.volume_id.clone(),
+                    Published {
+                        child,
+                        device,
+                        target: record.target.clone(),
+                        overlay: record.overlay.clone(),
+                    },
+                );
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => info!(volume_id = %volume_id, "volume recovered"),
+                Ok(Err(e)) => {
+                    error!(volume_id = %volume_id, error = %format!("{e:#}"), "volume recovery failed; pruning state so the kubelet can re-publish");
+                    if let Err(e) = state::remove(&volume_id) {
+                        warn!(%volume_id, error = %format!("{e:#}"), "failed to prune unrecoverable state file");
+                    }
+                }
+                Err(e) => error!(volume_id = %volume_id, error = %e, "recovery task panicked"),
+            }
+        }
     }
 }
 
@@ -410,7 +536,7 @@ impl Node for NodeService {
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             // Snapshot existing devices, spawn the child, and discover the new
             // node under a global lock so concurrent publishes don't collide.
-            let (mut child, device) = {
+            let (mut child, device, device_mode) = {
                 let _guard = publish_lock.lock().unwrap();
 
                 // Build NBD listen address if NBD mode is enabled
@@ -436,13 +562,19 @@ impl Node for NodeService {
                     Default::default()
                 };
 
-                let mut child = mount::spawn_device(size, &env, nbd_listen.clone())?;
+                let mut child = mount::spawn_device(size, &env, nbd_listen.clone(), None, false)?;
 
-                let device = if let Some(listen_addr) = nbd_listen {
+                let (device, device_mode) = if let Some(listen_addr) = nbd_listen {
                     // NBD mode: wait for server and connect with nbd-client
                     info!(listen_addr = %listen_addr, "Calling wait_and_connect_nbd");
                     match mount::wait_and_connect_nbd(&listen_addr, &mut child, DEVICE_TIMEOUT) {
-                        Ok(dev) => dev,
+                        Ok(dev) => {
+                            let mode = state::DeviceMode::Nbd {
+                                device: dev.clone(),
+                                listen: listen_addr.clone(),
+                            };
+                            (dev, mode)
+                        }
                         Err(e) => {
                             mount::signal_pid(child.id(), libc::SIGINT);
                             let _ = child.wait();
@@ -453,7 +585,12 @@ impl Node for NodeService {
                     // ublk mode: wait for /dev/ublkbN to appear
                     info!("Calling wait_for_new_device for ublk");
                     match mount::wait_for_new_device(&ublk_before, &mut child, DEVICE_TIMEOUT) {
-                        Ok(dev) => dev,
+                        Ok(dev) => {
+                            let dev_id = mount::dev_id_from_path(&dev).ok_or_else(|| {
+                                anyhow::anyhow!("could not parse ublk device id from {dev}")
+                            })?;
+                            (dev, state::DeviceMode::Ublk { dev_id })
+                        }
                         Err(e) => {
                             mount::signal_pid(child.id(), libc::SIGINT);
                             let _ = child.wait();
@@ -462,7 +599,7 @@ impl Node for NodeService {
                     }
                 };
 
-                (child, device)
+                (child, device, device_mode)
             };
 
             // Make a filesystem only on a blank device, then mount.
@@ -514,6 +651,30 @@ impl Node for NodeService {
 
             // Keep the long-lived child's pipes drained so it can't block.
             mount::drain_child_output(&mut child);
+
+            // Persist a recoverable record of this volume *before* publishing it
+            // to the in-memory registry, so a node-local restart of the plugin
+            // (crash / OOM / DaemonSet upgrade) can re-attach to the still-live
+            // device. The full child env (incl. credentials) is recorded;
+            // securing the node-local state dir is the operator's responsibility.
+            let record = state::VolumeState {
+                volume_id: volume_id.clone(),
+                size,
+                target: target.clone(),
+                fs_type: fs_type.clone(),
+                mount_flags: mount_flags.clone(),
+                readonly,
+                device_mode,
+                overlay: overlay_dirs.clone(),
+                env: env.clone(),
+            };
+            if let Err(e) = state::save(&record) {
+                // A failed save means a restart couldn't recover this volume, but
+                // the volume itself is healthy — log and continue rather than
+                // failing the publish.
+                warn!(volume_id = %volume_id, error = %format!("{e:#}"), "failed to persist volume state for recovery");
+            }
+
             volumes.lock().unwrap().insert(
                 volume_id,
                 Published {
@@ -553,6 +714,12 @@ impl Node for NodeService {
         let published = self.volumes.lock().unwrap().remove(&req.volume_id);
         let target = req.target_path.clone();
         let volume_id = req.volume_id.clone();
+
+        // Drop the recovery record first: this is a deliberate teardown, so a
+        // future restart must not try to re-attach to a device we are stopping.
+        if let Err(e) = state::remove(&volume_id) {
+            warn!(%volume_id, error = %format!("{e:#}"), "failed to remove volume state file");
+        }
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             // Always attempt to unmount the requested target (idempotent). For an

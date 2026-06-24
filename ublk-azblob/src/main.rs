@@ -424,6 +424,14 @@ enum Command {
         /// (`--nr-queues`, `--queue-depth`, `--id`) are ignored in this mode.
         #[arg(long, env = "NBD_LISTEN")]
         nbd: Option<String>,
+
+        /// Re-attach to an existing, quiesced ublk device (user-recovery) at
+        /// `--id` instead of creating a new one. Used by the CSI node plugin to
+        /// resume a device after a node-local restart of this server (crash or
+        /// DaemonSet upgrade) without disrupting the kubelet's mount. Requires a
+        /// concrete `--id` (>= 0); ignored in NBD mode.
+        #[arg(long, env = "UBLK_RECOVER")]
+        recover: bool,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -620,6 +628,7 @@ async fn main() -> anyhow::Result<()> {
             flush_io_timeout_secs,
             flush_concurrency,
             ref nbd,
+            recover,
         } => {
             let loc = cli.location()?;
             let auth = build_auth(&cli, &loc.account, loc.sas.as_deref())?;
@@ -839,6 +848,7 @@ async fn main() -> anyhow::Result<()> {
                 queue_depth,
                 id,
                 read_only,
+                recover,
             };
             let result = if let Some(addr) = nbd {
                 info!(addr = %addr, "starting NBD compatibility server");

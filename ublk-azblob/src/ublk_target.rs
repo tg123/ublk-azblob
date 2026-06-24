@@ -42,6 +42,13 @@ pub struct UblkConfig {
     pub id: i32,
     /// Expose the device read-only (kernel rejects writes with `EROFS`).
     pub read_only: bool,
+    /// Re-attach to an existing, quiesced ublk device (user-recovery) instead of
+    /// creating a fresh one. Requires `id >= 0` (the device id to recover). Used
+    /// to make a node-local restart of the daemon non-disruptive: the kernel
+    /// keeps `/dev/ublkbN` alive while the old server is gone, and the new server
+    /// resumes serving I/O against the same device (so the existing mount and its
+    /// `major:minor` stay valid).
+    pub recover: bool,
 }
 
 impl Default for UblkConfig {
@@ -53,6 +60,7 @@ impl Default for UblkConfig {
             queue_depth: 64,
             id: -1,
             read_only: false,
+            recover: false,
         }
     }
 }
@@ -170,17 +178,45 @@ fn run_ublk_target_blocking(
         queue_depth = cfg.queue_depth,
         id = cfg.id,
         read_only = cfg.read_only,
+        recover = cfg.recover,
         "starting ublk target"
     );
 
+    if cfg.recover && cfg.id < 0 {
+        anyhow::bail!("recovery requires a concrete device id (got {})", cfg.id);
+    }
+
+    // Always advertise USER_RECOVERY (+ REISSUE) so that an abrupt death of this
+    // server process (crash, OOM, or a node-local DaemonSet upgrade that
+    // SIGKILLs the cgroup) leaves `/dev/ublkbN` quiesced in the kernel instead
+    // of being torn down. A freshly-started server can then re-attach to it with
+    // `UBLK_DEV_F_RECOVER_DEV` and resume I/O, keeping the existing mount valid.
+    // REISSUE re-queues in-flight I/Os to the new server rather than failing
+    // them, so the recovery is transparent to the filesystem above.
+    let ctrl_flags = (sys::UBLK_F_USER_RECOVERY | sys::UBLK_F_USER_RECOVERY_REISSUE) as u64;
+    let dev_flags = if cfg.recover {
+        UblkFlags::UBLK_DEV_F_RECOVER_DEV
+    } else {
+        UblkFlags::UBLK_DEV_F_ADD_DEV
+    };
     let ctrl = UblkCtrlBuilder::default()
         .name("azblob")
         .id(cfg.id)
         .nr_queues(cfg.nr_queues)
         .depth(cfg.queue_depth)
-        .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+        .dev_flags(dev_flags)
+        .ctrl_flags(ctrl_flags)
         .build()
         .context("build UblkCtrl (is ublk_drv loaded? do you have root?)")?;
+
+    // Recovery: ask the kernel to begin user-recovery for this quiesced device
+    // before we (re)build the queues. `run_target`'s `start_dev` then completes
+    // recovery (END_USER_RECOVERY) once the queues are re-registered.
+    if cfg.recover {
+        info!(id = cfg.id, "starting ublk user-recovery");
+        ctrl.start_user_recover()
+            .map_err(|e| anyhow::anyhow!("start ublk user-recovery for id {}: {e:?}", cfg.id))?;
+    }
 
     let dev_size = cfg.dev_size;
     let block_size = cfg.block_size;
