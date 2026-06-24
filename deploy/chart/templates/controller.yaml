@@ -62,9 +62,15 @@ spec:
             - "csi"
             - "--role=controller"
             - "--csi-endpoint=unix:///csi/csi.sock"
-          {{- with .Values.controller.env }}
+          {{- $ioEnv := include "ublk-azblob-csi.ioEnv" . | trim }}
+          {{- if or $ioEnv .Values.controller.env }}
           env:
+            {{- if $ioEnv }}
+            {{- $ioEnv | nindent 12 }}
+            {{- end }}
+            {{- with .Values.controller.env }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           volumeMounts:
             - name: socket-dir

@@ -87,6 +87,24 @@ A single image is shared by the controller and node plugins.
 | `image.tag` | Driver image tag | `latest` |
 | `image.pullPolicy` | Driver image pull policy | `IfNotPresent` |
 
+### Azure I/O Gateway
+
+Every Azure download (read) and upload (write / clear / copy) — on both the
+controller (bulk template copy) and the node plugin (foreground I/O + flush) —
+funnels through one gateway enforcing a shared concurrency budget, optional
+per-direction bandwidth ceilings, and priority scheduling (foreground read >
+flush > copy > warm-up). All values default to `0` (auto/unlimited); only
+non-zero values are passed to the binary, which otherwise auto-sizes the budget
+to the logical CPU count.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `io.concurrency` | Total concurrent Azure requests shared across both directions (`0` = auto/CPU count) | `0` |
+| `io.downloadConcurrency` | Per-direction ceiling on concurrent downloads (`0` = full shared budget) | `0` |
+| `io.uploadConcurrency` | Per-direction ceiling on concurrent uploads (`0` = full shared budget) | `0` |
+| `io.downloadBandwidth` | Download bandwidth ceiling in bytes/sec (`0` = unlimited) | `0` |
+| `io.uploadBandwidth` | Upload bandwidth ceiling in bytes/sec (`0` = unlimited) | `0` |
+
 ### Controller Configuration
 
 | Parameter | Description | Default |

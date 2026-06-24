@@ -17,6 +17,33 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+# Centralized Azure I/O gateway limits. Every Azure download (read) and upload
+# (write / clear / copy) funnels through one gateway that enforces a shared
+# concurrency budget, optional per-direction bandwidth ceilings, and priority
+# scheduling (foreground read > flush > copy > warm-up). These apply to both the
+# controller (bulk template copy) and the node plugin (foreground I/O + flush).
+# Every value below is 0 = auto/unlimited; only non-zero values are passed to the
+# binary, which otherwise auto-sizes the budget to the logical CPU count.
+io:
+  # Total concurrent Azure requests shared across both directions. Downloads and
+  # uploads draw from it dynamically (either can use the whole budget when the
+  # other is idle). 0 = auto (logical CPU count).
+  concurrency: 0
+
+  # Per-direction ceiling on concurrent downloads (reads). 0 = may use the full
+  # shared budget when uploads are idle.
+  downloadConcurrency: 0
+
+  # Per-direction ceiling on concurrent uploads (writes / clears / copies).
+  # 0 = may use the full shared budget when downloads are idle.
+  uploadConcurrency: 0
+
+  # Download (read) bandwidth ceiling in bytes/sec. 0 = unlimited.
+  downloadBandwidth: 0
+
+  # Upload (write / clear / copy) bandwidth ceiling in bytes/sec. 0 = unlimited.
+  uploadBandwidth: 0
+
 # Controller deployment configuration
 controller:
   replicas: 1

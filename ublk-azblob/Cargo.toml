@@ -30,6 +30,14 @@ async-trait = "0.1.89"
 # Stream combinators (bounded-concurrency template copy)
 futures = "0.3"
 
+# Centralized Azure I/O gateway (src/backend/io_gateway.rs):
+#   * leaky-bucket — byte-rate (bandwidth) limiter, one per direction.
+#   * async-priority-channel — priority work queue feeding the per-direction
+#     worker pools (provider/consumer), so foreground reads preempt warm-up and
+#     flushes preempt copies instead of starving each other.
+leaky-bucket = "1.1.2"
+async-priority-channel = "0.2.0"
+
 # Byte buffers
 bytes = "1.11.1"
 

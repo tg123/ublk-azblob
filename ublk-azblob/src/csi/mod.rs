@@ -486,46 +486,54 @@ async fn copy_blob_streamed(
     total_size: u64,
     source_data_ranges: Option<&[(u64, u64)]>,
 ) -> anyhow::Result<()> {
-    let chunk = crate::backend::copy_chunk_bytes();
-    let mut offset = 0u64;
-    let mut copied_bytes = 0u64;
-    let mut cleared_bytes = 0u64;
-    while offset < total_size {
-        let len = chunk.min(total_size - offset);
-        if let Some(ranges) = source_data_ranges {
-            if !crate::backend::range_intersects(ranges, offset, len) {
-                // Zero gap in the source: clear the destination range rather than
-                // copying zeros. This avoids the source read but still guarantees
-                // the destination reads back as zero there even when it is not a
-                // freshly-created blob (create() is idempotent and does not zero
-                // an existing same-size target, so a retry could otherwise retain
-                // stale data and corrupt the clone).
-                dest.clear(offset, len)
-                    .await
-                    .with_context(|| format!("clear copy offset={offset} len={len}"))?;
-                cleared_bytes += len;
-                offset += len;
-                continue;
+    use crate::backend::io_gateway::{with_class, IoClass};
+    // Tag both the source reads (downloads) and destination writes (uploads) as
+    // copy traffic so the I/O gateway prioritizes foreground reads and flushes
+    // ahead of this bulk copy.
+    with_class(IoClass::Copy, async move {
+        let chunk = crate::backend::copy_chunk_bytes();
+        let mut offset = 0u64;
+        let mut copied_bytes = 0u64;
+        let mut cleared_bytes = 0u64;
+        while offset < total_size {
+            let len = chunk.min(total_size - offset);
+            if let Some(ranges) = source_data_ranges {
+                if !crate::backend::range_intersects(ranges, offset, len) {
+                    // Zero gap in the source: clear the destination range rather
+                    // than copying zeros. This avoids the source read but still
+                    // guarantees the destination reads back as zero there even
+                    // when it is not a freshly-created blob (create() is
+                    // idempotent and does not zero an existing same-size target,
+                    // so a retry could otherwise retain stale data and corrupt
+                    // the clone).
+                    dest.clear(offset, len)
+                        .await
+                        .with_context(|| format!("clear copy offset={offset} len={len}"))?;
+                    cleared_bytes += len;
+                    offset += len;
+                    continue;
+                }
             }
+            let data = source
+                .read(offset, len)
+                .await
+                .with_context(|| format!("read template offset={offset} len={len}"))?;
+            dest.write(offset, data)
+                .await
+                .with_context(|| format!("write copy offset={offset} len={len}"))?;
+            copied_bytes += len;
+            offset += len;
         }
-        let data = source
-            .read(offset, len)
-            .await
-            .with_context(|| format!("read template offset={offset} len={len}"))?;
-        dest.write(offset, data)
-            .await
-            .with_context(|| format!("write copy offset={offset} len={len}"))?;
-        copied_bytes += len;
-        offset += len;
-    }
-    dest.flush().await.context("flush copied blob")?;
-    if source_data_ranges.is_some() {
-        info!(
-            copied_bytes,
-            cleared_bytes, total_size, "streamed copy cleared source zero ranges"
-        );
-    }
-    Ok(())
+        dest.flush().await.context("flush copied blob")?;
+        if source_data_ranges.is_some() {
+            info!(
+                copied_bytes,
+                cleared_bytes, total_size, "streamed copy cleared source zero ranges"
+            );
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Round `n` up to the next multiple of 512 (the page-blob alignment), with a

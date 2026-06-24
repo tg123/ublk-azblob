@@ -30,6 +30,7 @@
 use super::cache_budget::CacheBudget;
 use super::cache_index::CacheIndex;
 use super::cache_lru::Lru;
+use super::io_gateway::{with_class, IoClass};
 use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
@@ -725,9 +726,7 @@ impl FileCacheBackend {
         let data: Vec<u8> = match self.try_peer_page(page_idx, page_len)? {
             Some(buf) => buf,
             None => {
-                let d = self
-                    .inner
-                    .read(offset, page_len)
+                let d = with_class(IoClass::Warmup, self.inner.read(offset, page_len))
                     .await
                     .with_context(|| format!("warm-up read page {page_idx}"))?;
                 if d.len() as u64 != page_len {
@@ -1137,7 +1136,8 @@ impl BlobBackend for FileCacheBackend {
         let skipped = AtomicU64::new(0);
 
         // Fetch up to `conc` pages from the blob at once (each `warm_one_page`
-        // does its blob read with no state lock held), turning warm-up from a
+        // does its blob read with no state lock held, tagged `Warmup` so the I/O
+        // gateway lets foreground reads preempt it), turning warm-up from a
         // latency-bound serial scan into a bandwidth-bound parallel one.
         stream::iter(0..n_pages)
             .for_each_concurrent(conc, |page_idx| {
@@ -1259,9 +1259,13 @@ impl BlobBackend for FileCacheBackend {
                 dirty_pages = dirty.len(),
                 "flushing dirty cache pages to inner backend"
             );
-            for page_idx in dirty {
-                self.flush_page(&mut state, page_idx).await?;
-            }
+            with_class(IoClass::Flush, async {
+                for page_idx in dirty {
+                    self.flush_page(&mut state, page_idx).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
         }
 
         // Propagate to the inner backend in case it buffers too.
