@@ -26,7 +26,7 @@
 //! plain `cargo test` run) it skips cleanly instead of failing.
 //!
 //! A second test, [`nbd_read_only`](fn.nbd_read_only.html), exercises
-//! `run --snapshot`: it snapshots the blob, asserts the export advertises `NBD_FLAG_READ_ONLY`,
+//! read-only via `?snapshot=`: it snapshots the blob, asserts the export advertises `NBD_FLAG_READ_ONLY`,
 //! reads succeed, and writes / trims / write-zeroes are rejected with `EPERM`
 //! without mutating the backing blob.
 //!
@@ -52,12 +52,11 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-/// Azurite well-known development account name.
-const DEFAULT_ACCOUNT: &str = "devstoreaccount1";
 /// Azurite well-known development account key.
 const DEFAULT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000/devstoreaccount1";
+const DEFAULT_ACCOUNT: &str = "devstoreaccount1";
 const DEFAULT_CONTAINER: &str = "e2etest";
 const DEFAULT_BLOB: &str = "nbdtest";
 
@@ -72,6 +71,8 @@ const NBD_ADDR_READ_ONLY: &str = "127.0.0.1:11810";
 /// Host:port for the `nbd_template_copy` test (distinct so it can run in
 /// parallel with the others).
 const NBD_ADDR_TEMPLATE: &str = "127.0.0.1:11811";
+/// Host:port for the `nbd_template_copy_skips_zero` test.
+const NBD_ADDR_TEMPLATE_SPARSE: &str = "127.0.0.1:11815";
 /// Host:port for the `nbd_graceful_shutdown_flush` test (distinct so it can run
 /// in parallel with the others).
 const NBD_ADDR_SHUTDOWN: &str = "127.0.0.1:11812";
@@ -155,21 +156,24 @@ fn azurite_available() -> bool {
 }
 
 /// Common Azure environment passed to the `ublk-azblob` child process.
-fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
+///
+/// The account, container and blob are collapsed into a single
+/// `UBLK_BLOB_URL` (Azurite path-style, so the account is the first
+/// path segment of the URL); only the SharedKey is passed separately.
+fn azure_env(cmd: &mut Command, container: &str, blob: &str, snapshot: Option<&str>) {
+    let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
+    let mut blob_url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), container, blob);
+    if let Some(s) = snapshot {
+        // A snapshot is selected via the URL's `?snapshot=` query (the only way
+        // a device is exposed read-only); there is no separate snapshot flag/env.
+        blob_url.push_str("?snapshot=");
+        blob_url.push_str(s);
+    }
     cmd.env(
-        "AZURE_STORAGE_ACCOUNT",
-        env_or("AZURE_STORAGE_ACCOUNT", DEFAULT_ACCOUNT),
-    )
-    .env(
         "AZURE_STORAGE_KEY",
         env_or("AZURE_STORAGE_KEY", DEFAULT_KEY),
     )
-    .env(
-        "AZURE_STORAGE_ENDPOINT",
-        env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT),
-    )
-    .env("AZURE_STORAGE_CONTAINER", container)
-    .env("AZURE_STORAGE_BLOB", blob);
+    .env("UBLK_BLOB_URL", blob_url);
 }
 
 /// Start the NBD server as a child process and wait until it accepts a TCP
@@ -228,7 +232,7 @@ fn create_snapshot(container: &str, blob: &str) -> String {
 }
 
 /// Like [`start_server`] but lets the caller bring the export up against a blob
-/// `snapshot` (`run --snapshot <id>`), which exposes it read-only, and/or
+/// `snapshot` (via `?snapshot=` in the blob URL), which exposes it read-only, and/or
 /// disable automatic flushing.  `create` and a snapshot are mutually exclusive
 /// (a snapshot is immutable), so callers pass `create=false` when supplying a
 /// snapshot.  When `disable_auto_flush` is set the server runs with
@@ -248,7 +252,7 @@ fn start_server_opts(
         "starting NBD server on {addr} ({}{})",
         if create { "--create" } else { "reuse blob" },
         match snapshot {
-            Some(s) => format!(", --snapshot {s}"),
+            Some(s) => format!(", snapshot={s}"),
             None => String::new(),
         }
     ));
@@ -265,19 +269,13 @@ fn start_server_opts(
     if create {
         cmd.arg("--create");
     }
-    if let Some(s) = snapshot {
-        // `--snapshot` is a top-level option (parsed before the subcommand), so
-        // pass it via its env var — like account/container/blob — rather than as
-        // a `run` argument, where clap would reject it.
-        cmd.env("AZURE_STORAGE_SNAPSHOT", s);
-    }
     if disable_auto_flush {
         cmd.arg("--idle-flush-secs")
             .arg("0")
             .arg("--force-flush-timeout-secs")
             .arg("0");
     }
-    azure_env(&mut cmd, container, blob);
+    azure_env(&mut cmd, container, blob, snapshot);
 
     let mut child = cmd.spawn().expect("failed to spawn ublk-azblob");
 
@@ -619,7 +617,7 @@ fn nbd_roundtrip() {
     log("nbd e2e PASSED ✓");
 }
 
-/// e2e for read-only mode (`run --snapshot`) over the NBD path.
+/// e2e for read-only mode (read-only via `?snapshot=`) over the NBD path.
 ///
 /// Cycle:
 ///   1. provision the blob writable, write a few random regions, flush, stop
@@ -842,6 +840,113 @@ fn nbd_template_copy() {
     log("nbd template copy e2e PASSED ✓");
 }
 
+/// e2e proving the `templateBlobUrl` copy skips the source's zero ranges
+/// (server-to-server / streamed copy benefits from sparseness) while the copied
+/// data still verifies.
+///
+/// Cycle:
+///   1. provision a *sparse* template blob — write a few small regions far
+///      apart so the bulk of the device stays zero/unwritten, flush, stop
+///   2. run `ublk-azblob copy` and capture its logs; assert the copy consulted
+///      the source sparseness map and cleared more zero bytes than it copied
+///   3. mount the target read-write and assert every written region's checksum
+///      matches, and that a zero gap reads back as all zeros
+#[test]
+fn nbd_template_copy_skips_zero() {
+    if !azurite_available() {
+        eprintln!(
+            "skipping nbd_template_copy_skips_zero: Azurite is not reachable at {} \
+             (set AZURE_STORAGE_ENDPOINT and start Azurite to run this test)",
+            endpoint_authority()
+        );
+        return;
+    }
+    assert!(
+        TcpStream::connect(NBD_ADDR_TEMPLATE_SPARSE).is_err(),
+        "{NBD_ADDR_TEMPLATE_SPARSE} is already in use; another NBD server is running"
+    );
+
+    let container = env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER);
+    let template_blob = format!("{}-sparse-src", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB));
+    let target_blob = format!("{}-sparse-dst", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB));
+
+    // ── Phase 1: build a sparse golden-image template ─────────────────────────
+    // A few small regions far apart leave the bulk of the 64 MiB device zero.
+    const REGION_LEN: usize = 64 * 1024; // 64 KiB (multiple of BLOCK_SIZE)
+    let region_offsets: [u64; 3] = [0, 24 * 1024 * 1024, 48 * 1024 * 1024];
+    let child = start_server(NBD_ADDR_TEMPLATE_SPARSE, &container, &template_blob, true);
+    let mut client = NbdClient::connect(NBD_ADDR_TEMPLATE_SPARSE);
+    log("writing sparse regions to the template");
+    let mut checksums: Vec<(u64, String)> = Vec::with_capacity(region_offsets.len());
+    for &offset in &region_offsets {
+        let data = random_bytes(REGION_LEN);
+        client.write_at(offset, &data);
+        checksums.push((offset, sha256_hex(&data)));
+    }
+    client.flush();
+    client.disconnect();
+    sleep(Duration::from_secs(1));
+    stop_server(child);
+    wait_for_port_release(NBD_ADDR_TEMPLATE_SPARSE);
+
+    // ── Phase 2: copy and assert zero ranges were cleared ─────────────────────
+    let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
+    let template_url = format!(
+        "{}/{}/{}",
+        endpoint.trim_end_matches('/'),
+        container,
+        template_blob
+    );
+    let logs = run_copy(&template_url, &container, &target_blob);
+    assert!(
+        logs.contains("cleared source zero ranges"),
+        "copy did not clear source zero ranges; logs:\n{logs}"
+    );
+    let copied = parse_log_field(&logs, "copied_bytes");
+    let cleared = parse_log_field(&logs, "cleared_bytes");
+    log(&format!(
+        "copy copied {copied} bytes, cleared {cleared} bytes"
+    ));
+    assert!(
+        cleared > 0,
+        "expected the copy to clear zero ranges, cleared 0"
+    );
+    assert!(
+        copied < BLOB_SIZE,
+        "copy copied the whole device ({copied}); zero ranges were not cleared"
+    );
+    assert!(
+        cleared > copied,
+        "expected the sparse copy to clear more zero bytes ({cleared}) than it \
+         copied ({copied})"
+    );
+
+    // ── Phase 3: open the target and verify the copy round-tripped ────────────
+    let child = start_server(NBD_ADDR_TEMPLATE_SPARSE, &container, &target_blob, false);
+    let mut client = NbdClient::connect(NBD_ADDR_TEMPLATE_SPARSE);
+    log("verifying the copied target matches the sparse template");
+    for (offset, expected) in &checksums {
+        let got = client.read_at(*offset, REGION_LEN as u32);
+        assert_eq!(
+            &sha256_hex(&got),
+            expected,
+            "copied target differs from template at offset {offset}"
+        );
+    }
+    // A region that lay entirely in a cleared zero gap must read back as zeros.
+    let gap_offset = 12 * 1024 * 1024;
+    let gap = client.read_at(gap_offset, REGION_LEN as u32);
+    assert!(
+        gap.iter().all(|&b| b == 0),
+        "zero gap at offset {gap_offset} is not all zeros after copy"
+    );
+    client.disconnect();
+    sleep(Duration::from_secs(1));
+    stop_server(child);
+
+    log("nbd template copy skip-zero e2e PASSED ✓");
+}
+
 /// Wait for `addr` to be released so the next server can bind it.
 fn wait_for_port_release(addr: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -851,16 +956,45 @@ fn wait_for_port_release(addr: &str) {
 }
 
 /// Run the one-shot `ublk-azblob copy --template-url <url>` subcommand, copying
-/// the template into the target `container`/`blob`. Panics on failure.
-fn run_copy(template_url: &str, container: &str, target_blob: &str) {
+/// the template into the target `container`/`blob`. Panics on failure. Returns
+/// the captured stdout (where `tracing` logs go) so a test can assert on the
+/// copy's log output (e.g. that it cleared the source's zero ranges).
+fn run_copy(template_url: &str, container: &str, target_blob: &str) -> String {
     let bin = std::env::var("UBLK_AZBLOB_BIN")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
     let mut cmd = Command::new(&bin);
     cmd.arg("copy").arg("--template-url").arg(template_url);
-    azure_env(&mut cmd, container, target_blob);
+    azure_env(&mut cmd, container, target_blob, None);
     log(&format!("$ ublk-azblob copy --template-url {template_url}"));
-    let status = cmd.status().expect("spawn ublk-azblob copy");
-    assert!(status.success(), "`ublk-azblob copy` failed with {status}");
+    let out = cmd.output().expect("spawn ublk-azblob copy");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stdout.is_empty() {
+        log(&format!("copy stdout:\n{stdout}"));
+    }
+    if !stderr.is_empty() {
+        log(&format!("copy stderr:\n{stderr}"));
+    }
+    assert!(
+        out.status.success(),
+        "`ublk-azblob copy` failed with {}",
+        out.status
+    );
+    stdout
+}
+
+/// Parse the integer value of a `key=NNN` field out of a captured log line.
+fn parse_log_field(logs: &str, key: &str) -> u64 {
+    let needle = format!("{key}=");
+    logs.split(&needle)
+        .nth(1)
+        .and_then(|rest| {
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end].parse::<u64>().ok()
+        })
+        .unwrap_or_else(|| panic!("log field `{key}` not found in:\n{logs}"))
 }
 
 /// Graceful-shutdown e2e for the NBD target: prove a write buffered only in
@@ -974,7 +1108,7 @@ fn expect_blob_lock_conflict(addr: &str, container: &str, blob: &str) -> String 
         .arg("--nbd")
         .arg(addr)
         .stderr(Stdio::piped());
-    azure_env(&mut cmd, container, blob);
+    azure_env(&mut cmd, container, blob, None);
 
     let mut child = cmd.spawn().expect("failed to spawn ublk-azblob");
     let mut stderr_pipe = child.stderr.take().expect("piped stderr");

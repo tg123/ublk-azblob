@@ -30,6 +30,14 @@ async-trait = "0.1.89"
 # Stream combinators (bounded-concurrency template copy)
 futures = "0.3"
 
+# Centralized Azure I/O gateway (src/backend/io_gateway.rs):
+#   * leaky-bucket — byte-rate (bandwidth) limiter, one per direction.
+#   * async-priority-channel — priority work queue feeding the per-direction
+#     worker pools (provider/consumer), so foreground reads preempt warm-up and
+#     flushes preempt copies instead of starving each other.
+leaky-bucket = "1.1.2"
+async-priority-channel = "0.2.0"
+
 # Byte buffers
 bytes = "1.11.1"
 
@@ -96,6 +104,10 @@ default = ["ublk", "csi"]
 # On by default; opt out with `--no-default-features`.  `libc` is a base
 # dependency (also used by the local-disk cache), so it is not listed here.
 ublk = ["dep:libublk"]
+
+# Enable the `bench` subcommand (backend throughput/IOPS/latency benchmark).
+# Off by default so the benchmark code is not shipped in the release binary.
+bench = []
 
 # Enable cluster coordination (Kubernetes coordination.k8s.io Lease + Azure blob
 # lease) so that at most one node mounts a given page blob at a time.  The Azure

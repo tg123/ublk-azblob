@@ -29,7 +29,7 @@
 //! ```
 //!
 //! A second test, [`mount_read_only`](fn.mount_read_only.html), exercises
-//! `run --snapshot`: it snapshots the blob, asserts the kernel marks `/dev/ublkbN` read-only,
+//! read-only via `?snapshot=`: it snapshots the blob, asserts the kernel marks `/dev/ublkbN` read-only,
 //! verifies the data is still readable, and confirms a write to the read-only
 //! mount fails without mutating the backing blob.
 //!
@@ -46,19 +46,18 @@ use std::process::{Child, Command};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-/// Azurite well-known development account name.
-const DEFAULT_ACCOUNT: &str = "devstoreaccount1";
 /// Azurite well-known development account key.
 const DEFAULT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000/devstoreaccount1";
+const DEFAULT_ACCOUNT: &str = "devstoreaccount1";
 const DEFAULT_CONTAINER: &str = "e2etest";
 const DEFAULT_BLOB: &str = "mounttest";
 
 // High device id (away from 0,1,…) so these tests don't collide with the ublk
 // devices the k8s CSI e2e auto-assigns from 0 when the whole suite runs together.
 const DEV_ID: &str = "40";
-const BLOB_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
+const BLOB_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB (xfs needs ~300 MiB minimum)
 const NUM_FILES: usize = 8;
 
 /// Parameters identifying a single device instance for a test run.
@@ -79,6 +78,14 @@ struct DeviceSpec {
     /// that can persist a buffered write is an explicit flush or the
     /// flush-on-shutdown path. Used by the graceful-shutdown test.
     disable_auto_flush: bool,
+    /// When true the device is started with `--cache-warmup`, prefetching the
+    /// backing blob into the local-disk cache on boot. Only meaningful when
+    /// `cache_dir` is `Some`. Used by the sparse-image warm-up test.
+    cache_warmup: bool,
+    /// When `Some`, the child's stdout (where `tracing` logs go) is redirected
+    /// to this file so a test can assert on log output (e.g. that warm-up used
+    /// the blob sparseness map). `None` inherits the parent's stdout.
+    log_path: Option<PathBuf>,
 }
 
 impl DeviceSpec {
@@ -101,6 +108,18 @@ fn ublk_available() -> bool {
     // SAFETY: `geteuid` has no preconditions and never fails.
     let is_root = unsafe { libc::geteuid() } == 0;
     is_root && Path::new("/dev/ublk-control").exists()
+}
+
+/// Whether a command-line tool is available (probed with `-V`, like the CSI
+/// node plugin's `mkfs.<fs>` tools).
+fn have_tool(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("-V")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Run a command to completion and panic if it fails.
@@ -131,21 +150,24 @@ fn run_fsck(args: &[&str]) {
 }
 
 /// Common Azure environment passed to the `ublk-azblob` child process.
-fn azure_env(cmd: &mut Command, container: &str, blob: &str) {
+///
+/// The account, container and blob are collapsed into a single
+/// `UBLK_BLOB_URL` (Azurite path-style, so the account is the first
+/// path segment of the URL); only the SharedKey is passed separately.
+fn azure_env(cmd: &mut Command, container: &str, blob: &str, snapshot: Option<&str>) {
+    let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
+    let mut blob_url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), container, blob);
+    if let Some(s) = snapshot {
+        // A snapshot is selected via the URL's `?snapshot=` query (the only way
+        // a device is exposed read-only); there is no separate snapshot flag/env.
+        blob_url.push_str("?snapshot=");
+        blob_url.push_str(s);
+    }
     cmd.env(
-        "AZURE_STORAGE_ACCOUNT",
-        env_or("AZURE_STORAGE_ACCOUNT", DEFAULT_ACCOUNT),
-    )
-    .env(
         "AZURE_STORAGE_KEY",
         env_or("AZURE_STORAGE_KEY", DEFAULT_KEY),
     )
-    .env(
-        "AZURE_STORAGE_ENDPOINT",
-        env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT),
-    )
-    .env("AZURE_STORAGE_CONTAINER", container)
-    .env("AZURE_STORAGE_BLOB", blob);
+    .env("UBLK_BLOB_URL", blob_url);
 }
 
 /// Start the ublk device as a child process and wait for `/dev/ublkbN` to
@@ -201,7 +223,7 @@ fn create_snapshot(spec: &DeviceSpec) -> String {
 }
 
 /// Like [`start_device`] but lets the caller bring the device up against a blob
-/// `snapshot` (`run --snapshot <id>`), which exposes it read-only.  `create` and
+/// `snapshot` (via `?snapshot=` in the blob URL), which exposes it read-only.  `create` and
 /// a snapshot are mutually exclusive (a snapshot is immutable), so callers pass
 /// `create=false` when supplying a snapshot.
 #[allow(clippy::zombie_processes)]
@@ -215,7 +237,7 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
             "reuse existing blob"
         },
         match snapshot {
-            Some(s) => format!(", --snapshot {s}"),
+            Some(s) => format!(", snapshot={s}"),
             None => String::new(),
         },
         match &spec.cache_dir {
@@ -236,17 +258,14 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
     if create {
         cmd.arg("--create");
     }
-    if let Some(s) = snapshot {
-        // `--snapshot` is a top-level option (parsed before the subcommand), so
-        // pass it via its env var — like account/container/blob — rather than as
-        // a `run` argument, where clap would reject it.
-        cmd.env("AZURE_STORAGE_SNAPSHOT", s);
-    }
     if let Some(dir) = &spec.cache_dir {
         cmd.arg("--cache-dir").arg(dir);
         if spec.cache_max_bytes > 0 {
             cmd.arg("--cache-max-bytes")
                 .arg(spec.cache_max_bytes.to_string());
+        }
+        if spec.cache_warmup {
+            cmd.arg("--cache-warmup");
         }
     }
     if spec.disable_auto_flush {
@@ -257,7 +276,14 @@ fn start_device_opts(spec: &DeviceSpec, create: bool, snapshot: Option<&str>) ->
             .arg("--force-flush-timeout-secs")
             .arg("0");
     }
-    azure_env(&mut cmd, &spec.container, &spec.blob);
+    azure_env(&mut cmd, &spec.container, &spec.blob, snapshot);
+
+    if let Some(path) = &spec.log_path {
+        let file =
+            fs::File::create(path).unwrap_or_else(|e| panic!("create log file {path:?}: {e}"));
+        // tracing-subscriber writes to stdout by default; capture that.
+        cmd.stdout(std::process::Stdio::from(file));
+    }
 
     let mut child = cmd.spawn().expect("failed to spawn ublk-azblob");
 
@@ -339,6 +365,37 @@ fn write_random_file(path: &Path, len: usize) {
     fs::write(path, &data).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
 }
 
+/// Extract the value of a `tracing` field rendered as `name=<u64>` from captured
+/// log text, returning the value on the first matching line.
+fn parse_log_field(logs: &str, name: &str) -> u64 {
+    let needle = format!("{name}=");
+    for line in logs.lines() {
+        if let Some(idx) = line.find(&needle) {
+            let rest = &line[idx + needle.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<u64>() {
+                return v;
+            }
+        }
+    }
+    panic!("field `{name}` not found in logs:\n{logs}");
+}
+
+/// Poll `path` until it contains `needle` or `timeout` elapses; returns whether
+/// the needle appeared. Used to wait for the background warm-up to finish.
+fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(s) = fs::read_to_string(path) {
+            if s.contains(needle) {
+                return true;
+            }
+        }
+        sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 /// Create a unique temporary directory under the system temp dir.
 fn tempdir(prefix: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -367,6 +424,8 @@ fn mount_roundtrip() {
         cache_dir: None,
         cache_max_bytes: 0,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     });
 }
 
@@ -398,6 +457,8 @@ fn mount_roundtrip_file_cache() {
         cache_dir: Some(cache_dir.clone()),
         cache_max_bytes: 0,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     });
     let _ = fs::remove_dir_all(&cache_dir);
 }
@@ -434,8 +495,206 @@ fn mount_roundtrip_file_cache_budget() {
         // file across NUM_FILES files), so eviction is exercised.
         cache_max_bytes: 8 * 1024 * 1024,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     });
     let _ = fs::remove_dir_all(&cache_dir);
+}
+
+/// e2e for sparseness-aware cache warm-up (`--cache-warmup`) over a disk image
+/// with large zero regions.
+///
+/// A 256 MiB page blob holds an ext4 filesystem that uses only a few MiB, so the
+/// backing blob is mostly unwritten (zero). On the second boot, warm-up must
+/// consult the blob's page-range map and *skip* those large zero gaps instead of
+/// downloading the whole device, yet every file must still read back correctly
+/// (zero pages serve as holes). The warm-up's own log output is captured and
+/// asserted on to prove the sparseness path actually ran.
+#[test]
+fn mount_warmup_sparse_image() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_warmup_sparse_image: requires root and a loaded \
+             ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    let cache_dir = tempdir("ublk-azblob-cache-warmup");
+    let mut spec = DeviceSpec {
+        // 48 avoids mount_fsck's device 45, the other tests' ids (40–44), and
+        // the 46/47 reserved by PR #21's mount_formattable_fs_profiles test.
+        dev_id: "48".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-warmup", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: Some(cache_dir.clone()),
+        cache_max_bytes: 0,
+        disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
+    };
+
+    let dev = spec.dev_path();
+    let mnt = tempdir("ublk-azblob-mnt");
+
+    // ── Phase 1: provision, make a small ext4, write a few small files ─────────
+    // Only a few MiB of the 256 MiB device are touched, so the page blob ends up
+    // with large zero gaps that warm-up should later skip.
+    let child = start_device(&spec, true);
+    log(&format!("mkfs.ext4 on {dev}"));
+    run("mkfs.ext4", &["-q", "-F", "-E", "nodiscard", &dev]);
+    log(&format!("mounting {dev} at {}", mnt.display()));
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+
+    log("writing a few small files (leaving large zero regions on the device)");
+    let mut checksums: Vec<(String, String)> = Vec::with_capacity(NUM_FILES);
+    for i in 1..=NUM_FILES {
+        let name = format!("sparse_{i}.bin");
+        let path = mnt.join(&name);
+        // Small files (≤256 KiB) so the bulk of the 256 MiB device stays zero.
+        let len = 1024 * (1 + (i * 31) % 256);
+        write_random_file(&path, len);
+        checksums.push((name, sha256_file(&path)));
+    }
+
+    log("sync + SIGUSR1 to force flush to the page blob");
+    run("sync", &[]);
+    signal(&child, libc::SIGUSR1);
+    sleep(Duration::from_secs(2));
+
+    log(&format!("unmounting {}", mnt.display()));
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // ── Phase 2: remount with a FRESH cache + warm-up, capturing the logs ──────
+    fs::remove_dir_all(&cache_dir).unwrap_or_else(|e| panic!("clear cache dir {cache_dir:?}: {e}"));
+    let log_dir = tempdir("ublk-azblob-warmup-log");
+    let log_path = log_dir.join("warmup.log");
+    spec.cache_warmup = true;
+    spec.log_path = Some(log_path.clone());
+    let child = start_device(&spec, false);
+
+    log(&format!("remounting {dev} at {}", mnt.display()));
+    run("mount", &[&dev, mnt.to_str().unwrap()]);
+
+    log("waiting for the background warm-up to complete");
+    assert!(
+        wait_for_log(&log_path, "cache warm-up complete", Duration::from_secs(60)),
+        "warm-up did not complete within 60s; logs:\n{}",
+        fs::read_to_string(&log_path).unwrap_or_default()
+    );
+
+    log("verifying checksums after warm-up remount");
+    for (name, expected) in &checksums {
+        let path = mnt.join(name);
+        let actual = sha256_file(&path);
+        assert_eq!(
+            &actual, expected,
+            "checksum mismatch for {name} after warm-up remount"
+        );
+        println!("{name}: OK");
+    }
+
+    log(&format!("unmounting {}", mnt.display()));
+    run("umount", &[mnt.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // The warm-up must have consulted the blob sparseness map and skipped the
+    // large zero regions rather than downloading the whole 256 MiB device.
+    let logs = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("read warm-up log {log_path:?}: {e}"));
+    assert!(
+        logs.contains("warm-up using blob sparseness map"),
+        "warm-up did not use the blob sparseness map; logs:\n{logs}"
+    );
+    let skipped = parse_log_field(&logs, "skipped_bytes");
+    let warmed = parse_log_field(&logs, "warmed_bytes");
+    log(&format!(
+        "warm-up skipped {skipped} bytes, warmed {warmed} bytes"
+    ));
+    assert!(
+        skipped > warmed,
+        "expected warm-up to skip more zero bytes ({skipped}) than it warmed \
+         ({warmed}) on a mostly-empty device; logs:\n{logs}"
+    );
+
+    let _ = fs::remove_dir_all(&mnt);
+    let _ = fs::remove_dir_all(&cache_dir);
+    let _ = fs::remove_dir_all(&log_dir);
+    log("warm-up sparse-image e2e PASSED ✓");
+}
+
+/// e2e: the *formattable* precooked filesystem profiles beyond the default
+/// ext4 — `xfs` and `btrfs` — actually `mkfs` and mount on a **real ublk
+/// device** and keep data across an unmount/remount. Skips a filesystem whose
+/// `mkfs.<fs>` tool is not installed.
+///
+/// (ext4 is already exercised end-to-end by `mount_roundtrip`. The negative
+/// "format not supported" path for the mount-only profiles squashfs/zfs/ntfs is
+/// covered by the `csi::mount` `mkfs_rejects_unformattable_filesystems` unit
+/// test, which needs neither root nor any tool and runs in CI's non-root
+/// `cargo test` job.)
+#[test]
+fn mount_formattable_fs_profiles() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_formattable_fs_profiles: requires root and a loaded \
+             ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+
+    // (fs_type, mkfs flags matching `csi::mount::fs_profile`, dev_id). High
+    // device ids avoid colliding with the other mount_e2e tests (40-45) and the
+    // k8s CSI e2e's low auto-assigned ids.
+    let cases: &[(&str, &[&str], &str)] = &[("xfs", &["-f"], "46"), ("btrfs", &["-f"], "47")];
+
+    for &(fs, mkfs_flags, dev_id) in cases {
+        if !have_tool(&format!("mkfs.{fs}")) {
+            eprintln!("skipping {fs}: mkfs.{fs} not installed");
+            continue;
+        }
+
+        let spec = DeviceSpec {
+            dev_id: dev_id.to_string(),
+            container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+            blob: format!("{}-{fs}", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+            cache_dir: None,
+            cache_max_bytes: 0,
+            disable_auto_flush: false,
+            cache_warmup: false,
+            log_path: None,
+        };
+        let dev = spec.dev_path();
+        let mnt = tempdir(&format!("ublk-azblob-{fs}"));
+        let mnt_str = mnt.to_str().unwrap().to_string();
+
+        // Provision the device and format it with the profile's mkfs flags.
+        let child = start_device(&spec, true);
+        log(&format!("mkfs.{fs} on {dev}"));
+        let mut args: Vec<&str> = mkfs_flags.to_vec();
+        args.push(&dev);
+        run(&format!("mkfs.{fs}"), &args);
+
+        // Mount, write a file, capture its checksum.
+        log(&format!("mounting {fs} {dev} at {mnt_str}"));
+        run("mount", &["-t", fs, &dev, &mnt_str]);
+        let probe = mnt.join("probe.bin");
+        write_random_file(&probe, 256 * 1024);
+        let expected = sha256_file(&probe);
+
+        // Unmount and remount the same device to prove the data is durable on
+        // the (ublk-backed) block device, then verify the checksum.
+        run("umount", &[&mnt_str]);
+        run("mount", &["-t", fs, &dev, &mnt_str]);
+        let actual = sha256_file(&probe);
+        assert_eq!(expected, actual, "{fs} round-trip mismatch after remount");
+
+        run("umount", &[&mnt_str]);
+        stop_device(&dev, child);
+        let _ = fs::remove_dir_all(&mnt);
+        log(&format!("{fs}: format + mount + remount round-trip OK"));
+    }
 }
 
 /// Drive a full mount/write/flush/remount/verify cycle for the given device.
@@ -508,7 +767,7 @@ fn run_mount_roundtrip(spec: DeviceSpec) {
     log("mount e2e PASSED ✓");
 }
 
-/// e2e for read-only mode (`run --snapshot`) over the kernel ublk path.
+/// e2e for read-only mode (read-only via `?snapshot=`) over the kernel ublk path.
 ///
 /// Cycle:
 ///   1. provision the device writable, make an ext4 filesystem, write random
@@ -540,6 +799,8 @@ fn mount_read_only() {
         cache_dir: None,
         cache_max_bytes: 0,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     };
     let dev = spec.dev_path();
     let mnt = tempdir("ublk-azblob-ro-mnt");
@@ -663,6 +924,8 @@ fn graceful_shutdown_flush() {
         cache_max_bytes: 0,
         // The whole point: only the shutdown flush may persist the write.
         disable_auto_flush: true,
+        cache_warmup: false,
+        log_path: None,
     };
     let dev = spec.dev_path();
     let work = tempdir("ublk-azblob-shutdown");
@@ -763,6 +1026,8 @@ fn mount_fsck() {
         cache_dir: None,
         cache_max_bytes: 0,
         disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
     };
     let dev = spec.dev_path();
     let mnt = tempdir("ublk-azblob-fsck-mnt");

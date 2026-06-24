@@ -51,40 +51,56 @@ docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
 
 # Run the built-in smoke test (create → write → read-back → clear → zero-verify)
 cargo run -p ublk-azblob -- \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob \
   test --size 4096
 ```
+
+### Benchmark the backend (throughput / IOPS / latency)
+
+```bash
+# Provision a 64 MiB blob and run all four phases (seq write/read, rand write/read)
+cargo run --release --features bench -p ublk-azblob -- \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/mybench \
+  --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
+  bench --create
+```
+
+The `bench` subcommand (gated behind the off-by-default `bench` feature so it is
+not shipped in the release binary) issues a fixed number of fixed-size
+operations against the `BlobBackend` using a configurable number of concurrent
+workers (mirroring a ublk queue depth) and reports throughput (MiB/s), IOPS, and
+latency percentiles (min / avg / p50 / p95 / p99 / max) per phase. It runs
+against Azurite, real Azure, or the in-memory backend used in tests.
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--size` | `67108864` (64 MiB) | Benchmark blob size (multiple of 512) |
+| `--block-size` | `4096` | I/O size per operation (multiple of 512) |
+| `--count` | `1024` | Operations issued per phase |
+| `--concurrency` | `16` | Concurrent in-flight operations (queue depth) |
+| `--workload` | `all` | `seq`, `rand`, or `all` |
+| `--create` | _off_ | Provision/overwrite the blob before benchmarking |
 
 ### Run as a block device (requires root + ublk_drv; ublk is built in by default)
 
 ```bash
 # System-assigned Managed Identity (recommended on Azure VMs / AKS)
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240
 
 # User-assigned Managed Identity by client ID
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi-client-id 00000000-0000-0000-0000-000000000000 \
   run --size 10737418240
 
 # Account key (local dev / Azurite)
 sudo ./target/release/ublk-azblob \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob.vhd \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob.vhd \
   run --size 4194304
 ```
 
@@ -100,25 +116,22 @@ sudo mount /dev/ublkb0 /mnt/azblob
 ## Read-only mode and blob snapshots
 
 A device is exposed **read-only** by mounting an immutable **point-in-time
-snapshot** of the blob: pass `--snapshot <SNAPSHOT>` (the `x-ms-snapshot`
-timestamp returned when the snapshot was created). There is no separate
-read-only flag — a snapshot is immutable, so the ublk device (or NBD export) is
-advertised read-only and every write, discard, and write-zeroes request is
-rejected, and (because the content can never change) the local cache is safe to
-reuse.
+snapshot** of the blob: append `?snapshot=<SNAPSHOT>` (the `x-ms-snapshot`
+timestamp returned when the snapshot was created) to `--blob-url`. There is no
+separate read-only flag — a snapshot is immutable, so the ublk device (or NBD
+export) is advertised read-only and every write, discard, and write-zeroes
+request is rejected, and (because the content can never change) the local cache
+is safe to reuse.
 
 ```bash
-# Mount a specific blob snapshot (read-only)
+# Mount a specific blob snapshot (read-only is implied)
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
-  --snapshot 2024-01-31T12:00:00.0000000Z \
+  --blob-url "https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd?snapshot=2024-01-31T12:00:00.0000000Z" \
   --msi \
   run --size 10737418240
 ```
 
-`--create` cannot be combined with `--snapshot` (a snapshot is immutable). A
+`--create` cannot be combined with a snapshot URL (a snapshot is immutable). A
 snapshot mount skips the write-back buffer entirely (there are no writes to
 batch); read caching via `--cache-dir` still works.
 
@@ -136,9 +149,7 @@ lapses within ≤60s).
 ```bash
 # Default: the blob lock is acquired automatically — no extra flag needed.
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240
 ```
@@ -148,11 +159,11 @@ process is using the blob:
 
 ```bash
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount --container mydisks --blob myvm.vhd --msi \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd --msi \
   run --size 10737418240 --disable-blob-lock
 ```
 
-Read-only mounts (`--snapshot`) never take the lock, since they
+Read-only snapshot mounts (a `?snapshot=` blob URL) never take the lock, since they
 never write. In Kubernetes, the CSI driver layers a cluster-wide lease on top of
 this blob lock via `--coordination` so a dead node's volume can be safely taken
 over; see [`docs/cluster-testing.md`](docs/cluster-testing.md). `--coordination`
@@ -172,11 +183,8 @@ NBD client — and does **not** require the `ublk` Cargo feature.
 ```bash
 # Start the NBD server (works on any kernel; no ublk device needed)
 ./target/release/ublk-azblob \
-  --endpoint http://127.0.0.1:10000/devstoreaccount1 \
-  --account devstoreaccount1 \
+  --blob-url http://127.0.0.1:10000/devstoreaccount1/mycontainer/myblob.vhd \
   --account-key "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" \
-  --container mycontainer \
-  --blob myblob.vhd \
   run --size 4194304 --nbd 0.0.0.0:10809
 
 # In another shell, attach it as /dev/nbd0
@@ -196,23 +204,64 @@ in NBD mode. The local-disk / write-back cache options behave identically.
 
 ## Environment variables
 
-All CLI flags have environment-variable equivalents:
+Common CLI flags have environment-variable equivalents:
 
 | Flag | Env var |
 |------|---------|
-| `--account` | `AZURE_STORAGE_ACCOUNT` |
-| `--endpoint` | `AZURE_STORAGE_ENDPOINT` |
+| `--blob-url` | `UBLK_BLOB_URL` |
 | `--account-key` | `AZURE_STORAGE_KEY` |
-| `--container` | `AZURE_STORAGE_CONTAINER` |
-| `--blob` | `AZURE_STORAGE_BLOB` |
-| `--snapshot` | `AZURE_STORAGE_SNAPSHOT` |
+| `--max-dirty-pages` | `UBLK_MAX_DIRTY_PAGES` |
+| `--max-cached-pages` | `UBLK_MAX_CACHED_PAGES` |
 | `--cache-dir` | `UBLK_CACHE_DIR` |
 | `--cache-page-size` | `UBLK_CACHE_PAGE_SIZE` |
 | `--cache-max-bytes` | `UBLK_CACHE_MAX_BYTES` |
 | `--cache-share-pages` | `UBLK_CACHE_SHARE_PAGES` |
 | `--cache-warmup` | `UBLK_CACHE_WARMUP` |
 | `--cache-warmup-bytes` | `UBLK_CACHE_WARMUP_BYTES` |
+| `--io-concurrency` | `UBLK_IO_CONCURRENCY` |
+| `--download-concurrency` | `UBLK_DOWNLOAD_CONCURRENCY` |
+| `--upload-concurrency` | `UBLK_UPLOAD_CONCURRENCY` |
+| `--download-bandwidth` | `UBLK_DOWNLOAD_BANDWIDTH` |
+| `--upload-bandwidth` | `UBLK_UPLOAD_BANDWIDTH` |
 | `--nbd` | `NBD_LISTEN` |
+
+---
+
+## Centralized Azure I/O limits (bandwidth & threads)
+
+Every Azure download (read) and upload (write / clear / server-side copy) is
+funnelled through a single, process-wide **I/O gateway**. It is the one place
+that bounds:
+
+- **Bandwidth** — `--download-bandwidth` / `--upload-bandwidth` (bytes/sec,
+  `UBLK_DOWNLOAD_BANDWIDTH` / `UBLK_UPLOAD_BANDWIDTH`), one limiter *per
+  direction*. `0` (default) = unlimited.
+- **Threads / concurrency** — a single shared budget `--io-concurrency`
+  (`UBLK_IO_CONCURRENCY`) across both directions. `0` (default) auto-sizes it to
+  the logical CPU count. Downloads and uploads draw from this budget
+  *dynamically*, so a busy direction can use the whole budget while the other is
+  idle (e.g. reads alone can reach the full CPU count when nothing is being
+  written). `--download-concurrency` / `--upload-concurrency`
+  (`UBLK_DOWNLOAD_CONCURRENCY` / `UBLK_UPLOAD_CONCURRENCY`) optionally cap how
+  much of the shared budget each direction may use; `0` (default) = the full
+  budget.
+
+The gateway uses a **provider/consumer** model: producers (on-demand reads,
+write-back flush, server-side copy and cache warm-up) enqueue work onto a
+priority queue that the shared worker pool drains highest-priority-first. This
+stops background work from starving foreground I/O. The priority order is:
+
+**foreground read > flush > copy > warm-up**
+
+Downloads and uploads keep separate priority queues and bandwidth limiters (the
+order above is enforced *within* each direction), but share one concurrency
+budget so neither direction's threads sit idle while the other has work.
+
+> The per-subsystem knobs `UBLK_FLUSH_CONCURRENCY`, `UBLK_CACHE_WARMUP_CONCURRENCY`
+> and `UBLK_COPY_CONCURRENCY` now only bound how many operations each producer
+> keeps *in flight* (i.e. memory / pipeline depth); each such operation submits
+> through the gateway, which enforces the authoritative Azure thread and
+> bandwidth ceilings.
 
 ---
 
@@ -225,13 +274,21 @@ write-back buffer and Azure, giving a three-level cache:
 BufferedBackend (memory) ──► FileCacheBackend (local disk) ──► AzurePageBlobBackend (blob)
 ```
 
-Enable it by pointing `--cache-dir` at a directory on a local disk:
+The **in-memory write-back buffer** (`BufferedBackend`) is itself a cache, not
+just a write batcher: pages fetched to satisfy reads (and pages left behind
+after a flush) stay resident so later accesses are served straight from memory.
+Its resident set is bounded by a least-recently-used budget — `--max-cached-pages`
+(`UBLK_MAX_CACHED_PAGES`, default `256`) — which evicts the least-recently-used
+**clean** pages once the count is exceeded. Dirty (unflushed) pages are pinned
+and never evicted; they are bounded separately by `--max-dirty-pages`, which
+flushes them. Set `--max-cached-pages 0` for an unbounded (grow-only) memory
+cache; any non-zero value must be `>= --max-dirty-pages`.
+
+Enable the local-disk level by pointing `--cache-dir` at a directory on a local disk:
 
 ```bash
 sudo ./target/release/ublk-azblob \
-  --account mystorageaccount \
-  --container mydisks \
-  --blob myvm.vhd \
+  --blob-url https://mystorageaccount.blob.core.windows.net/mydisks/myvm.vhd \
   --msi \
   run --size 10737418240 \
   --cache-dir /var/cache/ublk-azblob \
@@ -244,6 +301,24 @@ before a page is marked dirty, and the dirty bitmap is `fsync`ed on every change
 so **unflushed dirty data survives a crash or restart**. On startup the cache is
 recovered from disk and any recovered dirty pages are flushed to the blob, so
 in-flight writes are never silently lost.
+
+#### Reusing the cache across restarts (ETag validation)
+
+The cache is reused across restarts in **read-write** mode as well as for
+immutable snapshots. After each flush the backing blob's current **ETag** (its
+validity token) is recorded next to the cache in a `<container>-<blob>.etag`
+file. On the next start the live ETag is fetched and compared:
+
+- **unchanged** — nothing modified the blob since this cache last wrote it, so
+  the locally cached *clean* pages are still valid and are served from local
+  disk (no re-download). This is what makes the read-write cache safe to reuse:
+  write locally, flush to the blob, and a restart picks the local cache back up.
+- **changed** — the blob was modified externally, so the stale *clean* pages are
+  discarded and transparently re-fetched on demand.
+
+Either way, *dirty* (unflushed) pages are this process's own pending writes: they
+are always recovered and flushed, never dropped. When the backend cannot report
+an ETag, validation is skipped and the cache is trusted as before.
 
 ### Bounding the cache size (shared LRU byte budget)
 
@@ -326,6 +401,16 @@ For large, write-heavy, or sparsely-accessed blobs, leave it off — the cache
 only fetches what's actually used. In CSI deployments toggle it via the Helm
 chart's `node.cache.warmup`.
 
+**Sparse warm-up.** Before warming, the driver asks Azure for the blob's data
+ranges (`Get Page Ranges`, `?comp=pagelist`). On a sparse page blob — e.g. an
+ext4 image whose free space was never written — pages that fall entirely in a
+zero gap are **skipped**: they are never downloaded and read back as zeros on
+demand. Only the regions that actually hold data are transferred, so warming a
+mostly-empty filesystem image costs a fraction of its nominal size. Backends or
+blobs that cannot report ranges fall back to a full sequential sweep. The
+all-zero pages that are loaded are also left as **holes** in the local `.dat`
+file, so they consume no cache disk either.
+
 ---
 
 ## Auth modes
@@ -370,6 +455,74 @@ docker compose -f tests/e2e/docker-compose.yml down -v
 The e2e test lives in [ublk-azblob/tests/mount_e2e.rs](ublk-azblob/tests/mount_e2e.rs);
 it is gated behind the `ublk` feature and skips itself when not run as root with
 `ublk_drv` loaded.
+
+---
+
+## Benchmarking I/O speed (ublk-azblob vs. raw local disk)
+
+The benchmark **pipeline** measures the block-device I/O speed of `ublk-azblob`
+against a **raw local disk** baseline using [`fio`](https://fio.readthedocs.io/).
+Both targets are benchmarked as raw block devices (no filesystem):
+
+* **ublk-azblob** — a real `/dev/ublkbN` device backed by an Azure Page Blob
+  (Azurite in CI).
+* **local disk** — a loopback (`losetup`) device backed by a file on the
+  container's local filesystem, used as the reference baseline.
+
+The same fio jobs run against each target and the script prints a side-by-side
+comparison of throughput (MiB/s), IOPS, and mean latency, with each ublk-azblob
+result also expressed as a **percentage of the raw-local-disk baseline** (the
+`vs local` column). The jobs are grouped into phases:
+
+* **Phase 1 — Raw block performance:** the four base patterns (sequential and
+  random read/write) plus sweeps over block size (`4k…1M`), queue depth
+  (`1…128`), and read/write mix (`100/0`, `70/30`, `50/50`).
+* **Phase 2 — Cache behaviour:** cold-cache vs. warm-cache buffered reads, each
+  compared against the raw-local-disk baseline, plus the warm/cold speed-up.
+  The device runs without `--cache-dir` (and `BufferedBackend` does not cache
+  clean reads), so this warm/cold speed-up reflects the kernel's block-device
+  page cache, not a ublk-azblob read cache.
+* **Phase 3 — backend latency:** GET/PUT/flush throughput, IOPS and latency
+  measured directly against the Azure Page Blob backend via the `bench`
+  subcommand (bypassing the kernel device). The pipeline builds the binary with
+  the `bench` feature, runs it on a separate blob, and appends its results table
+  to the same summary (set `BENCH_BACKEND=0` to skip).
+* **Phase 4 — Scalability:** the random-read workload at increasing thread
+  (`numjobs`) counts.
+
+Like the e2e test, the Rust build, `fio`, and Azurite all run inside docker
+compose:
+
+```bash
+# 1. Load the kernel module on the host (a container can't do this for you)
+sudo modprobe ublk_drv
+
+# 2. Build + run the fio benchmark against both targets and print the comparison.
+docker compose -f tests/bench/docker-compose.yml up \
+  --build --abort-on-container-exit --exit-code-from runner
+
+# 3. Tear everything down when done
+docker compose -f tests/bench/docker-compose.yml down -v
+```
+
+The comparison table is printed to stdout and written to `bench-results.md`.
+The benchmark is tunable via environment variables — base block size, queue
+depth, threads, runtime, direct vs. buffered I/O, and the per-phase sweep lists
+(`FIO_BS_LIST`, `FIO_IODEPTH_LIST`, `FIO_RWMIX_LIST`, `FIO_NUMJOBS_LIST`) — see
+the header of [tests/bench/bench.sh](tests/bench/bench.sh) for the full list,
+e.g.:
+
+```bash
+# Trim the sweeps for a quick run.
+FIO_BS_LIST="4k 64k" FIO_IODEPTH_LIST="1 16" FIO_NUMJOBS_LIST="1 4" \
+  docker compose -f tests/bench/docker-compose.yml up \
+    --build --abort-on-container-exit --exit-code-from runner
+```
+
+In CI the benchmark runs on pushes to `main`, on every pull request, and on
+demand via the **`bench`** workflow (`workflow_dispatch` in the Actions tab, with
+tunable inputs).  Results are attached as a `bench-results` artifact and rendered
+into the run's job summary.
 
 ---
 
@@ -446,7 +599,6 @@ docker compose -f tests/e2e/docker-compose.yml up \
   --build --abort-on-container-exit --exit-code-from runner
 docker compose -f tests/e2e/docker-compose.yml down -v
 ```
-
 ---
 
 ## Running unit tests
@@ -474,6 +626,10 @@ The e2e job runs on `ubuntu-22.04`, loads `ublk_drv` from
 (`ubuntu-24.04` is avoided because its azure kernel currently Oopses in
 `ublk_drv` — see [actions/runner-images#14175](https://github.com/actions/runner-images/issues/14175).)
 
+A separate **`bench`** workflow (on pushes to `main`, pull requests, and manual `workflow_dispatch`)
+runs the fio benchmark comparing the ublk-azblob device against a raw local disk,
+on the same `ubuntu-22.04` runner.
+
 ---
 
 ## Project structure
@@ -488,6 +644,7 @@ ublk-azblob/
 │   ├── src/
 │   │   ├── main.rs             # CLI entry point (clap)
 │   │   ├── auth.rs             # MSI + SharedKey credential factory
+│   │   ├── bench.rs            # backend throughput / IOPS / latency benchmark
 │   │   ├── ublk_target.rs      # ublk device I/O loop (default feature `ublk`)
 │   │   ├── csi/                # Kubernetes CSI driver (default feature `csi`)
 │   │   │   ├── mod.rs          # gRPC server, role/config, volume-id encoding
@@ -509,9 +666,12 @@ ublk-azblob/
 │   ├── chart/                  # Helm chart (CSIDriver, RBAC, controller, node, StorageClass)
 │   └── example/                # sample PVC + pod
 ├── tests/
-│   └── e2e/
-│       ├── docker-compose.yml  # Azurite + k3s + runner for the whole e2e suite
-│       ├── Dockerfile          # e2e runner image (rust + docker/kubectl/helm)
-│       └── k8s/                # k8s manifests for the PVC e2e (helm values, writer/reader jobs)
+│   ├── e2e/
+│   │   ├── docker-compose.yml  # Azurite + k3s + runner for the whole e2e suite
+│   │   ├── Dockerfile          # e2e runner image (rust + docker/kubectl/helm)
+│   │   └── k8s/                # k8s manifests for the PVC e2e (helm values, writer/reader jobs)
+│   └── bench/
+│       ├── bench.sh            # fio benchmark: ublk-azblob vs. raw local disk
+│       └── docker-compose.yml  # benchmark override reusing tests/e2e/docker-compose.yml
 └── LICENSE.md                  # MIT license
 ```

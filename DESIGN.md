@@ -81,7 +81,7 @@ the `BlobBackend` trait:
 ```
 BlobBackend::read/write/clear/flush/size  ←  only interface the I/O loop sees
 AzurePageBlobBackend                      ←  all SDK types live here
-BufferedBackend                           ←  in-memory write-back cache (wraps any backend)
+BufferedBackend                           ←  in-memory write-back + read cache (wraps any backend)
 FileCacheBackend                          ←  persistent local-disk cache (wraps any backend)
 MemBackend                                ←  in-memory, no network, for unit tests
 ```
@@ -91,7 +91,11 @@ cache — for example `BufferedBackend` (memory) → `FileCacheBackend` (local d
 → `AzurePageBlobBackend` (blob).  The local-disk cache persists its `present` /
 `dirty` page bitmaps so that **dirty pages survive a restart**: on startup the
 cache is recovered from disk and any recovered dirty pages are flushed to the
-blob.
+blob.  Clean pages survive a restart too — including in read-write mode — gated
+by the backing blob's **ETag**: `FileCacheBackend` records the blob ETag (via the
+`BlobBackend::etag` accessor) after each flush and, on reopen, reuses the cached
+clean pages only when the live ETag still matches (proving no external change);
+on a mismatch the stale clean pages are dropped while dirty pages are kept.
 
 A future SDK upgrade only requires modifying `src/backend/azure.rs`.
 
@@ -147,6 +151,39 @@ Phase 1: single queue, single thread.  The libublk queue handler calls
 
 Phase 2: spawn one Tokio task per ublk queue, use `tokio::spawn` + channel for
 back-pressure.  Map io_uring depth → parallel REST calls.
+
+#### Centralized I/O gateway (`src/backend/io_gateway.rs`)
+
+Every Azure download (read) and upload (write / clear / server-side copy) is
+issued from exactly one place — `AzurePageBlobBackend` — so routing its
+primitives through a single, process-wide `AzureIoGateway` makes it the one
+chokepoint that enforces, *per direction independently*:
+
+1. **Bandwidth** — a byte-rate ceiling backed by a leaky bucket
+   (`leaky-bucket`), one limiter per direction; `0` = unlimited.
+2. **Threads / concurrency** — a single shared pool of consumer worker tasks
+   drawn from by both directions; at most that many Azure requests are in flight
+   at once *combined*. The budget auto-sizes to the logical CPU count, and
+   either direction can use all of it when the other is idle (a dynamic split,
+   not a fixed half each). Optional per-direction ceilings cap how much of the
+   budget each may use.
+3. **Fairness** — a **provider/consumer** model. Producers (on-demand reads,
+   write-back flush, server-side copy, cache warm-up) enqueue work onto a
+   priority queue (`async-priority-channel`); the workers drain it
+   highest-priority-first, so background work cannot starve foreground I/O.
+
+The priority order is **foreground read > flush > copy > warm-up**. Producers
+label their traffic with a task-local `IoClass` (`with_class`); on-demand reads
+default to `ForegroundRead` and writes to `Flush`. Downloads and uploads keep
+separate priority queues and bandwidth limiters (the order is enforced within
+each direction), but share one concurrency budget.
+
+The per-subsystem knobs (`UBLK_FLUSH_CONCURRENCY`,
+`UBLK_CACHE_WARMUP_CONCURRENCY`, `UBLK_COPY_CONCURRENCY`) now only bound how much
+work each producer keeps *enqueued* (pipeline depth / memory); the authoritative
+Azure thread and bandwidth limits live in the gateway (`UBLK_IO_CONCURRENCY` /
+`UBLK_DOWNLOAD_CONCURRENCY` / `UBLK_UPLOAD_CONCURRENCY` /
+`UBLK_DOWNLOAD_BANDWIDTH` / `UBLK_UPLOAD_BANDWIDTH`).
 
 ### 6. Retry / back-off
 
@@ -242,7 +279,11 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
   are never evicted. The budget is shared across every process using the same
   `--cache-dir` via a `flock`-coordinated, crash-safe `.cache-budget` file, so a
   single noisy volume cannot fill a shared CSI node's cache disk. Each process
-  evicts only its own clean pages and never touches a peer's cache files.
+  evicts only its own clean pages and never touches a peer's cache files. The
+  same LRU bookkeeping (`backend::cache_lru::Lru`) bounds the **in-memory**
+  write-back buffer too: it doubles as a read cache and evicts least-recently-
+  used clean pages once the resident set exceeds `--max-cached-pages` (dirty
+  pages stay pinned).
 - ⚠️ Cross-process clean-page sharing (`--cache-share-pages`) — **implemented but
   currently disabled in the shipped binary** (the flag is accepted but ignored;
   every cache is single-process). Design, retained for a later iteration:
@@ -265,7 +306,9 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 - Write coalescing (merge adjacent pages before `upload_pages`)
 - Multiple queues / true async (one Tokio task per queue)
 - FLUSH / FUA handling (drain write buffer before responding)
-- `list_page_ranges` sparse map to skip zero reads
+- ✅ `list_page_ranges` sparse map to skip zero reads — warm-up queries
+  `Get Page Ranges` (`?comp=pagelist`) and skips downloading pages that fall in
+  a zero gap; all-zero pages are also left as holes in the local `.dat`
 
 ### Phase 3 — Hardening
 - MSI live testing on Azure VM / AKS
