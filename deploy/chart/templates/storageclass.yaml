@@ -48,6 +48,9 @@ parameters:
   {{- if .templateBlobMountArgsOverwrite }}
   templateBlobMountArgsOverwrite: {{ .templateBlobMountArgsOverwrite | quote }}
   {{- end }}
+  {{- if .overlay }}
+  overlay: {{ .overlay | quote }}
+  {{- end }}
   {{- if .fsck }}
   fsck: {{ .fsck | quote }}
   {{- end }}
@@ -96,6 +99,9 @@ parameters:
   {{- end }}
   {{- if .templateBlobMountArgsOverwrite }}
   templateBlobMountArgsOverwrite: {{ .templateBlobMountArgsOverwrite | quote }}
+  {{- end }}
+  {{- if .overlay }}
+  overlay: {{ .overlay | quote }}
   {{- end }}
   {{- if .fsck }}
   fsck: {{ .fsck | quote }}

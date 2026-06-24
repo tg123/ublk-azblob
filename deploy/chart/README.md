@@ -137,6 +137,7 @@ A single image is shared by the controller and node plugins.
 | `storageClass.parameters.newBlobFsType` | Filesystem to format a freshly-provisioned blob (formattable profiles: ext2/3/4, xfs, btrfs) | `ext4` |
 | `storageClass.parameters.templateBlobFsType` | Filesystem the node mounts a `templateBlobUrl` image as (template only; never reformatted; image-only types squashfs/ntfs work out of the box, `zfs` needs a custom image with the ZFS kernel module + zfsutils-linux) | `""` |
 | `storageClass.parameters.templateBlobMountArgsOverwrite` | Advanced: override the built-in mount options of the `templateBlobFsType` profile (template only; comma/space-separated) | `""` |
+| `storageClass.parameters.overlay` | Ephemeral overlay over an immutable snapshot template: mount the snapshot read-only as the overlayfs lower and stack a writable node-local upper, so pod writes are kept local and discarded on unpublish (never reach/copy the golden image). Snapshot `templateBlobUrl` only; rejected on writable volumes; needs the `overlay` kernel filesystem | `""` |
 | `storageClass.parameters.fsck` | Run `fsck` before mounting a writable, formatted volume: `"false"`/`"off"` (default, skip), `"true"`/`"preen"` (`fsck -a`), or `"force"` (`fsck -f -y`). Skipped for freshly-formatted and read-only volumes | `""` |
 | `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS; `?snapshot=` ⇒ mount the immutable snapshot directly read-only, no copy/lock/lease; non-snapshot ⇒ copy into the per-PVC blob read-write and skip format) | `""` |
 

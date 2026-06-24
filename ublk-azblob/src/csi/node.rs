@@ -46,6 +46,11 @@ struct Published {
     child: Child,
     device: String,
     target: String,
+    /// When `Some`, the volume is published through an ephemeral overlay: the
+    /// device is mounted read-only as the overlay lower and these node-local
+    /// scratch dirs hold the writable upper/work. Unpublish must tear the
+    /// overlay (and lower) down and discard the scratch.
+    overlay: Option<mount::OverlayDirs>,
 }
 
 /// Node service implementation.
@@ -331,6 +336,28 @@ impl Node for NodeService {
             .get("snapshot")
             .is_some_and(|s| !s.is_empty());
         let readonly = req.readonly || device_read_only;
+        // Ephemeral overlay: when the StorageClass opts in (`overlay: "true"`),
+        // present a *writable* merged view over the immutable snapshot by
+        // stacking an overlayfs whose writable upper layer lives on node-local
+        // disk and is discarded on unpublish (pod-local changes never reach the
+        // immutable blob). Only meaningful for a read-only snapshot device — the
+        // lower must already carry a filesystem and stay immutable.
+        let overlay_enabled = req
+            .volume_context
+            .get("overlay")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        if overlay_enabled && !device_read_only {
+            return Err(Status::invalid_argument(
+                "overlay (ephemeral local writes) is only supported for read-only \
+                 snapshot volumes (a templateBlobUrl with ?snapshot=)",
+            ));
+        }
+        let overlay_dirs = if overlay_enabled {
+            Some(mount::overlay_dirs(&target))
+        } else {
+            None
+        };
         // A volume copied from a `templateBlobUrl` already carries a filesystem;
         // never reformat it (the copy is the user's golden image).
         let from_template = req
@@ -442,12 +469,22 @@ impl Node for NodeService {
                 if fsck_mode != mount::FsckMode::Off && !formatted && !readonly {
                     mount::fsck(&device, &fs_type, fsck_mode)?;
                 }
-                mount::mount(&device, &target, &fs_type, &mount_flags, readonly)?;
+                match &overlay_dirs {
+                    // Ephemeral overlay: mount the immutable device read-only as
+                    // the lower and stack a writable node-local upper at target.
+                    Some(dirs) => {
+                        mount::mount_overlay(&device, &target, &fs_type, &mount_flags, dirs)?
+                    }
+                    None => mount::mount(&device, &target, &fs_type, &mount_flags, readonly)?,
+                }
                 Ok(())
             })();
 
             if let Err(e) = outcome {
-                // Roll back the device on failure.
+                // Roll back the device on failure (and any partial overlay).
+                if let Some(dirs) = &overlay_dirs {
+                    let _ = mount::umount_overlay(&target, dirs);
+                }
                 mount::signal_pid(child.id(), libc::SIGINT);
                 let _ = child.wait();
                 return Err(e);
@@ -461,6 +498,7 @@ impl Node for NodeService {
                     child,
                     device,
                     target,
+                    overlay: overlay_dirs,
                 },
             );
             Ok(())
@@ -495,10 +533,19 @@ impl Node for NodeService {
         let volume_id = req.volume_id.clone();
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            // Always attempt to unmount the requested target (idempotent).
+            // Always attempt to unmount the requested target (idempotent). For an
+            // overlay volume `target` is the merged overlayfs; unmounting it here
+            // is harmless and `umount_overlay` below also tears down the lower.
             mount::umount(&target)?;
 
             if let Some(p) = published {
+                // Overlay volumes also have a read-only lower mount and node-local
+                // scratch dirs to unmount/remove (discarding all pod-local writes).
+                if let Some(dirs) = &p.overlay {
+                    if let Err(e) = mount::umount_overlay(&target, dirs) {
+                        warn!(error = %format!("{e:#}"), "overlay teardown failed");
+                    }
+                }
                 info!(device = %p.device, "stopping ublk device");
                 mount::signal_pid(p.child.id(), libc::SIGINT);
                 let mut child = p.child;

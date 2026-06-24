@@ -50,6 +50,12 @@ const PARAM_TEMPLATE_BLOB_FS_TYPE: &str = "templateBlobFsType";
 /// mount options that the `templateBlobFsType` profile would otherwise apply.
 /// Only meaningful when `templateBlobUrl` is set.
 const PARAM_TEMPLATE_BLOB_MOUNT_ARGS: &str = "templateBlobMountArgsOverwrite";
+/// Parameter key (StorageClass `parameters`) opting a read-only snapshot volume
+/// into an **ephemeral overlay**: the node presents a writable merged view over
+/// the immutable snapshot whose writes land in a node-local upper layer that is
+/// discarded on unpublish (pod-local changes never reach the blob). Only
+/// meaningful for a `templateBlobUrl` that targets a snapshot (`?snapshot=`).
+const PARAM_OVERLAY: &str = "overlay";
 /// Parameter keys for the optional cluster-lease coordination, forwarded to the
 /// node via the volume context (the node's `child_env` reads them).
 const PARAM_COORDINATION: &str = "coordination";
@@ -271,6 +277,12 @@ impl Controller for ControllerService {
                 }
                 if let Some(args) = req.parameters.get(PARAM_TEMPLATE_BLOB_MOUNT_ARGS) {
                     volume_context.insert(PARAM_TEMPLATE_BLOB_MOUNT_ARGS.to_string(), args.clone());
+                }
+                // Opt-in ephemeral overlay: the node stacks a writable node-local
+                // layer over the immutable snapshot so pods can write locally
+                // without mutating (or copying) the shared golden image.
+                if let Some(v) = req.parameters.get(PARAM_OVERLAY) {
+                    volume_context.insert(PARAM_OVERLAY.to_string(), v.clone());
                 }
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
