@@ -206,9 +206,8 @@ sudo ./target/release/ublk-azblob \
 Read-only snapshot mounts (a `?snapshot=` blob URL) never take the lock, since they
 never write. In Kubernetes, the CSI driver layers a cluster-wide lease on top of
 this blob lock via `--coordination` so a dead node's volume can be safely taken
-over; see [`docs/cluster-testing.md`](docs/cluster-testing.md). `--coordination`
-relies on the blob lock and therefore cannot be combined with
-`--disable-blob-lock`.
+over. `--coordination` relies on the blob lock and therefore cannot be combined
+with `--disable-blob-lock`.
 
 ---
 
