@@ -171,6 +171,22 @@ pub trait BlobBackend: Send + Sync {
 
     /// Return the current size of the backing store in bytes.
     async fn size(&self) -> anyhow::Result<u64>;
+
+    /// Return an opaque *validity token* for the current backing-store contents.
+    ///
+    /// For Azure this is the blob **ETag**, which changes on every mutation.
+    /// A persistent cache records this token and, on reopen, compares it with
+    /// the live value: an *unchanged* token proves nothing else mutated the blob
+    /// since the cache last wrote it, so locally cached (clean) pages are still
+    /// valid and may be reused — this is what lets a read-write cache survive a
+    /// restart, not just an immutable snapshot.  A *changed* token means the
+    /// remote contents diverged and the clean cache must be discarded.
+    ///
+    /// Returns `None` when the backend cannot provide one (validation is then
+    /// skipped and the prior trust-the-cache behaviour is preserved).
+    async fn etag(&self) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Whether `[offset, offset+len)` intersects any `(start, len)` data range.

@@ -718,6 +718,15 @@ async fn main() -> anyhow::Result<()> {
                     name = %name,
                     "local-disk cache enabled"
                 );
+                // The backing blob's ETag is the cache's validity token: if it
+                // is unchanged since the cache last wrote the blob, the locally
+                // cached clean pages are still valid and reused across this
+                // restart (read-write, not just immutable snapshots).  A read
+                // failure just disables validation for this start.
+                let current_etag = backend.etag().await.unwrap_or_else(|err| {
+                    warn!(%err, "failed to read backing blob etag; cache validation disabled this start");
+                    None
+                });
                 let (cache, recovered_dirty) = FileCacheBackend::open(
                     backend,
                     FileCacheConfig {
@@ -729,6 +738,7 @@ async fn main() -> anyhow::Result<()> {
                         share_pages,
                     },
                     actual_size,
+                    current_etag,
                 )
                 .context("open local-disk cache")?;
                 let cache: Arc<dyn BlobBackend> = Arc::new(cache);
