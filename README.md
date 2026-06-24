@@ -36,8 +36,6 @@ modern x86-64 / aarch64 Linux host with no runtime to install.
 tar -xzf ublk-azblob-<tag>-x86_64-unknown-linux-musl.tar.gz
 ./ublk-azblob-<tag>-x86_64-unknown-linux-musl/ublk-azblob --version
 
-# Verify it is statically linked (prints "not a dynamic executable"):
-ldd ublk-azblob-<tag>-x86_64-unknown-linux-musl/ublk-azblob
 ```
 
 Each archive ships a `.sha256` checksum next to it. The binaries are built with
