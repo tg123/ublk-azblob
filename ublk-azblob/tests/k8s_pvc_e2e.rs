@@ -12,10 +12,13 @@
 //!   4. run a reader Job that mounts the *same* PVC on a fresh device over
 //!      the existing page blob and verifies the SHA-256 still matches
 //!
-//! It then layers on three further checks: pod migration between nodes, two
-//! disks co-located on one node, and — with the persistent local-disk cache
-//! enabled — that the host-path cache survives a node-plugin pod restart and is
-//! revalidated (via the blob ETag) and reused rather than re-fetched.
+//! It then layers on four further checks: pod migration between nodes, two
+//! disks co-located on one node, that — with the persistent local-disk cache
+//! enabled — the host-path cache survives a node-plugin pod restart and is
+//! revalidated (via the blob ETag) and reused rather than re-fetched, and that
+//! an ephemeral overlay steered onto a configured `overlayScratchDir` reads its
+//! immutable snapshot, writes pod-local files into that scratch base, and prunes
+//! the per-volume scratch on unpublish.
 //!
 //! This is the Kubernetes counterpart of `mount_e2e.rs` and proves the data
 //! survives provision → write → unmount → remount through the page blob.
@@ -349,6 +352,9 @@ stringData:
 
     // ── Test 4: Local-disk cache survives a node-plugin pod restart ────────────
     test_local_cache_reload(&here);
+
+    // ── Test 5: ephemeral overlay with a configured `overlayScratchDir` ────────
+    test_overlay_scratch_dir(&here);
 
     log("k8s PVC e2e PASSED ✓");
 }
@@ -1372,6 +1378,441 @@ spec:
         "kubectl",
         &["delete", "pvc", "azblob-pvc-cache", "--wait=true"],
     );
+}
+
+/// The Azurite container the overlay golden image is written to and snapshotted
+/// from (the Helm chart's default `container`, which `e2e.values.yaml` does not
+/// override). The golden image is read-write while being seeded, then its
+/// snapshot is mounted read-only as the overlay's immutable lower.
+const OVERLAY_CONTAINER: &str = "ublk-azblob-volumes";
+/// Fixed (template-less) blob path for the overlay golden image, so its name is
+/// predictable and can be snapshotted by `az` after the golden writer flushes it.
+const OVERLAY_GOLDEN_BLOB: &str = "overlay-e2e/golden";
+/// Operator-chosen node-local scratch base for the overlay's writable
+/// `upperdir`/`workdir` (the `overlayScratchDir` StorageClass parameter under
+/// test). It lives under the kubelet directory, which the node plugin already
+/// bind-mounts (so the plugin can create per-volume scratch there) and which is
+/// a tmpfs in this harness (a valid overlayfs upper, unlike the containerd
+/// overlay rootfs). The operator must pre-create it on every node — this test
+/// does so via `docker exec` below.
+const OVERLAY_SCRATCH_DIR: &str = "/var/lib/kubelet/ublk-overlay-scratch";
+/// The k3s node containers provided by the compose harness (same names used by
+/// `load_image_into_k3s`).
+const K3S_NODE_CONTAINERS: &[&str] = &["ublk-e2e-k3s-server", "ublk-e2e-k3s-agent"];
+
+/// Whether the host kernel offers overlayfs (the node plugin's ephemeral-overlay
+/// path needs it). The runner shares the host kernel, so `/proc/filesystems`
+/// here reflects what the k3s nodes can mount.
+fn overlay_available_on_host() -> bool {
+    std::fs::read_to_string("/proc/filesystems")
+        .map(|c| {
+            c.lines()
+                .any(|l| l.split_whitespace().last() == Some("overlay"))
+        })
+        .unwrap_or(false)
+}
+
+/// Run `sh -c <script>` inside the node-plugin (`azblob`) container on `node`,
+/// returning combined stdout+stderr (empty when no plugin pod is found there).
+fn exec_node_plugin(node: &str, script: &str) -> String {
+    let Some(pod) = node_plugin_pod_on(node) else {
+        return String::new();
+    };
+    let out = Command::new("kubectl")
+        .args([
+            "-n", NS, "exec", &pod, "-c", "azblob", "--", "sh", "-c", script,
+        ])
+        .output();
+    match out {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Snapshot the golden blob via the Azure CLI (against the compose Azurite the
+/// runner reaches path-style) and return the `x-ms-snapshot` id — the only way a
+/// device is exposed read-only, which the ephemeral overlay stacks on top of.
+fn az_snapshot_golden() -> String {
+    // Azurite well-known account/key (same constants used for the in-cluster
+    // secret above); the runner reaches Azurite path-style via the compose env.
+    let account = "devstoreaccount1".to_string();
+    let key = std::env::var("AZURE_STORAGE_KEY").unwrap_or_else(|_| {
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+            .to_string()
+    });
+    let endpoint = std::env::var("AZURE_STORAGE_ENDPOINT")
+        .unwrap_or_else(|_| "http://azurite:10000/devstoreaccount1".to_string());
+    log(&format!(
+        "creating snapshot of golden blob {OVERLAY_GOLDEN_BLOB} via az"
+    ));
+    let out = Command::new("az")
+        .args([
+            "storage",
+            "blob",
+            "snapshot",
+            "--account-name",
+            &account,
+            "--account-key",
+            &key,
+            "--blob-endpoint",
+            &endpoint,
+            "--container-name",
+            OVERLAY_CONTAINER,
+            "--name",
+            OVERLAY_GOLDEN_BLOB,
+            "--query",
+            "snapshot",
+            "--output",
+            "tsv",
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn `az`: {e}"));
+    assert!(
+        out.status.success(),
+        "az storage blob snapshot failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!id.is_empty(), "az returned an empty snapshot id");
+    log(&format!("created golden snapshot {id}"));
+    id
+}
+
+/// Test 5: ephemeral overlay steered onto a configured `overlayScratchDir`.
+///
+/// Proves the new `overlayScratchDir` StorageClass parameter end-to-end through
+/// the CSI driver:
+///
+///   1. provision a golden image blob (a normal read-write PVC formatted by the
+///      node), write a seed file into it, and flush it to the blob;
+///   2. snapshot that blob (a snapshot is the only way a device is exposed
+///      read-only, which the overlay's immutable lower requires);
+///   3. create a StorageClass whose `templateBlobUrl` targets that snapshot with
+///      `overlay: "true"` and `overlayScratchDir` pointing at an operator-chosen
+///      node-local directory, then run a pod over it that reads the seed (the
+///      lower is visible) and writes a pod-local file (the overlay is writable);
+///   4. assert the pod-local write materialised under the *configured* scratch
+///      base (not next to the CSI target), and that tearing the pod down prunes
+///      the per-volume scratch root so nothing leaks on the chosen filesystem.
+fn test_overlay_scratch_dir(_here: &Path) {
+    log("TEST 5: ephemeral overlay with a configured overlayScratchDir");
+
+    if !overlay_available_on_host() {
+        // The overlay path needs overlayfs in the (shared) kernel; without it the
+        // node could never present the merged view. Skip gracefully off-CI.
+        skip_or_fail("kernel has no overlay filesystem; cannot exercise overlayScratchDir");
+        return;
+    }
+
+    // The operator must pre-create the scratch base on every node. The kubelet
+    // dir is a shared tmpfs in this harness, so creating it via each node
+    // container makes it visible to that node's plugin pod.
+    log(&format!(
+        "pre-creating {OVERLAY_SCRATCH_DIR} on the k3s nodes"
+    ));
+    for node in K3S_NODE_CONTAINERS {
+        let _ = try_run(
+            "docker",
+            &["exec", node, "mkdir", "-p", OVERLAY_SCRATCH_DIR],
+        );
+    }
+
+    // ── 1. Golden image: a normal RW PVC, formatted + seeded, then flushed ─────
+    // A dedicated StorageClass with a fixed (template-less) blob path so the blob
+    // name is predictable for the `az` snapshot. `Retain` keeps the blob (and its
+    // snapshot) intact regardless of PVC teardown ordering.
+    let golden_sc = format!(
+        r#"apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: azblob-overlay-golden
+provisioner: azblob.ublk.csi.tg123.github.io
+parameters:
+  csi.storage.k8s.io/provisioner-secret-name: azblob-csi-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: ${{pvc.namespace}}
+  csi.storage.k8s.io/node-publish-secret-name: azblob-csi-secret
+  csi.storage.k8s.io/node-publish-secret-namespace: ${{pvc.namespace}}
+  container: "{OVERLAY_CONTAINER}"
+  blobPathTemplate: "{OVERLAY_GOLDEN_BLOB}"
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+"#
+    );
+    log("creating golden StorageClass + PVC");
+    kubectl_apply_stdin(&golden_sc);
+    let golden_pvc = r#"apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azblob-overlay-golden-pvc
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: azblob-overlay-golden
+  resources:
+    requests:
+      storage: 256Mi
+"#;
+    kubectl_apply_stdin(golden_pvc);
+
+    let golden_writer = r#"apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azblob-overlay-golden-writer
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: azblob-overlay-golden-writer
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "ublk-azblob-overlay-seed" > /data/seed.txt
+              sync
+              echo "golden writer done"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: azblob-overlay-golden-pvc
+"#;
+    log("running golden writer Job (seeds the immutable image)");
+    kubectl_apply_stdin(golden_writer);
+    if !try_run(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=complete",
+            "job/azblob-overlay-golden-writer",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-overlay-golden-writer");
+        panic!("golden writer Job did not complete");
+    }
+    // Delete the writer and wait for the pod to be fully reaped so
+    // NodeUnpublishVolume has flushed the seed to the blob before snapshotting.
+    log("deleting golden writer (flushes the seed to the blob)");
+    run(
+        "kubectl",
+        &[
+            "delete",
+            "job",
+            "azblob-overlay-golden-writer",
+            "--wait=true",
+        ],
+    );
+    if !wait_for_no_pods(
+        "azblob-overlay-golden-writer",
+        std::time::Duration::from_secs(120),
+    ) {
+        dump_diagnostics("azblob-overlay-golden-writer");
+        panic!("golden writer pod was not reaped; the seed flush may be incomplete");
+    }
+
+    // ── 2. Snapshot the golden blob (read-only is the overlay's immutable lower).
+    let snapshot = az_snapshot_golden();
+
+    // ── 3. Overlay StorageClass over the snapshot, steered to the scratch dir ──
+    // The controller pods resolve the subdomain host via hostAliases (see
+    // e2e.values.yaml); the URL must be subdomain-style so the account is parsed
+    // from the host label.
+    let template_url = format!(
+        "http://devstoreaccount1.azurite.{NS}.svc.cluster.local:10000/{OVERLAY_CONTAINER}/{OVERLAY_GOLDEN_BLOB}?snapshot={snapshot}"
+    );
+    let overlay_sc = format!(
+        r#"apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: azblob-overlay
+provisioner: azblob.ublk.csi.tg123.github.io
+parameters:
+  csi.storage.k8s.io/provisioner-secret-name: azblob-csi-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: ${{pvc.namespace}}
+  csi.storage.k8s.io/node-publish-secret-name: azblob-csi-secret
+  csi.storage.k8s.io/node-publish-secret-namespace: ${{pvc.namespace}}
+  templateBlobUrl: "{template_url}"
+  templateBlobFsType: "ext4"
+  overlay: "true"
+  overlayScratchDir: "{OVERLAY_SCRATCH_DIR}"
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+"#
+    );
+    log("creating overlay StorageClass (templateBlobUrl=snapshot, overlay=true)");
+    kubectl_apply_stdin(&overlay_sc);
+    let overlay_pvc = r#"apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azblob-overlay-pvc
+spec:
+  # ReadWriteOnce so kubelet bind-mounts the volume read-write into the
+  # container: the *pod* must be able to write to the overlay's merged view. The
+  # underlying snapshot device stays read-only (the node forces the overlay path
+  # from the snapshot volume context regardless of access mode), so pod-local
+  # writes land in the upper layer, never the immutable blob.
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: azblob-overlay
+  resources:
+    requests:
+      storage: 256Mi
+"#;
+    kubectl_apply_stdin(overlay_pvc);
+
+    // Pin the consumer to a known node so we can inspect that node's scratch dir.
+    let nodes_out = Command::new("kubectl")
+        .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+        .output()
+        .expect("get nodes");
+    let nodes_str = String::from_utf8_lossy(&nodes_out.stdout);
+    let node = nodes_str
+        .split_whitespace()
+        .next()
+        .expect("overlay test: no nodes found")
+        .to_string();
+    log(&format!("pinning overlay pod to node {node}"));
+
+    // Pin with `nodeSelector`, NOT `spec.nodeName`: the overlay PVC is
+    // `WaitForFirstConsumer`, so the scheduler must process this (its first
+    // consumer) pod to stamp the `selected-node` annotation that triggers
+    // provisioning/binding. `nodeName` bypasses the scheduler, so the PVC would
+    // stay Pending forever and the pod would never become ready.
+    let overlay_deploy = format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azblob-overlay-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: azblob-overlay-app
+  template:
+    metadata:
+      labels:
+        app: azblob-overlay-app
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: {node}
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "reading seed from the immutable lower"
+              grep -q ublk-azblob-overlay-seed /data/seed.txt
+              echo "writing a pod-local file into the overlay"
+              echo pod-local-write > /data/pod-local.txt
+              grep -q pod-local-write /data/pod-local.txt
+              echo "overlay-ok"
+              sleep 3600
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: azblob-overlay-pvc
+"#
+    );
+    log("creating overlay consumer Deployment (reads seed + writes pod-local)");
+    kubectl_apply_stdin(&overlay_deploy);
+    if !try_run(
+        "kubectl",
+        &[
+            "rollout",
+            "status",
+            "deployment/azblob-overlay-app",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-overlay-app");
+        panic!("overlay consumer pod did not become ready");
+    }
+    // The in-pod read+write runs before the container reports Ready; poll its
+    // logs for the success marker rather than reading once.
+    let mut ok = false;
+    for _ in 0..30 {
+        let logs_out = Command::new("kubectl")
+            .args(["logs", "deployment/azblob-overlay-app"])
+            .output()
+            .expect("get overlay logs");
+        if String::from_utf8_lossy(&logs_out.stdout).contains("overlay-ok") {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    if !ok {
+        dump_diagnostics("azblob-overlay-app");
+        panic!("overlay pod did not report a successful read+write over the snapshot");
+    }
+    log("✓ overlay is readable (lower) and writable (upper)");
+
+    // ── 4a. The pod-local write must have landed under the *configured* scratch
+    //        base (proving overlayScratchDir steered the upperdir there). ───────
+    let found = exec_node_plugin(
+        &node,
+        &format!("find {OVERLAY_SCRATCH_DIR} -name pod-local.txt 2>/dev/null"),
+    );
+    log(&format!(
+        "pod-local file search under {OVERLAY_SCRATCH_DIR} on node {node}:\n{found}"
+    ));
+    assert!(
+        found.contains("pod-local.txt"),
+        "the pod-local write did not materialise under the configured overlayScratchDir \
+         {OVERLAY_SCRATCH_DIR}; overlayScratchDir was not honoured"
+    );
+    log("✓ overlay write landed under the configured overlayScratchDir");
+
+    // ── 4b. Tearing the pod down prunes the per-volume scratch root ────────────
+    log("deleting overlay consumer (unpublish prunes the scratch root)");
+    run(
+        "kubectl",
+        &["delete", "deployment", "azblob-overlay-app", "--wait=true"],
+    );
+    if !wait_for_no_pods("azblob-overlay-app", std::time::Duration::from_secs(120)) {
+        dump_diagnostics("azblob-overlay-app");
+        panic!("overlay consumer pod was not reaped; cannot verify scratch pruning");
+    }
+    // After unpublish the configured base must hold no per-volume scratch roots.
+    // Keep stderr (don't redirect it away): a missing base would otherwise yield
+    // an empty stdout and spuriously pass — surfacing the error fails the
+    // assertion loudly instead.
+    let leftover = exec_node_plugin(&node, &format!("ls -A {OVERLAY_SCRATCH_DIR}"));
+    log(&format!(
+        "scratch base {OVERLAY_SCRATCH_DIR} after unpublish on node {node}: {leftover:?}"
+    ));
+    assert!(
+        leftover.trim().is_empty(),
+        "overlayScratchDir {OVERLAY_SCRATCH_DIR} still holds scratch after unpublish \
+         (umount_overlay did not prune the per-volume root): {leftover:?}"
+    );
+    log("✓ overlay scratch root was pruned on unpublish");
+
+    // Cleanup (best-effort; the cluster is torn down after the suite anyway).
+    let _ = try_run(
+        "kubectl",
+        &["delete", "pvc", "azblob-overlay-pvc", "--wait=false"],
+    );
+    let _ = try_run(
+        "kubectl",
+        &["delete", "pvc", "azblob-overlay-golden-pvc", "--wait=false"],
+    );
+    log("✓ Overlay scratch-dir test PASSED");
 }
 
 /// Best-effort cluster diagnostics on failure (mirrors the bash failure dumps).

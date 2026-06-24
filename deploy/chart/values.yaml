@@ -233,6 +233,25 @@ storageClass:
     # profile. Comma- or space-separated. Only meaningful with templateBlobUrl.
     # templateBlobMountArgsOverwrite: "noatime,nodiratime"
 
+    # Ephemeral overlay: present a *writable* merged view over an immutable
+    # snapshot template. The node mounts the snapshot read-only as the overlayfs
+    # lower and stacks a writable upper layer on node-local disk; pod writes land
+    # in the upper and are discarded on unpublish, so they never reach (or copy)
+    # the shared golden image. Only valid for a snapshot `templateBlobUrl`
+    # (`?snapshot=`) — the node rejects it on writable volumes. Requires the
+    # `overlay` filesystem in the node kernel (standard on modern distros).
+    # overlay: "true"
+
+    # Optional filesystem backing the ephemeral overlay's writable scratch
+    # (overlayfs upperdir/workdir). When unset, the scratch lives next to the
+    # CSI target on the kubelet directory's filesystem. Set it to steer pod-local
+    # writes onto a chosen node-local mount — e.g. an SSD for large, fast,
+    # disk-backed scratch, or a tmpfs for RAM-backed scratch. The operator must
+    # pre-create/mount this path on *every* node (e.g. via a hostPath or a tmpfs
+    # mount); upperdir and workdir always live together under it, in a per-volume
+    # subdirectory that is removed on unpublish. Only meaningful with overlay.
+    # overlayScratchDir: "/mnt/ssd/ublk-overlay"
+
 # Secret configuration for global mode
 # Only used when secretSearchMode: global
 globalSecret:
