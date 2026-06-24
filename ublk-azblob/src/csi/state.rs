@@ -88,9 +88,11 @@ pub fn state_dir() -> PathBuf {
 /// Map a volume id to its state file path inside `dir`.
 ///
 /// The volume id is sanitized to a filesystem-safe component (alphanumerics plus
-/// `-`/`_`) so it can't escape the state directory.
+/// `-`/`_`) so it can't escape the state directory. A short stable hash of the
+/// full, unsanitized id is appended so two distinct ids that sanitize to the
+/// same string (e.g. `vol/123` and `vol#123`) can't collide onto one file.
 fn state_file(dir: &Path, volume_id: &str) -> PathBuf {
-    let mut name = String::with_capacity(volume_id.len() + 5);
+    let mut name = String::with_capacity(volume_id.len() + 22);
     for ch in volume_id.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
             name.push(ch);
@@ -98,7 +100,14 @@ fn state_file(dir: &Path, volume_id: &str) -> PathBuf {
             name.push('_');
         }
     }
-    name.push_str(".json");
+    // FNV-1a 64-bit over the original bytes: deterministic, dependency-free, and
+    // recomputed identically by `remove()`, so the filename is a stable 1:1 map.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in volume_id.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    name.push_str(&format!("-{hash:016x}.json"));
     dir.join(name)
 }
 
@@ -204,7 +213,15 @@ mod tests {
 
     #[test]
     fn state_file_sanitizes_volume_id() {
+        // The sanitized prefix is filesystem-safe, and a stable hash suffix keeps
+        // distinct ids that sanitize alike from colliding onto one file.
         let p = state_file(Path::new("/csi/state"), "a/b#c");
-        assert_eq!(p, Path::new("/csi/state/a_b_c.json"));
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("a_b_c-"), "got {name}");
+        assert!(name.ends_with(".json"), "got {name}");
+        // Deterministic for a given id.
+        assert_eq!(p, state_file(Path::new("/csi/state"), "a/b#c"));
+        // Distinct ids that sanitize to the same prefix get distinct files.
+        assert_ne!(p, state_file(Path::new("/csi/state"), "a#b/c"));
     }
 }

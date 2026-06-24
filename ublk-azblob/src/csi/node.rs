@@ -216,7 +216,6 @@ impl NodeService {
             let volume_id = record.volume_id.clone();
             let volumes = self.volumes.clone();
             let publish_lock = self.publish_lock.clone();
-            let nbd_host = self.config.nbd_host.clone();
             let nbd_port_start = self.config.nbd_port_start;
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let _guard = publish_lock.lock().unwrap();
@@ -242,8 +241,13 @@ impl NodeService {
                     }
                     state::DeviceMode::Nbd { device, listen } => {
                         // NBD has no kernel quiesce; re-serve on a fresh free port
-                        // and reconnect the client to the same /dev/nbdN.
-                        let host = listen.split_once(':').map(|(h, _)| h).unwrap_or(&nbd_host);
+                        // and reconnect the client to the same /dev/nbdN. The
+                        // persisted `listen` was always built as `host:port`, so a
+                        // missing host is a corrupt record — fail recovery (and
+                        // prune the record) rather than guessing a wrong host.
+                        let host = listen.split_once(':').map(|(h, _)| h).ok_or_else(|| {
+                            anyhow::anyhow!("corrupt NBD listen address {listen:?} (no host:port)")
+                        })?;
                         let port = mount::find_free_port(host, nbd_port_start, 1024)?;
                         let new_listen = format!("{host}:{port}");
                         info!(volume_id = %record.volume_id, device = %device, listen = %new_listen, "recovering NBD device");

@@ -1571,8 +1571,11 @@ spec:
              the device/mount did not survive recovery"
         );
     }
-    // (b) write a fresh payload to prove the recovered device is read-write again.
-    log("verifying the recovered device accepts new writes from the running pod");
+    // (b) write a fresh payload (write + sync + record checksum in one exec),
+    //     then read it back in a *separate* exec so the verification can't be
+    //     served from page cache of the same command chain — it must round-trip
+    //     through the recovered device.
+    log("verifying the recovered device accepts new durable writes from the running pod");
     if !try_run(
         "kubectl",
         &[
@@ -1581,14 +1584,31 @@ spec:
             "--",
             "/bin/sh",
             "-c",
-            "cd /data && dd if=/dev/urandom of=after bs=1M count=1 && sync && \
-             sha256sum after > after.sha256 && sha256sum -c after.sha256",
+            "cd /data && dd if=/dev/urandom of=after bs=1M count=1 && \
+             sha256sum after > after.sha256 && sync",
         ],
     ) {
         dump_diagnostics("azblob-restart-app");
         panic!(
             "the running pod could not write to its volume after the node-plugin restart — \
              the recovered device is not read-write"
+        );
+    }
+    if !try_run(
+        "kubectl",
+        &[
+            "exec",
+            "deploy/azblob-restart-app",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cd /data && sha256sum -c after.sha256",
+        ],
+    ) {
+        dump_diagnostics("azblob-restart-app");
+        panic!(
+            "the post-restart write did not round-trip through the recovered device — \
+             the recovered device is not durably read-write"
         );
     }
     log("✓ Restart-safety test PASSED: the running pod kept its mount across the node-plugin restart");
