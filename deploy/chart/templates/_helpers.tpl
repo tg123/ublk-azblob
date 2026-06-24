@@ -107,3 +107,33 @@ Secret namespace based on deployment mode
 ${pvc.namespace}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Centralized Azure I/O gateway env vars (bandwidth / concurrency / priority).
+Shared by the controller (bulk template copy) and node (foreground I/O + flush)
+plugins. Only non-zero values are emitted; the binary auto-sizes the rest.
+*/}}
+{{- define "ublk-azblob-csi.ioEnv" -}}
+{{- with .Values.io }}
+{{- if .concurrency }}
+- name: UBLK_IO_CONCURRENCY
+  value: {{ .concurrency | int64 | quote }}
+{{- end }}
+{{- if .downloadConcurrency }}
+- name: UBLK_DOWNLOAD_CONCURRENCY
+  value: {{ .downloadConcurrency | int64 | quote }}
+{{- end }}
+{{- if .uploadConcurrency }}
+- name: UBLK_UPLOAD_CONCURRENCY
+  value: {{ .uploadConcurrency | int64 | quote }}
+{{- end }}
+{{- if .downloadBandwidth }}
+- name: UBLK_DOWNLOAD_BANDWIDTH
+  value: {{ .downloadBandwidth | int64 | quote }}
+{{- end }}
+{{- if .uploadBandwidth }}
+- name: UBLK_UPLOAD_BANDWIDTH
+  value: {{ .uploadBandwidth | int64 | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}

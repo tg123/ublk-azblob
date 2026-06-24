@@ -86,12 +86,13 @@ cat /cross-env.sh
 EOF
 
 # Use BuildKit cache mounts for faster builds:
-# - Cache cargo registry (crates.io index and downloads)
-# - Cache cargo build artifacts in /build/target
+# - Cache cargo registry (crates.io index and downloads), keyed per target
+#   architecture to avoid concurrent unpack races during multi-platform builds
+# - Cache cargo build artifacts in /build/target, keyed per target architecture
 # - Mount source code instead of copying (avoids layer invalidation)
 RUN --mount=type=bind,source=.,target=/src,readonly \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/build/target \
     . /cross-env.sh && \
     cd /src && \
     CARGO_TARGET_DIR=/build/target cargo build --release -p ublk-azblob && \
@@ -101,13 +102,22 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
 # Pulled for the *target* platform; carries the cross-built target-arch binary.
 FROM debian:bookworm-slim
 
-# - e2fsprogs       : mkfs.ext4 + blkid
-# - util-linux      : mount / umount / blockdev
+# - e2fsprogs       : mkfs.ext4 + blkid + fsck.ext4 (e2fsck)
+# - xfsprogs        : mkfs.xfs (newBlobFsType: xfs)
+# - btrfs-progs     : mkfs.btrfs (newBlobFsType: btrfs)
+# - ntfs-3g         : mount.ntfs (templateBlobFsType: ntfs, mount-only via FUSE)
+# - util-linux      : mount / umount / blockdev / fsck
 # - ca-certificates : TLS roots for talking to Azure Storage / the Kubernetes API
 # - nbd-client      : NBD client for NBD mode (compatibility with kernels without ublk_drv)
+# squashfs mounts via the in-kernel driver (no userspace tooling). `zfs` is NOT
+# shipped: mounting it needs the ZFS kernel module (absent from a stock kernel)
+# plus zfsutils-linux, so `templateBlobFsType: zfs` requires a custom runtime image.
 # (the ublk_drv module is loaded on the host, so no kmod/modprobe is needed here)
 RUN apt-get update && apt-get install -y \
         e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
+        ntfs-3g \
         util-linux \
         ca-certificates \
         nbd-client \

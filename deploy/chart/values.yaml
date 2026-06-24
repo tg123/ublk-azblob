@@ -17,6 +17,33 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+# Centralized Azure I/O gateway limits. Every Azure download (read) and upload
+# (write / clear / copy) funnels through one gateway that enforces a shared
+# concurrency budget, optional per-direction bandwidth ceilings, and priority
+# scheduling (foreground read > flush > copy > warm-up). These apply to both the
+# controller (bulk template copy) and the node plugin (foreground I/O + flush).
+# Every value below is 0 = auto/unlimited; only non-zero values are passed to the
+# binary, which otherwise auto-sizes the budget to the logical CPU count.
+io:
+  # Total concurrent Azure requests shared across both directions. Downloads and
+  # uploads draw from it dynamically (either can use the whole budget when the
+  # other is idle). 0 = auto (logical CPU count).
+  concurrency: 0
+
+  # Per-direction ceiling on concurrent downloads (reads). 0 = may use the full
+  # shared budget when uploads are idle.
+  downloadConcurrency: 0
+
+  # Per-direction ceiling on concurrent uploads (writes / clears / copies).
+  # 0 = may use the full shared budget when downloads are idle.
+  uploadConcurrency: 0
+
+  # Download (read) bandwidth ceiling in bytes/sec. 0 = unlimited.
+  downloadBandwidth: 0
+
+  # Upload (write / clear / copy) bandwidth ceiling in bytes/sec. 0 = unlimited.
+  uploadBandwidth: 0
+
 # Controller deployment configuration
 controller:
   replicas: 1
@@ -47,7 +74,48 @@ node:
     # Port range start for NBD servers (each volume gets its own port)
     # Default: 10809
     portStart: 10809
-  
+
+  # Local-disk cache shared by every volume process on the node.
+  # When enabled, a host directory is mounted into the node plugin and each
+  # volume's `run` child caches blob pages there. The byte budget is enforced
+  # across all volumes sharing the directory (LRU eviction of clean pages).
+  cache:
+    # Enable the local-disk cache. When false, no cache directory is wired up
+    # and volumes stream directly to/from the blob.
+    enabled: false
+
+    # Host directory used as the cache, shared by every volume on the node.
+    # Mounted into the node plugin container at the same path.
+    hostPath: /var/lib/ublk-azblob/cache
+
+    # Maximum total cache size in bytes, shared across all volumes using the
+    # directory above. 0 = unlimited (grow-only).
+    maxBytes: 0
+
+    # Cache page size in bytes (the local-disk cache granularity).
+    pageSize: 1048576
+
+    # Cross-process clean-page sharing. NOTE: currently a no-op — the node
+    # binary forces sharing OFF (the flag is accepted but ignored), so every
+    # volume's cache is single-process for now. When re-enabled, volumes on the
+    # node that cache the *same* blob would serve each other's already-fetched
+    # clean pages directly off the shared cache directory (via a flock-coordinated
+    # `.cache-index`), avoiding redundant blob reads. Each volume still writes
+    # only its own data file (copy-on-write on a dirtying write), so a write to
+    # one volume never affects another. The node plugin gives each volume a
+    # unique, stable cache instance (its volume id) automatically.
+    sharePages: false
+
+    # Background cache warm-up: each volume prefetches its blob into the cache on
+    # start (in the background; the device comes online immediately). Best for
+    # read-only / read-mostly datasets (e.g. an immutable snapshot golden image)
+    # that fit the cache budget.
+    warmup: false
+
+    # Cap in bytes for warm-up. 0 = auto (the cache byte budget when set, else the
+    # whole device).
+    warmupBytes: 0
+
   resources:
     limits:
       cpu: 500m
@@ -125,23 +193,64 @@ storageClass:
     # Use single quotes to preserve ${...} variables literally
     blobPathTemplate: '${pvc.namespace}/volumes/${pv.name}'
     
-    # Filesystem type: ext4, xfs, btrfs, etc.
-    fsType: ext4
+    # Filesystem type to format a freshly-provisioned blob with. Each formattable
+    # type carries a built-in profile of mkfs + mount options: ext2/ext3/ext4,
+    # xfs, btrfs. squashfs, zfs and ntfs are mount-only image filesystems (used
+    # via templateBlobFsType); they are never freshly formatted, so they are not
+    # valid here.
+    newBlobFsType: ext4
 
-    # Expose the volume read-only ("true"/"false"). The device rejects every
-    # write/discard and is mounted read-only; the blob must already be formatted.
-    # readOnly: "true"
-
+    # Run fsck before mounting an already-formatted, writable volume.
+    #   - "false"/"off" (default): never run fsck
+    #   - "true"/"preen":          `fsck -a` (auto-repair safe problems)
+    #   - "force":                 `fsck -f -y` (force a full check, repair all)
+    # Skipped for freshly-formatted and read-only volumes (which can't be
+    # repaired in place).
+    # fsck: "preen"
     # Provision the volume from a golden-image *template* blob. Full Azure blob
     # URL, optionally carrying a SAS token and/or a `?snapshot=` query. With no
     # SAS, the driver authenticates the template with its own credentials (the
-    # template must then be reachable with those creds).
-    #   - read-only volumes (readOnly: "true" or a snapshot URL) mount
-    #     the template directly — no copy, and no cluster lock/lease (so many PVCs
-    #     can share one golden image); DeleteVolume never deletes the template.
-    #   - read-write volumes copy the template into a fresh per-PVC blob and skip
-    #     formatting (the copy is already a filesystem).
-    # templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd?sv=...&sig=...'
+    # template must then be reachable with those creds). Read-only is determined
+    # solely by whether the URL targets a snapshot — there is no readOnly param.
+    #   - a snapshot URL (`?snapshot=`) mounts the (immutable) template directly
+    #     — no copy, no cluster lock/lease (so many PVCs can share one golden
+    #     image), and the local cache is safe to reuse; DeleteVolume never
+    #     deletes the template.
+    #   - a non-snapshot template is copied into a fresh per-PVC blob (read-write)
+    #     and formatting is skipped (the copy is already a filesystem).
+    # templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd?snapshot=...'
+
+    # Filesystem the node mounts a `templateBlobUrl` image as. The template is
+    # never reformatted, so this is the type it already carries (defaults to
+    # newBlobFsType). Only meaningful together with templateBlobUrl.
+    # Mount-only image types: squashfs and ntfs work out of the box (squashfs via
+    # the in-kernel driver, ntfs via the shipped ntfs-3g FUSE driver). `zfs`
+    # requires a custom runtime image with the ZFS kernel module + zfsutils-linux
+    # (neither is present in a stock kernel / the default image).
+    # templateBlobFsType: squashfs
+
+    # Advanced: override the built-in mount options of the templateBlobFsType
+    # profile. Comma- or space-separated. Only meaningful with templateBlobUrl.
+    # templateBlobMountArgsOverwrite: "noatime,nodiratime"
+
+    # Ephemeral overlay: present a *writable* merged view over an immutable
+    # snapshot template. The node mounts the snapshot read-only as the overlayfs
+    # lower and stacks a writable upper layer on node-local disk; pod writes land
+    # in the upper and are discarded on unpublish, so they never reach (or copy)
+    # the shared golden image. Only valid for a snapshot `templateBlobUrl`
+    # (`?snapshot=`) — the node rejects it on writable volumes. Requires the
+    # `overlay` filesystem in the node kernel (standard on modern distros).
+    # overlay: "true"
+
+    # Optional filesystem backing the ephemeral overlay's writable scratch
+    # (overlayfs upperdir/workdir). When unset, the scratch lives next to the
+    # CSI target on the kubelet directory's filesystem. Set it to steer pod-local
+    # writes onto a chosen node-local mount — e.g. an SSD for large, fast,
+    # disk-backed scratch, or a tmpfs for RAM-backed scratch. The operator must
+    # pre-create/mount this path on *every* node (e.g. via a hostPath or a tmpfs
+    # mount); upperdir and workdir always live together under it, in a per-volume
+    # subdirectory that is removed on unpublish. Only meaningful with overlay.
+    # overlayScratchDir: "/mnt/ssd/ublk-overlay"
 
 # Secret configuration for global mode
 # Only used when secretSearchMode: global
@@ -215,7 +324,7 @@ additionalStorageClasses: []
   #   parameters:
   #     container: "database-volumes"
   #     blobPathTemplate: '${pvc.namespace}/db/${pv.name}'
-  #     fsType: xfs
+  #     newBlobFsType: xfs
   #
   # - name: azblob-per-tenant
   #   isDefault: false
@@ -226,22 +335,22 @@ additionalStorageClasses: []
   #     storageAccount: '${pvc.namespace}storage'
   #     container: '${pvc.namespace}'
   #     blobPathTemplate: 'volumes/${pv.name}'
-  #     fsType: ext4
+  #     newBlobFsType: ext4
   #
   # ── Golden-image (templateBlobUrl) StorageClasses ───────────────────────────
   #
-  # Read-only mount of a shared golden image: many PVCs mount the template blob
-  # directly — no copy, and no cluster lock/lease. The volume id is tagged `ro:`
-  # so DeleteVolume never deletes the template; pair it with reclaimPolicy:
-  # Retain and Immediate binding.
+  # Read-only mount of a shared golden image: point templateBlobUrl at a blob
+  # *snapshot* (`?snapshot=`). Many PVCs mount the immutable snapshot directly —
+  # no copy, no cluster lock/lease, and the local cache is safe to reuse. The
+  # volume id is tagged `ro:` so DeleteVolume never deletes the template; pair it
+  # with reclaimPolicy: Retain and Immediate binding.
   # - name: azblob-template-ro
   #   isDefault: false
   #   reclaimPolicy: Retain
   #   volumeBindingMode: Immediate
   #   allowVolumeExpansion: false
   #   parameters:
-  #     readOnly: "true"
-  #     templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd'
+  #     templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd?snapshot=2026-01-02T03:04:05.0Z'
   #
   # Read-write copy of a golden image: the controller server-side copies the
   # template into a fresh per-PVC blob and the node skips mkfs. Set storageAccount
@@ -256,7 +365,7 @@ additionalStorageClasses: []
   #     storageAccount: 'mydeststorage'
   #     container: '${pvc.namespace}'
   #     blobPathTemplate: '${pvc.namespace}/tmpl/${pv.name}'
-  #     fsType: ext4
+  #     newBlobFsType: ext4
   #     templateBlobUrl: 'https://acct.blob.core.windows.net/images/golden.vhd'
 
 # Namespace where CSI driver components are deployed

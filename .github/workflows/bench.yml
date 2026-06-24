@@ -1,0 +1,142 @@
+name: bench
+
+# I/O benchmark: ublk-azblob block device vs. a raw local disk.
+#
+# Runs on pushes to `main`, on pull requests (to catch I/O regressions), and on
+# demand from the Actions tab (workflow_dispatch, with tunable inputs).  fio
+# benchmarks take a few minutes; on pull requests the default tunables below are
+# used.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      dev_size_mib:
+        description: "Device / blob size (MiB)"
+        default: "512"
+      fio_size:
+        description: "How much of each device fio touches"
+        default: "256M"
+      fio_bs:
+        description: "Base block size per I/O"
+        default: "4k"
+      fio_iodepth:
+        description: "Base queue depth"
+        default: "16"
+      fio_numjobs:
+        description: "Base thread (numjobs) count"
+        default: "1"
+      fio_runtime:
+        description: "Seconds per workload"
+        default: "10"
+      fio_direct:
+        description: "O_DIRECT (1) or buffered (0)"
+        default: "1"
+      fio_bs_list:
+        description: "Phase 1 block-size sweep (space-separated)"
+        default: "4k 16k 64k 256k 1M"
+      fio_iodepth_list:
+        description: "Phase 1 queue-depth sweep (space-separated)"
+        default: "1 4 16 64 128"
+      fio_rwmix_list:
+        description: "Phase 1 read-percentage sweep (space-separated)"
+        default: "100 70 50"
+      fio_numjobs_list:
+        description: "Phase 4 thread sweep (space-separated)"
+        default: "1 4 16 64"
+
+jobs:
+  bench:
+    name: fio benchmark (ublk-azblob vs raw local disk)
+    # Same kernel constraint as the e2e job: ublk_drv Oopses on the ubuntu-24.04
+    # azure kernel (actions/runner-images#14175); 22.04 ships a stable 6.x kernel.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load ublk_drv kernel module
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe ublk_drv
+          ls -l /dev/ublk-control
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build e2e runner image (BuildKit + GHA cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/e2e/Dockerfile
+          tags: ublk-azblob-e2e-runner:local
+          load: true
+          cache-from: type=gha,scope=bench-runner-${{ runner.arch }}
+          cache-to: type=gha,mode=max,scope=bench-runner-${{ runner.arch }}
+
+      - name: Cache cargo-home and target
+        # The benchmark compile happens inside the runner container, which writes
+        # CARGO_HOME to /workspace/.cargo-home and target/ to /workspace/target
+        # (both on the bind-mounted checkout).
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry/index
+            .cargo-home/registry/cache
+            .cargo-home/git/db
+            target
+          key: bench-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            bench-cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run benchmark (build + fio in docker compose runner)
+        env:
+          DEV_SIZE_MIB: ${{ inputs.dev_size_mib }}
+          FIO_SIZE: ${{ inputs.fio_size }}
+          FIO_BS: ${{ inputs.fio_bs }}
+          FIO_IODEPTH: ${{ inputs.fio_iodepth }}
+          FIO_NUMJOBS: ${{ inputs.fio_numjobs }}
+          FIO_RUNTIME: ${{ inputs.fio_runtime }}
+          FIO_DIRECT: ${{ inputs.fio_direct }}
+          FIO_BS_LIST: ${{ inputs.fio_bs_list }}
+          FIO_IODEPTH_LIST: ${{ inputs.fio_iodepth_list }}
+          FIO_RWMIX_LIST: ${{ inputs.fio_rwmix_list }}
+          FIO_NUMJOBS_LIST: ${{ inputs.fio_numjobs_list }}
+        run: |
+          docker compose -f tests/bench/docker-compose.yml up \
+            --abort-on-container-exit --exit-code-from runner
+
+      - name: Normalize cache ownership
+        if: always()
+        run: |
+          [ -d .cargo-home ] && sudo chown -R "$(id -u):$(id -g)" .cargo-home
+          [ -d target ] && sudo chown -R "$(id -u):$(id -g)" target
+
+      - name: Publish results to job summary
+        if: always()
+        run: |
+          if [ -f bench-results.md ]; then
+            cat bench-results.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No bench-results.md produced (benchmark failed?)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.md
+          if-no-files-found: ignore
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose -f tests/bench/docker-compose.yml logs || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/bench/docker-compose.yml down -v || true

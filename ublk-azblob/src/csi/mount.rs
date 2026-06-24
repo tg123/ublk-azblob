@@ -1,7 +1,7 @@
-//! Node-side OS helpers: ublk device discovery, `mkfs`, `mount` / `umount`.
+//! Node-side OS helpers: ublk device discovery, `mkfs`, `fsck`, `mount` / `umount`.
 //!
-//! These are blocking operations (they shell out to `mkfs`, `mount`, `blkid`,
-//! `umount` and poll `/dev`); the node service runs them on a blocking thread.
+//! These are blocking operations (they shell out to `mkfs`, `fsck`, `mount`,
+//! `blkid`, `umount` and poll `/dev`); the node service runs them on a blocking thread.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -305,25 +305,155 @@ pub fn has_filesystem(dev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Built-in `mkfs` and mount options for a supported filesystem type.
+///
+/// A profile bundles the sensible defaults for a filesystem so a StorageClass
+/// only has to pick a type (`newBlobFsType` / `templateBlobFsType`) instead of
+/// hand-rolling `mkfs`/mount flags.
+pub struct FsProfile {
+    /// Options passed to `mkfs.<fs>` before the device argument, or `None` when
+    /// the filesystem cannot be created on a live device (mount-only image /
+    /// pool filesystems and unknown types).
+    pub mkfs_options: Option<&'static [&'static str]>,
+    /// Default mount `-o` options applied when mounting the filesystem.
+    pub mount_options: &'static [&'static str],
+}
+
+/// Return the built-in formatting/mount profile for `fs_type`.
+///
+/// Supported profiles cover ext2/3/4, xfs, btrfs, squashfs, zfs and ntfs.
+/// squashfs, zfs and ntfs are image / pool filesystems that we only ever mount
+/// from a template (never freshly format on a live device), so they have no
+/// `mkfs` options (`None`). Unknown types also map to `None`, so [`mkfs`]
+/// rejects them instead of shelling out to a non-existent `mkfs.<fs>`.
+pub fn fs_profile(fs_type: &str) -> FsProfile {
+    match fs_type {
+        "ext2" | "ext3" | "ext4" => FsProfile {
+            // `-F` forces creation without interactive confirmation; `-E
+            // nodiscard` avoids a full TRIM pass (faster, and discard maps onto
+            // Clear Pages); lazy_itable_init / lazy_journal_init speed up mkfs on
+            // large devices (no zeroing of inode tables and journal).
+            mkfs_options: Some(&[
+                "-F",
+                "-E",
+                "nodiscard,lazy_itable_init=1,lazy_journal_init=1",
+            ]),
+            mount_options: &[],
+        },
+        // `-f` forces formatting even when an old signature is present.
+        "xfs" => FsProfile {
+            mkfs_options: Some(&["-f"]),
+            mount_options: &[],
+        },
+        "btrfs" => FsProfile {
+            mkfs_options: Some(&["-f"]),
+            mount_options: &[],
+        },
+        // Image / pool filesystems: only ever mounted from a template, never
+        // formatted on a freshly-provisioned device. squashfs/zfs are read-only
+        // images; ntfs is a template-only image too — we do not create NTFS
+        // (no reliable read-write NTFS formatting, and `mkfs.ntfs` isn't shipped
+        // in the runtime image), so it can only be mounted from a template.
+        "squashfs" | "zfs" | "ntfs" => FsProfile {
+            mkfs_options: None,
+            mount_options: &[],
+        },
+        _ => FsProfile {
+            mkfs_options: None,
+            mount_options: &[],
+        },
+    }
+}
+
 /// Create a filesystem of type `fs_type` on `dev` (only call on a blank device).
+///
+/// The built-in `mkfs` options come from the filesystem [`fs_profile`]. Returns
+/// an error for filesystem types that cannot be created on a live device
+/// (mount-only image / pool filesystems such as squashfs/zfs, and unknown
+/// types).
 pub fn mkfs(dev: &str, fs_type: &str) -> anyhow::Result<()> {
+    let mkfs_options = fs_profile(fs_type).mkfs_options.ok_or_else(|| {
+        anyhow::anyhow!("filesystem type {fs_type:?} does not support mkfs (cannot format {dev})")
+    })?;
     let mkfs_bin = format!("mkfs.{fs_type}");
     info!(dev, fs_type, "creating filesystem");
-    // `-F` forces creation without interactive confirmation; `-E nodiscard`
-    // avoids a full TRIM pass (faster, and discard maps onto Clear Pages).
-    // For ext4, use lazy_itable_init and lazy_journal_init to speed up mkfs
-    // on large devices (avoids writing zeros to entire inode tables and journal).
-    let args: Vec<&str> = if fs_type == "ext4" || fs_type == "ext3" || fs_type == "ext2" {
-        vec![
-            "-F",
-            "-E",
-            "nodiscard,lazy_itable_init=1,lazy_journal_init=1",
-            dev,
-        ]
-    } else {
-        vec![dev]
-    };
+    let mut args: Vec<&str> = mkfs_options.to_vec();
+    args.push(dev);
     run(&mkfs_bin, &args)
+}
+
+/// How to run `fsck` on a device before mounting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsckMode {
+    /// Don't run `fsck` (default).
+    Off,
+    /// `fsck -a`: automatically repair (preen) the filesystem; only minor,
+    /// safe-to-fix problems are corrected without prompting.
+    Preen,
+    /// `fsck -f -y`: force a full check even on a clean filesystem and answer
+    /// "yes" to every repair prompt.
+    Force,
+}
+
+impl FsckMode {
+    /// Parse a volume-context `fsck` value. Recognised values (case-insensitive):
+    /// `""`/`false`/`off`/`no`/`none`/`0` ⇒ [`FsckMode::Off`];
+    /// `true`/`auto`/`preen`/`yes`/`on`/`1` ⇒ [`FsckMode::Preen`];
+    /// `force`/`full` ⇒ [`FsckMode::Force`].
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "false" | "off" | "no" | "none" | "0" => Ok(FsckMode::Off),
+            "true" | "auto" | "preen" | "yes" | "on" | "1" => Ok(FsckMode::Preen),
+            "force" | "full" => Ok(FsckMode::Force),
+            other => bail!(
+                "invalid fsck value {other:?}; expected one of \
+                 false/off, true/preen/auto, or force"
+            ),
+        }
+    }
+}
+
+/// Run `fsck` on `dev` according to `mode` before mounting.
+///
+/// Only call this on a writable device that already carries a filesystem.
+/// `fsck` repairs in place, so the backing device must be read-write. Exit
+/// codes are interpreted per the `fsck(8)` bitmask: `0` (clean) and `1`
+/// (errors corrected) are treated as success; anything else — including `2`
+/// (corrected, reboot recommended), `4` (errors left uncorrected) and operational
+/// failures — is an error.
+pub fn fsck(dev: &str, fs_type: &str, mode: FsckMode) -> anyhow::Result<()> {
+    let args: Vec<&str> = match mode {
+        FsckMode::Off => return Ok(()),
+        // `-a` preens (auto-repair without prompting); non-interactive.
+        FsckMode::Preen => vec!["-t", fs_type, "-a", dev],
+        // `-f` forces a full check, `-y` answers yes to every prompt.
+        FsckMode::Force => vec!["-t", fs_type, "-f", "-y", dev],
+    };
+    info!(dev, fs_type, ?mode, "running fsck");
+    let output = Command::new("fsck")
+        .args(&args)
+        .output()
+        .with_context(|| format!("spawn `fsck {}`", args.join(" ")))?;
+    // `fsck` returns a bitmask: bit 0 (1) = errors corrected, bit 1 (2) = reboot
+    // recommended, bit 2 (4) = errors left uncorrected, bit 3 (8) = operational
+    // error, etc. Treat 0 (clean) and 1 (corrected) as success.
+    if let Some(code) = output.status.code() {
+        if code == 0 || code == 1 {
+            if code == 1 {
+                warn!(dev, "fsck corrected filesystem errors");
+            }
+            return Ok(());
+        }
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "`fsck {}` failed ({}): {} {}",
+        args.join(" "),
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    );
 }
 
 /// Mount `dev` at `target`, creating the mount point if needed.
@@ -359,6 +489,159 @@ pub fn mount(
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     info!(dev, target, fs_type, "mounting");
     run("mount", &arg_refs)
+}
+
+/// Node-local scratch directories backing an *ephemeral overlay* mount.
+///
+/// For a read-only (snapshot) volume the immutable filesystem is mounted at
+/// `lower` and an `overlayfs` is stacked on top with a writable `upper` (the
+/// pod-local change layer) and an empty `work` dir. The merged, writable view
+/// is presented at the CSI target path. The scratch lives on node disk and is
+/// discarded on unpublish, so writes never reach the immutable backing blob.
+///
+/// `lower` is always placed as a hidden sibling of the CSI target (it is only a
+/// mount point for the immutable filesystem). The writable `upper`/`work` pair
+/// must share one filesystem outside the merged mount (an overlayfs
+/// requirement); where they live depends on the layout:
+///
+///   * Default (`scratch_root = None`): `upper`/`work` are hidden siblings of
+///     the target too, on the per-volume kubelet directory's filesystem, and
+///     are naturally removed with that directory on unpublish.
+///   * Configured scratch base (`scratch_root = Some(_)`): `upper`/`work` live
+///     under an operator-chosen base (`overlayScratchDir`), on that base's
+///     filesystem — not on the target's — and are pruned explicitly via
+///     `scratch_root` on teardown so nothing leaks.
+#[derive(Clone, Debug)]
+pub struct OverlayDirs {
+    /// Read-only mount point of the immutable lower filesystem.
+    pub lower: String,
+    /// Writable upper layer (pod-local changes land here).
+    pub upper: String,
+    /// overlayfs work directory (must be empty and on the same fs as `upper`).
+    pub work: String,
+    /// Per-volume scratch root holding `upper`/`work` when an operator-chosen
+    /// scratch base is used (`None` for the default hidden-sibling layout).
+    /// Removed on teardown so nothing leaks on the configured filesystem.
+    pub scratch_root: Option<String>,
+}
+
+/// Sanitize a string to a filesystem-safe component (alphanumerics plus `-` and
+/// `_`), so an operator-supplied scratch base plus the volume id can't traverse
+/// paths (e.g. `..`) outside the configured scratch directory.
+fn sanitize_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// Derive the per-volume overlay scratch directories from the CSI `target` path.
+///
+/// `lower` is always a hidden sibling of `target` (it is only a mount point for
+/// the immutable filesystem). The writable `upper`/`work` pair must live on a
+/// single filesystem:
+///
+///   * With `scratch_base = None` (default) they are hidden siblings of `target`
+///     too — i.e. on the per-volume kubelet directory's filesystem — and are
+///     cleaned up together with the volume. Behaviour is unchanged.
+///   * With `scratch_base = Some(dir)` they are placed under
+///     `<dir>/<sanitized volume id>/{upper,work}`, letting operators steer the
+///     ephemeral write scratch onto a chosen filesystem (e.g. an SSD or tmpfs
+///     mount). The per-volume subdirectory keeps concurrent volumes isolated and
+///     is removed on teardown.
+pub fn overlay_dirs(target: &str, scratch_base: Option<&str>, volume_id: &str) -> OverlayDirs {
+    let parent = Path::new(target).parent().unwrap_or_else(|| Path::new("/"));
+    let sibling = |name: &str| parent.join(name).to_string_lossy().into_owned();
+    let lower = sibling(".ublk-overlay-lower");
+    match scratch_base {
+        Some(base) => {
+            let root = Path::new(base).join(sanitize_component(volume_id));
+            let upper = root.join("upper").to_string_lossy().into_owned();
+            let work = root.join("work").to_string_lossy().into_owned();
+            OverlayDirs {
+                lower,
+                upper,
+                work,
+                scratch_root: Some(root.to_string_lossy().into_owned()),
+            }
+        }
+        None => OverlayDirs {
+            lower,
+            upper: sibling(".ublk-overlay-upper"),
+            work: sibling(".ublk-overlay-work"),
+            scratch_root: None,
+        },
+    }
+}
+
+/// Mount `dev` read-only as the overlay lower, then stack a writable overlayfs
+/// with a node-local upper/work at `target`.
+///
+/// `dev` carries the immutable (snapshot) filesystem; it is mounted read-only at
+/// `dirs.lower` (reusing the read-only mount path, including the ext `noload`
+/// fixup), then an `overlay` filesystem is mounted at `target` presenting a
+/// writable merged view whose writes land in `dirs.upper`.
+pub fn mount_overlay(
+    dev: &str,
+    target: &str,
+    fs_type: &str,
+    mount_flags: &[String],
+    dirs: &OverlayDirs,
+) -> anyhow::Result<()> {
+    // Start from clean scratch dirs: a stale, non-empty work dir makes the
+    // overlay mount fail, and a leftover upper would resurrect prior writes.
+    let _ = std::fs::remove_dir_all(&dirs.upper);
+    let _ = std::fs::remove_dir_all(&dirs.work);
+    for d in [&dirs.lower, &dirs.upper, &dirs.work] {
+        std::fs::create_dir_all(d).with_context(|| format!("create overlay dir {d}"))?;
+    }
+
+    // Mount the immutable lower read-only (ro + ext `noload` are added by
+    // `mount` when `readonly` is set).
+    mount(dev, &dirs.lower, fs_type, mount_flags, true)?;
+
+    std::fs::create_dir_all(target).with_context(|| format!("create overlay target {target}"))?;
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        dirs.lower, dirs.upper, dirs.work
+    );
+    info!(target, lower = %dirs.lower, "mounting ephemeral overlay");
+    if let Err(e) = run("mount", &["-t", "overlay", "overlay", "-o", &opts, target]) {
+        // Roll back the lower mount so a failed overlay doesn't leak it.
+        let _ = umount(&dirs.lower);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Tear down an ephemeral overlay: unmount the merged view and the lower, then
+/// remove the node-local scratch (discarding all pod-local writes). Idempotent.
+pub fn umount_overlay(target: &str, dirs: &OverlayDirs) -> anyhow::Result<()> {
+    umount(target)?;
+    umount(&dirs.lower)?;
+    // Best-effort scratch removal; the writes are already gone once unmounted.
+    for d in [&dirs.upper, &dirs.work, &dirs.lower] {
+        if let Err(e) = std::fs::remove_dir_all(d) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(dir = %d, error = %e, "overlay scratch removal failed");
+            }
+        }
+    }
+    // For an operator-configured scratch base, also prune the per-volume root
+    // (which holds `upper`/`work`) so nothing leaks on the chosen filesystem.
+    if let Some(root) = &dirs.scratch_root {
+        if let Err(e) = std::fs::remove_dir_all(root) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(dir = %root, error = %e, "overlay scratch root removal failed");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Unmount `target` (idempotent: a "not mounted" result is treated as success).
@@ -407,4 +690,232 @@ fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Filesystems whose built-in profile must be able to format a fresh blob.
+    const FORMATTABLE: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs"];
+    /// Mount-only image / pool filesystems: never freshly formatted on a live
+    /// device (squashfs/zfs are read-only images; ntfs has no reliable
+    /// read-write mkfs we ship), so their profile must reject `mkfs`.
+    const MOUNT_ONLY: &[&str] = &["squashfs", "zfs", "ntfs"];
+
+    #[test]
+    fn fsck_mode_parses_off_values() {
+        for v in ["", "  ", "false", "OFF", "No", "none", "0"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Off, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_parses_preen_values() {
+        for v in ["true", "TRUE", "auto", "preen", "yes", "on", "1"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Preen, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_parses_force_values() {
+        for v in ["force", "Full"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Force, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_rejects_unknown_values() {
+        assert!(FsckMode::parse("maybe").is_err());
+    }
+
+    #[test]
+    fn overlay_dirs_are_hidden_siblings_of_target() {
+        let dirs = overlay_dirs(
+            "/var/lib/kubelet/pods/abc/volumes/x/pvc-1/mount",
+            None,
+            "pvc-1",
+        );
+        let parent = "/var/lib/kubelet/pods/abc/volumes/x/pvc-1";
+        assert_eq!(dirs.lower, format!("{parent}/.ublk-overlay-lower"));
+        assert_eq!(dirs.upper, format!("{parent}/.ublk-overlay-upper"));
+        assert_eq!(dirs.work, format!("{parent}/.ublk-overlay-work"));
+        assert!(dirs.scratch_root.is_none());
+        // upper and work must share the target's parent filesystem and must not
+        // sit inside the merged target (an overlayfs requirement).
+        for d in [&dirs.upper, &dirs.work, &dirs.lower] {
+            assert!(!d.starts_with("/var/lib/kubelet/pods/abc/volumes/x/pvc-1/mount/"));
+            assert!(d.starts_with(parent));
+        }
+    }
+
+    #[test]
+    fn overlay_dirs_use_configured_scratch_base() {
+        let dirs = overlay_dirs(
+            "/var/lib/kubelet/pods/abc/volumes/x/pvc-1/mount",
+            Some("/mnt/ssd/overlay"),
+            "pvc-1",
+        );
+        let root = "/mnt/ssd/overlay/pvc-1";
+        // lower stays a hidden sibling of the target (it is only a mount point).
+        assert_eq!(
+            dirs.lower,
+            "/var/lib/kubelet/pods/abc/volumes/x/pvc-1/.ublk-overlay-lower"
+        );
+        // upper and work move onto the configured base, under a per-volume root
+        // so they share one filesystem and can't collide across volumes.
+        assert_eq!(dirs.upper, format!("{root}/upper"));
+        assert_eq!(dirs.work, format!("{root}/work"));
+        assert_eq!(dirs.scratch_root.as_deref(), Some(root));
+    }
+
+    #[test]
+    fn overlay_dirs_sanitize_volume_id_for_scratch_base() {
+        // A volume id with path separators must not escape the scratch base.
+        let dirs = overlay_dirs("/tgt/mount", Some("/mnt/ssd"), "../../etc/evil");
+        assert_eq!(
+            dirs.scratch_root.as_deref(),
+            Some("/mnt/ssd/______etc_evil")
+        );
+        assert!(dirs.upper.starts_with("/mnt/ssd/______etc_evil/"));
+    }
+
+    #[test]
+    fn fs_profile_formattable_types_have_mkfs_options() {
+        for fs in FORMATTABLE {
+            assert!(
+                fs_profile(fs).mkfs_options.is_some(),
+                "formattable filesystem {fs:?} must have built-in mkfs options"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_profile_mount_only_and_unknown_types_have_no_mkfs_options() {
+        for fs in MOUNT_ONLY.iter().chain(["not-a-fs", ""].iter()) {
+            assert!(
+                fs_profile(fs).mkfs_options.is_none(),
+                "mount-only / unknown filesystem {fs:?} must not advertise mkfs options"
+            );
+        }
+    }
+
+    /// `mkfs` returns a "format not supported" error (instead of shelling out to
+    /// a missing `mkfs.<fs>`) for every filesystem that cannot be created on a
+    /// live device.
+    #[test]
+    fn mkfs_rejects_unformattable_filesystems() {
+        for fs in MOUNT_ONLY.iter().chain(["not-a-fs"].iter()) {
+            let err = mkfs("/dev/null", fs).expect_err(&format!(
+                "mkfs({fs:?}) must fail for an unformattable filesystem"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not support mkfs"),
+                "unexpected error for {fs:?}: {msg}"
+            );
+        }
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: `geteuid` has no preconditions and never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn have_tool(bin: &str) -> bool {
+        Command::new(bin)
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// End-to-end check that every formattable profile actually formats and
+    /// mounts: back a loop device with a sparse image, run the real
+    /// [`mkfs`]/[`mount`]/[`umount`] (which source their flags from the built-in
+    /// profile), and round-trip a file through the mounted filesystem.
+    ///
+    /// Needs root + loop devices + the per-filesystem `mkfs.<fs>` tool; it skips
+    /// (rather than fails) when the environment cannot provide them. CI's
+    /// `cargo test` job runs as a non-root user, so this skips there; it
+    /// exercises the full format+mount path only when invoked as root locally.
+    /// In CI the equivalent coverage comes from the `mount_e2e`
+    /// `mount_formattable_fs_profiles` integration test, which formats+mounts the
+    /// xfs/btrfs profiles on real ublk devices on the privileged e2e runner.
+    #[test]
+    fn formattable_profiles_format_and_mount() {
+        if !is_root() || !have_tool("losetup") {
+            eprintln!("skipping formattable_profiles_format_and_mount: needs root + losetup");
+            return;
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp =
+            std::env::temp_dir().join(format!("ublk-mkfs-e2e-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        for fs in FORMATTABLE {
+            // ext2/ext3/ext4 all share `mkfs.ext*`; xfs needs ~300 MiB minimum,
+            // so size every image generously at 512 MiB (sparse, so cheap).
+            if !have_tool(&format!("mkfs.{fs}")) {
+                eprintln!("skipping {fs}: mkfs.{fs} not installed");
+                continue;
+            }
+
+            let img = tmp.join(format!("{fs}.img"));
+            {
+                let f = std::fs::File::create(&img).expect("create image file");
+                f.set_len(512 * 1024 * 1024).expect("size image file");
+            }
+            let img_str = img.to_str().unwrap();
+
+            // Attach a loop device for the image.
+            let out = Command::new("losetup")
+                .args(["--find", "--show", img_str])
+                .output()
+                .expect("spawn losetup");
+            if !out.status.success() {
+                // No usable loop device (e.g. a root container without loop
+                // support): skip rather than fail, matching the documented intent.
+                eprintln!(
+                    "skipping {fs}: losetup --find failed (no usable loop device): {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let _ = std::fs::remove_file(&img);
+                continue;
+            }
+            let dev = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+            let mount_point = tmp.join(format!("{fs}.mnt"));
+            let mount_point_str = mount_point.to_str().unwrap();
+
+            // Format and mount via the real profile-driven helpers.
+            mkfs(&dev, fs).unwrap_or_else(|e| panic!("mkfs.{fs} failed: {e}"));
+            let mount_opts: Vec<String> = fs_profile(fs)
+                .mount_options
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            mount(&dev, mount_point_str, fs, &mount_opts, false)
+                .unwrap_or_else(|e| panic!("mount {fs} failed: {e}"));
+
+            // Round-trip a file through the mounted filesystem.
+            let payload = b"precooked-fs-roundtrip";
+            let file = mount_point.join("probe");
+            std::fs::write(&file, payload).expect("write probe file");
+            let read = std::fs::read(&file).expect("read probe file");
+            assert_eq!(read, payload, "{fs} round-trip mismatch");
+
+            umount(mount_point_str).unwrap_or_else(|e| panic!("umount {fs} failed: {e}"));
+            let _ = Command::new("losetup").args(["-d", &dev]).status();
+            let _ = std::fs::remove_file(&img);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

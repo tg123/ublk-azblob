@@ -115,6 +115,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- include "ublk-azblob-csi.ioEnv" . | nindent 12 }}
             {{- if .Values.node.useNbd }}
             # NBD mode configuration
             - name: CSI_USE_NBD
@@ -123,6 +124,35 @@ spec:
               value: "127.0.0.1"
             - name: CSI_NBD_PORT_START
               value: {{ .Values.node.nbd.portStart | quote }}
+            {{- end }}
+            {{- if .Values.node.cache.enabled }}
+            # Local-disk cache configuration (shared by all volumes on the node).
+            # The child `run` process inherits these and caches blob pages on the
+            # mounted host directory, with a cross-volume LRU byte budget.
+            - name: UBLK_CACHE_DIR
+              value: {{ .Values.node.cache.hostPath | quote }}
+            - name: UBLK_CACHE_MAX_BYTES
+              value: {{ .Values.node.cache.maxBytes | int64 | quote }}
+            - name: UBLK_CACHE_PAGE_SIZE
+              value: {{ .Values.node.cache.pageSize | int64 | quote }}
+            {{- if .Values.node.cache.sharePages }}
+            # Cross-process clean-page sharing: volumes caching the same blob
+            # serve each other's clean pages off the shared directory. The node
+            # plugin assigns each volume a unique UBLK_CACHE_INSTANCE.
+            - name: UBLK_CACHE_SHARE_PAGES
+              value: "1"
+            {{- end }}
+            {{- if .Values.node.cache.warmup }}
+            # Background cache warm-up: each volume prefetches its blob into the
+            # cache on start (sharing-aware). Best for read-only / read-mostly
+            # datasets that fit the cache budget.
+            - name: UBLK_CACHE_WARMUP
+              value: "1"
+            {{- if .Values.node.cache.warmupBytes }}
+            - name: UBLK_CACHE_WARMUP_BYTES
+              value: {{ .Values.node.cache.warmupBytes | int64 | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             {{- with .Values.node.env }}
             # Additional environment variables
@@ -140,6 +170,11 @@ spec:
             - name: modules-dir
               mountPath: /lib/modules
               readOnly: true
+            {{- if .Values.node.cache.enabled }}
+            - name: cache-dir
+              mountPath: {{ .Values.node.cache.hostPath }}
+              mountPropagation: None
+            {{- end }}
             {{- with .Values.node.volumeMounts }}
             # Additional volume mounts
             {{- toYaml . | nindent 12 }}
@@ -169,6 +204,12 @@ spec:
           hostPath:
             path: /lib/modules
             type: DirectoryOrCreate
+        {{- if .Values.node.cache.enabled }}
+        - name: cache-dir
+          hostPath:
+            path: {{ .Values.node.cache.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
         {{- with .Values.node.volumes }}
         # Additional volumes
         {{- toYaml . | nindent 8 }}

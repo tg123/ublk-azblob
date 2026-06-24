@@ -47,7 +47,7 @@ pub mod proto {
 use anyhow::Context as _;
 use std::path::Path;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::{self, AuthConfig, UserAssignedIdentity};
 use crate::backend::{azure::AzurePageBlobBackend, BlobBackend};
@@ -349,6 +349,14 @@ pub fn build_template_backend(
     let container_client = auth::build_container_client(&service_url, &tmpl.container, &auth)
         .context("build template container client")?;
     let mut backend = AzurePageBlobBackend::new(container_client, tmpl.blob.clone());
+    // Auth-wired pipeline for `Get Page Ranges` so the copy can query the
+    // source's sparseness map and skip its zero ranges; best-effort.
+    match auth::build_pipeline(&auth) {
+        Ok(pipeline) => backend = backend.with_page_list(pipeline),
+        Err(err) => {
+            warn!(%err, "source page-ranges query disabled (could not build auth pipeline)")
+        }
+    }
     if let Some(snapshot) = &tmpl.snapshot {
         backend = backend.with_snapshot(snapshot.clone());
     }
@@ -388,7 +396,17 @@ pub fn build_backend_concrete(
 ///   streamed copy through `source` (download → upload).
 ///
 /// `source_url` is the raw `templateBlobUrl` (already carrying any `snapshot=` /
-/// SAS query). `dest` must already exist and be at least `total_size`.
+/// SAS query). `dest` must already exist and be at least `total_size`; it need
+/// **not** be freshly zeroed — zero ranges are cleared on the destination (see
+/// below), so a retry against an existing same-size blob is safe.
+///
+/// When the `source` can report its sparseness map (via
+/// [`BlobBackend::data_ranges`]), ranges that the source never wrote are
+/// **cleared** on the destination rather than copied: neither the server-side
+/// nor the streamed path reads them from the source, but both issue
+/// `Clear Pages` / `clear` so the destination reads back as zero there even if
+/// it previously held data. A source that cannot report ranges degrades to
+/// copying every byte.
 pub async fn copy_template(
     dest: &AzurePageBlobBackend,
     source: &dyn BlobBackend,
@@ -397,6 +415,26 @@ pub async fn copy_template(
     dest_auth: &AuthConfig,
     total_size: u64,
 ) -> anyhow::Result<()> {
+    // Best-effort source sparseness map: lets both copy paths clear (instead of
+    // copying) the source's unwritten free space on the destination, so a
+    // non-empty/retried target is still zeroed there. A missing or errored map
+    // copies in full.
+    let data_ranges = match source.data_ranges().await {
+        Ok(ranges) => ranges,
+        Err(err) => {
+            warn!(%err, "source data-ranges query failed; copying the whole blob");
+            None
+        }
+    };
+    if let Some(ranges) = &data_ranges {
+        let data_bytes: u64 = ranges.iter().map(|&(_, len)| len).sum();
+        info!(
+            data_ranges = ranges.len(),
+            data_bytes, "copy using source sparseness map (skipping zero ranges)"
+        );
+    }
+    let data_ranges = data_ranges.as_deref();
+
     // A SAS in the URL authenticates the source itself; otherwise the storage
     // service needs an Entra copy-source authorization (minted per batch inside
     // `copy_pages_from_url`). SharedKey with no SAS can't authenticate a
@@ -413,21 +451,22 @@ pub async fn copy_template(
             total_size,
             "server-side copy (Put Page From URL, SAS source)"
         );
-        dest.copy_pages_from_url(source_url, total_size, None).await
+        dest.copy_pages_from_url(source_url, total_size, None, data_ranges)
+            .await
     } else if entra_token.is_some() {
         info!(
             total_size,
             "server-side copy (Put Page From URL, Entra source)"
         );
         // Pass the auth (not the probe token) so the token is re-minted per batch.
-        dest.copy_pages_from_url(source_url, total_size, Some(dest_auth.clone()))
+        dest.copy_pages_from_url(source_url, total_size, Some(dest_auth.clone()), data_ranges)
             .await
     } else {
         info!(
             total_size,
             "no copy-source authorization (SharedKey, no SAS); streaming the copy"
         );
-        copy_blob_streamed(source, dest, total_size).await
+        copy_blob_streamed(source, dest, total_size, data_ranges).await
     }
 }
 
@@ -435,26 +474,66 @@ pub async fn copy_template(
 /// fallback used by [`copy_template`] when a server-side copy isn't possible).
 ///
 /// Copies in 4 MiB page-aligned chunks; sparse source ranges read back as zeros.
+///
+/// `source_data_ranges` is the source sparseness map: when `Some`, chunks lying
+/// entirely in a zero gap are **cleared** on `dest` (via `clear`) rather than
+/// copied — neither read from the source nor written from it — so the
+/// destination reads back as zero there even when it is not a freshly-created
+/// blob (e.g. a retry against an existing same-size target).
 async fn copy_blob_streamed(
     source: &dyn BlobBackend,
     dest: &dyn BlobBackend,
     total_size: u64,
+    source_data_ranges: Option<&[(u64, u64)]>,
 ) -> anyhow::Result<()> {
-    let chunk = crate::backend::copy_chunk_bytes();
-    let mut offset = 0u64;
-    while offset < total_size {
-        let len = chunk.min(total_size - offset);
-        let data = source
-            .read(offset, len)
-            .await
-            .with_context(|| format!("read template offset={offset} len={len}"))?;
-        dest.write(offset, data)
-            .await
-            .with_context(|| format!("write copy offset={offset} len={len}"))?;
-        offset += len;
-    }
-    dest.flush().await.context("flush copied blob")?;
-    Ok(())
+    use crate::backend::io_gateway::{with_class, IoClass};
+    // Tag both the source reads (downloads) and destination writes (uploads) as
+    // copy traffic so the I/O gateway prioritizes foreground reads and flushes
+    // ahead of this bulk copy.
+    with_class(IoClass::Copy, async move {
+        let chunk = crate::backend::copy_chunk_bytes();
+        let mut offset = 0u64;
+        let mut copied_bytes = 0u64;
+        let mut cleared_bytes = 0u64;
+        while offset < total_size {
+            let len = chunk.min(total_size - offset);
+            if let Some(ranges) = source_data_ranges {
+                if !crate::backend::range_intersects(ranges, offset, len) {
+                    // Zero gap in the source: clear the destination range rather
+                    // than copying zeros. This avoids the source read but still
+                    // guarantees the destination reads back as zero there even
+                    // when it is not a freshly-created blob (create() is
+                    // idempotent and does not zero an existing same-size target,
+                    // so a retry could otherwise retain stale data and corrupt
+                    // the clone).
+                    dest.clear(offset, len)
+                        .await
+                        .with_context(|| format!("clear copy offset={offset} len={len}"))?;
+                    cleared_bytes += len;
+                    offset += len;
+                    continue;
+                }
+            }
+            let data = source
+                .read(offset, len)
+                .await
+                .with_context(|| format!("read template offset={offset} len={len}"))?;
+            dest.write(offset, data)
+                .await
+                .with_context(|| format!("write copy offset={offset} len={len}"))?;
+            copied_bytes += len;
+            offset += len;
+        }
+        dest.flush().await.context("flush copied blob")?;
+        if source_data_ranges.is_some() {
+            info!(
+                copied_bytes,
+                cleared_bytes, total_size, "streamed copy cleared source zero ranges"
+            );
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Round `n` up to the next multiple of 512 (the page-blob alignment), with a
@@ -464,113 +543,9 @@ pub fn round_up_512(n: u64) -> u64 {
     aligned.max(512)
 }
 
-/// A parsed `templateBlobUrl` (the StorageClass golden-image source).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TemplateBlobRef {
-    /// Blob *service* URL the rest of the code expects (`build_container_client`
-    /// appends `/container`): subdomain-style `https://acct.blob.core.windows.net`
-    /// for Azure, or `http://host:port/account` for Azurite/path-style.
-    pub service_url: String,
-    /// Storage account name.
-    pub account: String,
-    /// Container name.
-    pub container: String,
-    /// Blob name (may contain `/`).
-    pub blob: String,
-    /// Optional `snapshot=` timestamp from the URL.
-    pub snapshot: Option<String>,
-    /// Optional SAS query string (everything except `snapshot`, present only when
-    /// the URL carries a `sig=` signature).
-    pub sas: Option<String>,
-}
-
-/// Parse a full Azure blob URL (`templateBlobUrl`) into its components.
-///
-/// Supports both Azure subdomain hosts (`<account>.blob.core.windows.net`) and
-/// path-style/Azurite hosts (`host:port/<account>/...`). Any `snapshot=` query
-/// is split out; the remaining query (when it carries a `sig=`) is returned as
-/// the SAS token.
-pub fn parse_blob_url(url: &str) -> anyhow::Result<TemplateBlobRef> {
-    let parsed = azure_core::http::Url::parse(url)
-        .with_context(|| format!("parse templateBlobUrl: {url}"))?;
-    let scheme = parsed.scheme();
-    let host = parsed
-        .host_str()
-        .context("templateBlobUrl has no host")?
-        .to_string();
-
-    // Split query into snapshot vs the rest (SAS).
-    let mut snapshot = None;
-    let mut sas_pairs: Vec<(String, String)> = Vec::new();
-    let mut has_sig = false;
-    for (k, v) in parsed.query_pairs() {
-        if k == "snapshot" {
-            snapshot = Some(v.into_owned());
-        } else {
-            if k == "sig" {
-                has_sig = true;
-            }
-            sas_pairs.push((k.into_owned(), v.into_owned()));
-        }
-    }
-    let sas = if has_sig {
-        let mut tmp = azure_core::http::Url::parse("https://x/").unwrap();
-        tmp.query_pairs_mut().extend_pairs(&sas_pairs);
-        tmp.query().map(|q| q.to_string())
-    } else {
-        None
-    };
-
-    let segments: Vec<String> = parsed
-        .path_segments()
-        .map(|it| {
-            it.filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Azure subdomain style: `<account>.blob.<suffix>` → account is the first
-    // host label, the path is `<container>/<blob...>`.
-    let azure_subdomain = host.contains(".blob.");
-    let (service_url, account, container, blob) = if azure_subdomain {
-        let account = host.split('.').next().unwrap_or("").to_string();
-        if segments.len() < 2 {
-            anyhow::bail!("templateBlobUrl missing container/blob path: {url}");
-        }
-        let container = segments[0].clone();
-        let blob = segments[1..].join("/");
-        let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-        (format!("{scheme}://{host}{port}"), account, container, blob)
-    } else {
-        // Path-style / Azurite: `host:port/<account>/<container>/<blob...>`.
-        if segments.len() < 3 {
-            anyhow::bail!("templateBlobUrl missing account/container/blob path: {url}");
-        }
-        let account = segments[0].clone();
-        let container = segments[1].clone();
-        let blob = segments[2..].join("/");
-        let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-        (
-            format!("{scheme}://{host}{port}/{account}"),
-            account,
-            container,
-            blob,
-        )
-    };
-
-    if container.is_empty() || blob.is_empty() {
-        anyhow::bail!("templateBlobUrl missing container or blob: {url}");
-    }
-    Ok(TemplateBlobRef {
-        service_url,
-        account,
-        container,
-        blob,
-        snapshot,
-        sas,
-    })
-}
+/// Re-exported from [`crate::bloburl`]: a parsed Azure blob URL (used here for
+/// the StorageClass `templateBlobUrl` golden-image source).
+pub use crate::bloburl::{parse_blob_url, TemplateBlobRef};
 
 #[cfg(test)]
 mod tests {
@@ -613,57 +588,5 @@ mod tests {
         assert_eq!("NODE".parse::<Role>().unwrap(), Role::Node);
         assert_eq!("all".parse::<Role>().unwrap(), Role::All);
         assert!("bogus".parse::<Role>().is_err());
-    }
-
-    #[test]
-    fn parse_blob_url_azure_subdomain() {
-        let r =
-            parse_blob_url("https://myacct.blob.core.windows.net/images/golden/disk.vhd").unwrap();
-        assert_eq!(r.service_url, "https://myacct.blob.core.windows.net");
-        assert_eq!(r.account, "myacct");
-        assert_eq!(r.container, "images");
-        assert_eq!(r.blob, "golden/disk.vhd");
-        assert_eq!(r.snapshot, None);
-        assert_eq!(r.sas, None);
-    }
-
-    #[test]
-    fn parse_blob_url_azurite_path_style() {
-        let r = parse_blob_url("http://127.0.0.1:10000/devstoreaccount1/images/golden/disk.vhd")
-            .unwrap();
-        assert_eq!(r.service_url, "http://127.0.0.1:10000/devstoreaccount1");
-        assert_eq!(r.account, "devstoreaccount1");
-        assert_eq!(r.container, "images");
-        assert_eq!(r.blob, "golden/disk.vhd");
-    }
-
-    #[test]
-    fn parse_blob_url_with_sas_and_snapshot() {
-        let r = parse_blob_url(
-            "https://myacct.blob.core.windows.net/c/b?snapshot=2024-01-02T03:04:05.0Z&sv=2022-11-02&sig=ABC%2Bdef&se=2030-01-01",
-        )
-        .unwrap();
-        assert_eq!(r.account, "myacct");
-        assert_eq!(r.container, "c");
-        assert_eq!(r.blob, "b");
-        assert_eq!(r.snapshot.as_deref(), Some("2024-01-02T03:04:05.0Z"));
-        let sas = r.sas.expect("sas present");
-        assert!(sas.contains("sig=ABC%2Bdef"));
-        assert!(sas.contains("sv=2022-11-02"));
-        assert!(!sas.contains("snapshot"));
-    }
-
-    #[test]
-    fn parse_blob_url_no_sig_means_no_sas() {
-        // A bare query without a signature is not treated as a SAS token.
-        let r = parse_blob_url("https://myacct.blob.core.windows.net/c/b?foo=bar").unwrap();
-        assert_eq!(r.sas, None);
-    }
-
-    #[test]
-    fn parse_blob_url_rejects_incomplete() {
-        assert!(parse_blob_url("https://myacct.blob.core.windows.net/onlycontainer").is_err());
-        assert!(parse_blob_url("http://127.0.0.1:10000/acct/onlycontainer").is_err());
-        assert!(parse_blob_url("not a url").is_err());
     }
 }

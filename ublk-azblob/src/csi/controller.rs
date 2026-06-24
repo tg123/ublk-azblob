@@ -37,8 +37,32 @@ const PARAM_STORAGE_ACCOUNT: &str = "storageAccount";
 const PARAM_CONTAINER: &str = "container";
 /// Parameter key for blob path template.
 const PARAM_BLOB_PATH_TEMPLATE: &str = "blobPathTemplate";
-/// Parameter key selecting the on-disk filesystem the node should create.
-const PARAM_FS_TYPE: &str = "fsType";
+/// Parameter key (StorageClass `parameters`) selecting the on-disk filesystem
+/// the node should create when formatting a freshly-provisioned (non-template)
+/// blob.
+const PARAM_NEW_BLOB_FS_TYPE: &str = "newBlobFsType";
+/// Parameter key (StorageClass `parameters`) selecting the filesystem the node
+/// should mount when provisioning from a golden-image template (`templateBlobUrl`).
+/// The template is never reformatted, so this is the type it already carries.
+/// Only meaningful when `templateBlobUrl` is set.
+const PARAM_TEMPLATE_BLOB_FS_TYPE: &str = "templateBlobFsType";
+/// Advanced parameter key (StorageClass `parameters`) overriding the built-in
+/// mount options that the `templateBlobFsType` profile would otherwise apply.
+/// Only meaningful when `templateBlobUrl` is set.
+const PARAM_TEMPLATE_BLOB_MOUNT_ARGS: &str = "templateBlobMountArgsOverwrite";
+/// Parameter key (StorageClass `parameters`) opting a read-only snapshot volume
+/// into an **ephemeral overlay**: the node presents a writable merged view over
+/// the immutable snapshot whose writes land in a node-local upper layer that is
+/// discarded on unpublish (pod-local changes never reach the blob). Only
+/// meaningful for a `templateBlobUrl` that targets a snapshot (`?snapshot=`).
+const PARAM_OVERLAY: &str = "overlay";
+/// Parameter key (StorageClass `parameters`) choosing the node-local filesystem
+/// that backs an ephemeral overlay's writable scratch (`upperdir`/`workdir`).
+/// When unset the scratch lives next to the CSI target (the per-volume kubelet
+/// directory); set it to steer writes onto a chosen mount (e.g. an SSD or tmpfs)
+/// that the operator has pre-created on every node. Only meaningful with
+/// `overlay: "true"`.
+const PARAM_OVERLAY_SCRATCH_DIR: &str = "overlayScratchDir";
 /// Parameter keys for the optional cluster-lease coordination, forwarded to the
 /// node via the volume context (the node's `child_env` reads them).
 const PARAM_COORDINATION: &str = "coordination";
@@ -51,18 +75,11 @@ const PARAM_LEASE_DURATION_SECS: &str = "leaseDurationSecs";
 /// `templateBlobUrl` that includes a `?snapshot=<timestamp>` query, and read by
 /// the node to mount the immutable snapshot read-only.
 const PARAM_SNAPSHOT: &str = "snapshot";
-/// Parameter key exposing the volume read-only (no writes reach the blob).
-const PARAM_READ_ONLY: &str = "readOnly";
 /// Parameter key: a full Azure blob URL to use as a golden-image template.
-/// Read-only/snapshot volumes mount it directly (no lock/lease); read-write
-/// volumes copy it into a fresh per-PVC blob and skip formatting.
+/// A template URL that targets a **snapshot** (`?snapshot=`) is mounted directly
+/// read-only (no lock/lease); a non-snapshot template is copied into a fresh
+/// per-PVC blob (read-write) and formatting is skipped.
 const PARAM_TEMPLATE_BLOB_URL: &str = "templateBlobUrl";
-
-/// Parse a `"true"`/`"1"`/`"yes"` style flag value.
-fn is_truthy(v: Option<&String>) -> bool {
-    v.map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
-}
 
 /// Default blob path template
 const DEFAULT_BLOB_PATH_TEMPLATE: &str = "ublk-azblob-disk/${pv.name}";
@@ -210,11 +227,9 @@ impl Controller for ControllerService {
         ));
 
         // `templateBlobUrl` provisions the volume from a golden-image blob.
-        // Read-only when the StorageClass opts in via `readOnly`, or when the
-        // template URL targets a snapshot — such volumes mount the template
-        // directly with no copy, no lock and no lease; read-write volumes copy
-        // the template into the per-PVC blob.
-        let read_only_mode = is_truthy(req.parameters.get(PARAM_READ_ONLY));
+        // Read-only exactly when the template URL targets a snapshot — such
+        // volumes mount the template directly with no copy, no lock and no lease;
+        // a non-snapshot template is copied into the per-PVC blob (read-write).
 
         // Tracks state when provisioning from a template (see below).
         let mut size = size;
@@ -228,7 +243,7 @@ impl Controller for ControllerService {
         {
             let tmpl = parse_blob_url(template_url)
                 .map_err(|e| Status::invalid_argument(format!("templateBlobUrl: {e:#}")))?;
-            let read_only_mode = read_only_mode || tmpl.snapshot.is_some();
+            let read_only_mode = tmpl.snapshot.is_some();
             let source = build_template_backend(&self.config, &tmpl, &req.secrets)
                 .map_err(|e| Status::internal(format!("build template backend: {e:#}")))?;
             let source_size = source
@@ -252,15 +267,32 @@ impl Controller for ControllerService {
                     format!("{}/", tmpl.service_url.trim_end_matches('/')),
                 );
                 volume_context.insert("size".to_string(), source_size.to_string());
-                volume_context.insert(PARAM_READ_ONLY.to_string(), "true".to_string());
                 if let Some(snapshot) = &tmpl.snapshot {
                     volume_context.insert(PARAM_SNAPSHOT.to_string(), snapshot.clone());
                 }
                 if let Some(sas) = &tmpl.sas {
                     volume_context.insert("sasToken".to_string(), sas.clone());
                 }
-                if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
-                    volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
+                if let Some(fs) = req.parameters.get(PARAM_NEW_BLOB_FS_TYPE) {
+                    volume_context.insert(PARAM_NEW_BLOB_FS_TYPE.to_string(), fs.clone());
+                }
+                // A read-only template is mounted (never formatted), so the node
+                // mounts it as `templateBlobFsType`; `templateBlobMountArgsOverwrite` lets
+                // an advanced user override the profile's built-in mount options.
+                if let Some(fs) = req.parameters.get(PARAM_TEMPLATE_BLOB_FS_TYPE) {
+                    volume_context.insert(PARAM_TEMPLATE_BLOB_FS_TYPE.to_string(), fs.clone());
+                }
+                if let Some(args) = req.parameters.get(PARAM_TEMPLATE_BLOB_MOUNT_ARGS) {
+                    volume_context.insert(PARAM_TEMPLATE_BLOB_MOUNT_ARGS.to_string(), args.clone());
+                }
+                // Opt-in ephemeral overlay: the node stacks a writable node-local
+                // layer over the immutable snapshot so pods can write locally
+                // without mutating (or copying) the shared golden image.
+                if let Some(v) = req.parameters.get(PARAM_OVERLAY) {
+                    volume_context.insert(PARAM_OVERLAY.to_string(), v.clone());
+                }
+                if let Some(v) = req.parameters.get(PARAM_OVERLAY_SCRATCH_DIR) {
+                    volume_context.insert(PARAM_OVERLAY_SCRATCH_DIR.to_string(), v.clone());
                 }
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
@@ -334,8 +366,19 @@ impl Controller for ControllerService {
             // mkfs so it preserves the template's contents.
             volume_context.insert("fromTemplate".to_string(), "true".to_string());
         }
-        if let Some(fs) = req.parameters.get(PARAM_FS_TYPE) {
-            volume_context.insert(PARAM_FS_TYPE.to_string(), fs.clone());
+        if let Some(fs) = req.parameters.get(PARAM_NEW_BLOB_FS_TYPE) {
+            volume_context.insert(PARAM_NEW_BLOB_FS_TYPE.to_string(), fs.clone());
+        }
+        // `templateBlobFsType` / `templateBlobMountArgsOverwrite` only apply when the
+        // volume is provisioned from a golden-image template (it is copied, not
+        // formatted, so the node mounts it as the template's existing filesystem).
+        if from_template {
+            if let Some(fs) = req.parameters.get(PARAM_TEMPLATE_BLOB_FS_TYPE) {
+                volume_context.insert(PARAM_TEMPLATE_BLOB_FS_TYPE.to_string(), fs.clone());
+            }
+            if let Some(args) = req.parameters.get(PARAM_TEMPLATE_BLOB_MOUNT_ARGS) {
+                volume_context.insert(PARAM_TEMPLATE_BLOB_MOUNT_ARGS.to_string(), args.clone());
+            }
         }
         // Forward the coordination opt-in (and its tuning) from the StorageClass
         // parameters into the volume context, since CSI only hands the node the
@@ -346,7 +389,6 @@ impl Controller for ControllerService {
             PARAM_LEASE_NAMESPACE,
             PARAM_RECOVERY_TIMEOUT_SECS,
             PARAM_LEASE_DURATION_SECS,
-            PARAM_READ_ONLY,
         ] {
             if let Some(v) = req.parameters.get(key) {
                 volume_context.insert(key.to_string(), v.clone());

@@ -5,23 +5,27 @@
 //! trait.  The Azure SDK is **completely isolated** inside this module — no SDK
 //! type crosses the `BlobBackend` boundary into the rest of the crate.
 
+use super::io_gateway::{current_class, AzureIoGateway, IoClass};
 use super::BlobBackend;
 use crate::coordination::{BlobLock, LockError};
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
+use azure_core::http::{Context, Method, Pipeline, Request, Url};
 use azure_storage_blob::{
     models::{
         BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
         BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
-        PageBlobClientCreateOptions, PageBlobClientUploadPagesFromUrlOptions,
-        PageBlobClientUploadPagesOptions,
+        PageBlobClientClearPagesResultHeaders, PageBlobClientCreateOptions,
+        PageBlobClientUploadPagesFromUrlOptions, PageBlobClientUploadPagesOptions,
+        PageBlobClientUploadPagesResultHeaders,
     },
     BlobClient, BlobContainerClient,
 };
 use bytes::Bytes;
 use futures::stream::{StreamExt as _, TryStreamExt as _};
+use std::sync::Arc;
 use std::sync::RwLock;
-use tracing::{error, instrument, trace};
+use tracing::{error, info, instrument, trace};
 
 /// Azure Page Blob backend.
 ///
@@ -46,6 +50,24 @@ pub struct AzurePageBlobBackend {
     /// before any I/O is served. `None` means no lease is held (coordination
     /// disabled), and requests are sent without a lease condition.
     lease_id: RwLock<Option<String>>,
+    /// Shared, process-wide I/O gateway that all reads (downloads) and
+    /// writes/clears/copies (uploads) funnel through, enforcing the per-direction
+    /// bandwidth ceiling, concurrency cap and priority scheduling.
+    gateway: Arc<AzureIoGateway>,
+    /// ETag returned by the most recent mutating request (Put Page / Clear
+    /// Pages).
+    ///
+    /// Every page-blob write response already carries the blob's new ETag, so we
+    /// cache it here to let [`BlobBackend::etag`] return the post-write validity
+    /// token without a separate `get_properties` round-trip. `None` until the
+    /// first write of this process's lifetime, in which case `etag` falls back
+    /// to `get_properties`.
+    last_etag: RwLock<Option<String>>,
+    /// Optional auth-wired pipeline for `Get Page Ranges` (`?comp=pagelist`),
+    /// which the typed SDK 1.0 client no longer exposes.  `None` disables the
+    /// [`BlobBackend::data_ranges`] sparseness query (callers then assume every
+    /// byte may contain data).  Built by [`crate::auth::build_pipeline`].
+    page_list_pipeline: Option<Pipeline>,
 }
 
 impl AzurePageBlobBackend {
@@ -60,7 +82,20 @@ impl AzurePageBlobBackend {
             blob_name: blob_name.into(),
             snapshot: None,
             lease_id: RwLock::new(None),
+            gateway: AzureIoGateway::global(),
+            last_etag: RwLock::new(None),
+            page_list_pipeline: None,
         }
+    }
+
+    /// Attach an auth-wired pipeline used to issue `Get Page Ranges`
+    /// (`?comp=pagelist`) requests, enabling [`BlobBackend::data_ranges`].
+    ///
+    /// Build the pipeline with [`crate::auth::build_pipeline`] so it carries the
+    /// same credential as the backend's container client.
+    pub fn with_page_list(mut self, pipeline: Pipeline) -> Self {
+        self.page_list_pipeline = Some(pipeline);
+        self
     }
 
     /// Target a specific blob snapshot.
@@ -99,6 +134,14 @@ impl AzurePageBlobBackend {
         self.lease_id.read().unwrap().clone()
     }
 
+    /// Record the ETag carried by a mutating response so a later [`etag`] call
+    /// can avoid a separate `get_properties` round-trip.
+    ///
+    /// [`etag`]: BlobBackend::etag
+    fn record_etag(&self, etag: Option<String>) {
+        *self.last_etag.write().unwrap() = etag;
+    }
+
     /// Server-side copy `total_size` bytes from `source_url` into this page blob
     /// using concurrent `Put Page From URL` requests.
     ///
@@ -114,42 +157,59 @@ impl AzurePageBlobBackend {
     /// wall-clock time exceeds the (~1 h) token lifetime does not start failing
     /// late chunks with HTTP 403. Ranges are 512-aligned; sparse source ranges
     /// copy as zeros.
+    ///
+    /// `source_data_ranges` is the source blob's sparseness map (from
+    /// [`BlobBackend::data_ranges`]); when `Some`, any chunk lying entirely in a
+    /// zero gap is **cleared** on the destination (`Clear Pages`) instead of
+    /// being copied — no `Put Page From URL` is issued for it, so the storage
+    /// service never copies the source's unwritten free space, yet the
+    /// destination is still guaranteed to read back as zero there. This is safe
+    /// even when copying into a blob that already holds data (e.g. a retry
+    /// against an idempotently-created same-size target). `None` copies every
+    /// chunk.
     pub async fn copy_pages_from_url(
         &self,
         source_url: &str,
         total_size: u64,
         copy_source_auth: Option<crate::auth::AuthConfig>,
+        source_data_ranges: Option<&[(u64, u64)]>,
     ) -> anyhow::Result<()> {
         if !total_size.is_multiple_of(512) {
             bail!("copy size {total_size} is not 512-byte aligned");
         }
-        /// Concurrent in-flight copy requests (override with `UBLK_COPY_CONCURRENCY`).
-        const DEFAULT_CONCURRENCY: usize = 32;
         /// Re-mint the copy-source token roughly every this many bytes.
         const BATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
         // Per-request size (override with `UBLK_COPY_CHUNK_BYTES`); `Put Page From
         // URL` caps it at 4 MiB.
         let chunk = crate::backend::copy_chunk_bytes();
-        let concurrency = std::env::var("UBLK_COPY_CONCURRENCY")
+        // How many copy chunks to pipeline into the I/O gateway at once. This
+        // only bounds in-flight *enqueued* work (and thus memory); the actual
+        // server-side upload concurrency and bandwidth are enforced centrally by
+        // the gateway's upload pipeline. Overridable with `UBLK_COPY_CONCURRENCY`.
+        let pipeline_depth = std::env::var("UBLK_COPY_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_CONCURRENCY);
+            .unwrap_or_else(crate::backend::cpu_count);
 
         let blob_client = self.container.blob_client(&self.blob_name);
-        let page_client = blob_client.page_blob_client();
+        let page_client = Arc::new(blob_client.page_blob_client());
         let lease_id = self.lease_id();
+        let gateway = self.gateway.clone();
 
         let n_chunks = total_size.div_ceil(chunk);
-        let chunks_per_batch = (BATCH_BYTES / chunk).max(concurrency as u64);
+        let chunks_per_batch = (BATCH_BYTES / chunk).max(pipeline_depth as u64);
         trace!(
             total_size,
             n_chunks,
             chunk,
-            concurrency,
-            "server-side copy via Put Page From URL"
+            pipeline_depth,
+            clear_zero_ranges = source_data_ranges.is_some(),
+            "server-side copy via Put Page From URL (zero gaps cleared, not copied)"
         );
 
+        let mut copied_bytes = 0u64;
+        let mut cleared_bytes = 0u64;
         let mut batch_start = 0u64;
         while batch_start < n_chunks {
             let batch_end = (batch_start + chunks_per_batch).min(n_chunks);
@@ -160,34 +220,217 @@ impl AzurePageBlobBackend {
                     .context("mint copy-source authorization token")?,
                 None => None,
             };
-            let copies = (batch_start..batch_end).map(|i| {
+            // Each chunk either carries source data — copied via Put Page From
+            // URL — or lies entirely in a source zero gap. For a zero gap we
+            // *clear* the destination range rather than skipping it: this still
+            // avoids the source round-trip, but also guarantees the destination
+            // reads back as zero there even when it is not a freshly-created
+            // blob. `create()` is idempotent and does not zero an existing
+            // same-size target, so on a retry/re-run a skipped range could
+            // otherwise retain stale data and corrupt the clone.
+            let ops = (batch_start..batch_end).map(|i| {
                 let offset = i * chunk;
                 let len = chunk.min(total_size - offset);
-                let src_range = HttpRange::new(offset, len);
-                let dst_range = HttpRange::new(offset, len);
-                let opts = PageBlobClientUploadPagesFromUrlOptions {
-                    lease_id: lease_id.clone(),
-                    copy_source_authorization: csa.clone(),
-                    ..Default::default()
-                };
-                let page_client = &page_client;
+                let is_data = source_data_ranges
+                    .map(|ranges| super::range_intersects(ranges, offset, len))
+                    .unwrap_or(true);
+                if is_data {
+                    copied_bytes += len;
+                } else {
+                    cleared_bytes += len;
+                }
+                let page_client = page_client.clone();
+                let lease_id = lease_id.clone();
+                let csa = csa.clone();
                 let source_url = source_url.to_string();
+                let gateway = gateway.clone();
                 async move {
-                    page_client
-                        .upload_pages_from_url(source_url, src_range, len, dst_range, Some(opts))
+                    gateway
+                        .upload(IoClass::Copy, len, async move {
+                            if is_data {
+                                let opts = PageBlobClientUploadPagesFromUrlOptions {
+                                    lease_id,
+                                    copy_source_authorization: csa,
+                                    ..Default::default()
+                                };
+                                page_client
+                                    .upload_pages_from_url(
+                                        source_url,
+                                        HttpRange::new(offset, len),
+                                        len,
+                                        HttpRange::new(offset, len),
+                                        Some(opts),
+                                    )
+                                    .await
+                                    .with_context(|| {
+                                        format!("put page from url offset={offset} len={len}")
+                                    })?;
+                            } else {
+                                let opts = PageBlobClientClearPagesOptions {
+                                    lease_id,
+                                    ..Default::default()
+                                };
+                                page_client
+                                    .clear_pages(HttpRange::new(offset, len), Some(opts))
+                                    .await
+                                    .with_context(|| {
+                                        format!("clear pages offset={offset} len={len}")
+                                    })?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        })
                         .await
-                        .with_context(|| format!("put page from url offset={offset} len={len}"))?;
-                    Ok::<(), anyhow::Error>(())
                 }
             });
-            futures::stream::iter(copies)
-                .buffer_unordered(concurrency)
+            futures::stream::iter(ops)
+                .buffer_unordered(pipeline_depth)
                 .try_collect::<()>()
                 .await?;
             batch_start = batch_end;
         }
+        if source_data_ranges.is_some() {
+            info!(
+                copied_bytes,
+                cleared_bytes, total_size, "server-side copy cleared source zero ranges"
+            );
+        }
+        // The server-side copy mutated the blob via many concurrent requests, so
+        // any previously cached write ETag is now stale; drop it so a later
+        // `etag` call re-reads the authoritative value.
+        self.record_etag(None);
         Ok(())
     }
+
+    /// Query Azure `Get Page Ranges` (`?comp=pagelist`) for the byte ranges of
+    /// the blob that actually contain data.
+    ///
+    /// The typed `azure_storage_blob` 1.0 client no longer exposes this
+    /// operation, so it is issued as a raw GET through the auth-wired
+    /// [`page_list_pipeline`](Self::page_list_pipeline).  Returns `Ok(None)` when
+    /// no pipeline was attached (capability disabled).  Returned ranges are
+    /// `(offset, len)` pairs, 512-byte aligned, sorted by offset; every byte not
+    /// covered reads back as zero.
+    async fn list_page_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        let Some(pipeline) = &self.page_list_pipeline else {
+            return Ok(None);
+        };
+        let ctx = Context::new();
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut marker: Option<String> = None;
+        // `Get Page Ranges` is paginated: a heavily-fragmented blob returns a
+        // subset plus a `<NextMarker>`; re-issue with `&marker=` until it is
+        // empty so no data ranges are dropped (and warmed regions mistaken for
+        // zero gaps).
+        loop {
+            // Blob URL, encoded identically to every other request this backend makes.
+            let mut url: Url = self.container.blob_client(&self.blob_name).url().clone();
+            {
+                let mut q = url.query_pairs_mut();
+                q.append_pair("comp", "pagelist");
+                if let Some(snapshot) = &self.snapshot {
+                    q.append_pair("snapshot", snapshot);
+                }
+                if let Some(m) = &marker {
+                    q.append_pair("marker", m);
+                }
+            }
+            let mut request = Request::new(url, Method::Get);
+            request.insert_header("x-ms-version", PAGE_LIST_API_VERSION);
+            trace!(marker = ?marker, "querying page ranges");
+            let response = pipeline
+                .send(&ctx, &mut request, None)
+                .await
+                .with_context(|| format!("Get Page Ranges for blob '{}'", self.blob_name))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.into_body().into_string().unwrap_or_default();
+                anyhow::bail!(
+                    "Get Page Ranges for blob '{}' returned HTTP {status}: {body}",
+                    self.blob_name
+                );
+            }
+            let body = response.into_body().into_string().with_context(|| {
+                format!("read Get Page Ranges body for blob '{}'", self.blob_name)
+            })?;
+            let batch = parse_page_ranges(&body).with_context(|| {
+                format!("parse Get Page Ranges body for blob '{}'", self.blob_name)
+            })?;
+            ranges.extend(batch);
+            match parse_next_marker(&body) {
+                Some(m) => marker = Some(m),
+                None => break,
+            }
+        }
+        // Batches arrive ordered, but re-sort defensively across pages.
+        ranges.sort_by_key(|&(start, _)| start);
+        Ok(Some(ranges))
+    }
+}
+
+/// Azure Storage REST API version used for the raw `Get Page Ranges` request.
+/// Kept in sync with the `azure_storage_blob` SDK's default service version.
+const PAGE_LIST_API_VERSION: &str = "2026-04-06";
+
+/// Parse a `Get Page Ranges` XML body into `(offset, len)` data ranges.
+///
+/// The body looks like
+/// `<PageList><PageRange><Start>0</Start><End>511</End></PageRange>...</PageList>`,
+/// where `Start`/`End` are **inclusive** 512-aligned byte offsets.  `ClearRange`
+/// elements (present only in a diff response) are ignored.  Ranges are returned
+/// sorted by offset.
+fn parse_page_ranges(body: &str) -> anyhow::Result<Vec<(u64, u64)>> {
+    let mut ranges = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find("<PageRange>") {
+        let after = &rest[open + "<PageRange>".len()..];
+        let Some(close) = after.find("</PageRange>") else {
+            bail!("unterminated <PageRange> element in Get Page Ranges response");
+        };
+        let segment = &after[..close];
+        let start = extract_tag_u64(segment, "Start").context("missing <Start> in <PageRange>")?;
+        let end = extract_tag_u64(segment, "End").context("missing <End> in <PageRange>")?;
+        if end < start {
+            bail!("invalid page range: End ({end}) < Start ({start})");
+        }
+        ranges.push((start, end - start + 1));
+        rest = &after[close + "</PageRange>".len()..];
+    }
+    ranges.sort_by_key(|&(start, _)| start);
+    Ok(ranges)
+}
+
+/// Extract a non-empty `<NextMarker>` continuation token from a `Get Page
+/// Ranges` response body, if present (an empty `<NextMarker />` means the last
+/// page).
+fn parse_next_marker(body: &str) -> Option<String> {
+    let open = "<NextMarker>";
+    let close = "</NextMarker>";
+    let start = body.find(open)? + open.len();
+    let end = body[start..].find(close)? + start;
+    let marker = body[start..end].trim();
+    if marker.is_empty() {
+        None
+    } else {
+        Some(marker.to_string())
+    }
+}
+
+/// Extract the unsigned integer value of `<tag>NNN</tag>` from `segment`.
+fn extract_tag_u64(segment: &str, tag: &str) -> anyhow::Result<u64> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = segment
+        .find(&open)
+        .with_context(|| format!("missing <{tag}>"))?
+        + open.len();
+    let end = segment[start..]
+        .find(&close)
+        .with_context(|| format!("missing </{tag}>"))?
+        + start;
+    segment[start..end]
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("parse <{tag}> value"))
 }
 
 #[async_trait]
@@ -259,24 +502,27 @@ impl BlobBackend for AzurePageBlobBackend {
         if !len.is_multiple_of(512) {
             bail!("len {len} is not 512-byte aligned");
         }
-        let blob_client = self.blob_client()?;
+        let blob_client = Arc::new(self.blob_client()?);
+        let blob_name = self.blob_name.clone();
+        let class = current_class().unwrap_or(IoClass::ForegroundRead);
         trace!(offset, len, "downloading range");
-        let opts = BlobClientDownloadOptions {
-            range: Some(HttpRange::new(offset, len)),
-            ..Default::default()
-        };
-        let result = blob_client.download(Some(opts)).await.with_context(|| {
-            format!(
-                "download blob '{}' offset={offset} len={len}",
-                self.blob_name
-            )
-        })?;
-        let data = result
-            .body
-            .collect()
+        self.gateway
+            .download(class, len, async move {
+                let opts = BlobClientDownloadOptions {
+                    range: Some(HttpRange::new(offset, len)),
+                    ..Default::default()
+                };
+                let result = blob_client.download(Some(opts)).await.with_context(|| {
+                    format!("download blob '{blob_name}' offset={offset} len={len}")
+                })?;
+                let data = result
+                    .body
+                    .collect()
+                    .await
+                    .with_context(|| format!("collect body for blob '{blob_name}'"))?;
+                Ok(data)
+            })
             .await
-            .with_context(|| format!("collect body for blob '{}'", self.blob_name))?;
-        Ok(data)
     }
 
     #[instrument(skip(self, data), fields(blob = %self.blob_name, offset, len = data.len()))]
@@ -292,27 +538,36 @@ impl BlobBackend for AzurePageBlobBackend {
             bail!("data length {len} is not 512-byte aligned");
         }
         let blob_client = self.container.blob_client(&self.blob_name);
-        let page_client = blob_client.page_blob_client();
+        let page_client = Arc::new(blob_client.page_blob_client());
+        let blob_name = self.blob_name.clone();
         let range = HttpRange::new(offset, len);
+        let class = current_class().unwrap_or(IoClass::Flush);
         trace!(offset, len, "uploading pages");
         let opts = PageBlobClientUploadPagesOptions {
             lease_id: self.lease_id(),
             ..Default::default()
         };
-        page_client
-            .upload_pages(
-                azure_core::http::RequestContent::from(data.to_vec()),
-                len,
-                range,
-                Some(opts),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "upload_pages blob '{}' offset={offset} len={len}",
-                    self.blob_name
-                )
-            })?;
+        let etag = self
+            .gateway
+            .upload(class, len, async move {
+                let resp = page_client
+                    .upload_pages(
+                        azure_core::http::RequestContent::from(data.to_vec()),
+                        len,
+                        range,
+                        Some(opts),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("upload_pages blob '{blob_name}' offset={offset} len={len}")
+                    })?;
+                Ok::<_, anyhow::Error>(resp.etag().ok().flatten().map(|e| e.to_string()))
+            })
+            .await?;
+        // The Put Page response already carries the blob's new ETag; cache it so
+        // a follow-up flush can read the validity token without an extra
+        // get_properties round-trip.
+        self.record_etag(etag);
         Ok(())
     }
 
@@ -328,23 +583,35 @@ impl BlobBackend for AzurePageBlobBackend {
             bail!("len {len} is not 512-byte aligned");
         }
         let blob_client = self.container.blob_client(&self.blob_name);
-        let page_client = blob_client.page_blob_client();
+        let page_client = Arc::new(blob_client.page_blob_client());
+        let blob_name = self.blob_name.clone();
         let range = HttpRange::new(offset, len);
+        let class = current_class().unwrap_or(IoClass::Flush);
         trace!(offset, len, "clearing pages");
         let opts = PageBlobClientClearPagesOptions {
             lease_id: self.lease_id(),
             ..Default::default()
         };
-        page_client
-            .clear_pages(range, Some(opts))
-            .await
-            .with_context(|| {
-                format!(
-                    "clear_pages blob '{}' offset={offset} len={len}",
-                    self.blob_name
-                )
-            })?;
+        let etag = self
+            .gateway
+            .upload(class, 0, async move {
+                let resp = page_client
+                    .clear_pages(range, Some(opts))
+                    .await
+                    .with_context(|| {
+                        format!("clear_pages blob '{blob_name}' offset={offset} len={len}")
+                    })?;
+                Ok::<_, anyhow::Error>(resp.etag().ok().flatten().map(|e| e.to_string()))
+            })
+            .await?;
+        // Clear Pages also mutates the blob and returns the new ETag; keep the
+        // cached validity token current.
+        self.record_etag(etag);
         Ok(())
+    }
+
+    async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        self.list_page_ranges().await
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
@@ -380,6 +647,22 @@ impl BlobBackend for AzurePageBlobBackend {
             )
         })?;
         Ok(len)
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn etag(&self) -> anyhow::Result<Option<String>> {
+        // A prior write/clear in this process already learned the blob's current
+        // ETag from its response, so reuse it instead of issuing a separate
+        // get_properties round-trip on the (latency-bound) flush completion path.
+        if let Some(etag) = self.last_etag.read().unwrap().clone() {
+            return Ok(Some(etag));
+        }
+        let blob_client = self.blob_client()?;
+        let props = blob_client
+            .get_properties(None)
+            .await
+            .with_context(|| format!("get_properties for blob '{}'", self.blob_name))?;
+        Ok(props.etag()?.map(|e| e.to_string()))
     }
 }
 
@@ -485,5 +768,73 @@ impl BlobLock for AzureBlobLock {
             .await
             .with_context(|| format!("break blob lease '{}'", self.blob_name))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_tag_u64, parse_next_marker, parse_page_ranges};
+
+    #[test]
+    fn parse_next_marker_present_and_absent() {
+        // A non-empty marker is returned for continuation.
+        let with = "<PageList><NextMarker>2!abc=</NextMarker></PageList>";
+        assert_eq!(parse_next_marker(with).as_deref(), Some("2!abc="));
+        // An empty (or self-closing) marker means the last page.
+        assert_eq!(
+            parse_next_marker("<PageList><NextMarker></NextMarker></PageList>"),
+            None
+        );
+        assert_eq!(
+            parse_next_marker("<PageList><NextMarker /></PageList>"),
+            None
+        );
+        assert_eq!(parse_next_marker("<PageList />"), None);
+    }
+
+    #[test]
+    fn parse_empty_page_list() {
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><PageList />"#;
+        assert!(parse_page_ranges(body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_single_range_inclusive_to_len() {
+        let body = "<PageList><PageRange><Start>0</Start><End>511</End></PageRange></PageList>";
+        // Inclusive [0, 511] => offset 0, len 512.
+        assert_eq!(parse_page_ranges(body).unwrap(), vec![(0, 512)]);
+    }
+
+    #[test]
+    fn parse_multiple_ranges_sorted() {
+        let body = "<PageList>\
+            <PageRange><Start>1024</Start><End>2047</End></PageRange>\
+            <PageRange><Start>0</Start><End>511</End></PageRange>\
+            </PageList>";
+        assert_eq!(
+            parse_page_ranges(body).unwrap(),
+            vec![(0, 512), (1024, 1024)]
+        );
+    }
+
+    #[test]
+    fn parse_ignores_clear_ranges() {
+        let body = "<PageList>\
+            <PageRange><Start>0</Start><End>511</End></PageRange>\
+            <ClearRange><Start>512</Start><End>1023</End></ClearRange>\
+            </PageList>";
+        assert_eq!(parse_page_ranges(body).unwrap(), vec![(0, 512)]);
+    }
+
+    #[test]
+    fn parse_rejects_inverted_range() {
+        let body = "<PageList><PageRange><Start>512</Start><End>0</End></PageRange></PageList>";
+        assert!(parse_page_ranges(body).is_err());
+    }
+
+    #[test]
+    fn extract_tag_handles_whitespace() {
+        assert_eq!(extract_tag_u64("<Start> 42 </Start>", "Start").unwrap(), 42);
+        assert!(extract_tag_u64("<Start>42</Start>", "End").is_err());
     }
 }
