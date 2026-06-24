@@ -1080,3 +1080,225 @@ fn mount_fsck() {
     let _ = fs::remove_dir_all(&mnt);
     log("mount fsck e2e PASSED ✓");
 }
+
+/// Whether the kernel offers the `overlay` filesystem (overlayfs). The node
+/// plugin's ephemeral-overlay path needs it; without it the test self-skips.
+fn overlay_available() -> bool {
+    fs::read_to_string("/proc/filesystems")
+        .map(|s| {
+            s.lines()
+                .any(|l| l.split_whitespace().last() == Some("overlay"))
+        })
+        .unwrap_or(false)
+}
+
+/// DRAFT e2e for "local ephemeral overlay": mount an immutable snapshot as the
+/// overlayfs **lowerdir**, stack a node-local writable **upperdir** (on tmpfs,
+/// so it is RAM-backed and disappears on unmount), and present the merged view
+/// as the pod-visible mount. Proves the three properties the feature promises:
+///
+///   * **readable** — every seed file from the snapshot is visible through the
+///     merged mount with its original checksum (reads fall through to the lower)
+///   * **writable** — creating a new file and modifying an existing seed file
+///     both succeed (writes and copy-ups land in the upper layer)
+///   * **ephemeral + non-destructive** — after tearing the overlay down and the
+///     tmpfs upper with it, reopening the backing blob writable shows the new
+///     file is gone and every seed checksum is unchanged: pod-local writes never
+///     touched the immutable snapshot blob
+///
+/// This validates the overlay mechanism end-to-end over a real read-only
+/// `/dev/ublkbN` *before* the CSI node plugin wires it behind a StorageClass
+/// flag, so the plumbing change can be implemented against a known-good target.
+///
+/// Cycle:
+///   1. provision the device writable, mkfs.ext4, write random seed files,
+///      record checksums, flush and tear the device down
+///   2. snapshot the blob, reopen read-only, mount it as the overlay lower, add
+///      a tmpfs upper/work, mount the overlay, and exercise read + write + modify
+///   3. drop the overlay and tmpfs upper, reopen the blob writable, and assert
+///      the snapshot blob is byte-for-byte unchanged (writes were ephemeral)
+#[test]
+fn mount_overlay_ephemeral() {
+    if !ublk_available() {
+        eprintln!(
+            "skipping mount_overlay_ephemeral: requires root and a loaded \
+             ublk_drv (no /dev/ublk-control or not running as root)"
+        );
+        return;
+    }
+    if !overlay_available() {
+        eprintln!(
+            "skipping mount_overlay_ephemeral: kernel has no `overlay` \
+             filesystem (not in /proc/filesystems)"
+        );
+        return;
+    }
+
+    let spec = DeviceSpec {
+        // Distinct, high device id and blob so this test never collides with the
+        // other mount tests (40/41/42/43/45) or the k8s CSI e2e's low ids.
+        dev_id: "44".to_string(),
+        container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
+        blob: format!("{}-overlay", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
+        cache_dir: None,
+        cache_max_bytes: 0,
+        disable_auto_flush: false,
+        cache_warmup: false,
+        log_path: None,
+    };
+    let dev = spec.dev_path();
+    // lower = the read-only snapshot mount; scratch = a tmpfs holding the
+    // overlay upper/work dirs; merged = the pod-visible writable view.
+    let lower = tempdir("ublk-azblob-overlay-lower");
+    let scratch = tempdir("ublk-azblob-overlay-scratch");
+    let merged = tempdir("ublk-azblob-overlay-merged");
+    let upper = scratch.join("upper");
+    let work = scratch.join("work");
+
+    // ── Phase 1: provision the device writable and seed known files ───────────
+    let child = start_device(&spec, true);
+    log(&format!("mkfs.ext4 on {dev}"));
+    run("mkfs.ext4", &["-q", "-F", "-E", "nodiscard", &dev]);
+    run("mount", &[&dev, lower.to_str().unwrap()]);
+
+    log(&format!("writing {NUM_FILES} random files"));
+    let mut checksums: Vec<(String, String)> = Vec::with_capacity(NUM_FILES);
+    for i in 1..=NUM_FILES {
+        let name = format!("random_{i}.bin");
+        let path = lower.join(&name);
+        let len = 1024 * (1 + (i * 509) % 4096);
+        write_random_file(&path, len);
+        checksums.push((name, sha256_file(&path)));
+    }
+
+    log("sync + SIGUSR1 to force flush to the page blob");
+    run("sync", &[]);
+    signal(&child, libc::SIGUSR1);
+    sleep(Duration::from_secs(2));
+    run("umount", &[lower.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // ── Phase 2: snapshot, reopen read-only, and stack an ephemeral overlay ───
+    let snapshot = create_snapshot(&spec);
+    let child = start_device_opts(&spec, false, Some(&snapshot));
+
+    // The lower must be a read-only mount of the immutable snapshot. `noload`
+    // skips ext4 journal recovery, which would otherwise write to the device.
+    log(&format!(
+        "mounting snapshot {dev} read-only as overlay lower"
+    ));
+    run("mount", &["-o", "ro,noload", &dev, lower.to_str().unwrap()]);
+
+    // A tmpfs holds the writable upper + work dirs: RAM-backed, capped, and
+    // guaranteed to vanish on unmount — exactly the "pod-local ephemeral" layer.
+    log("mounting tmpfs for the overlay upper/work (ephemeral, capped)");
+    run(
+        "mount",
+        &[
+            "-t",
+            "tmpfs",
+            "-o",
+            "size=256m",
+            "tmpfs",
+            scratch.to_str().unwrap(),
+        ],
+    );
+    fs::create_dir_all(&upper).expect("create overlay upperdir");
+    fs::create_dir_all(&work).expect("create overlay workdir");
+
+    log("mounting overlay (lower=snapshot ro, upper=tmpfs) at merged");
+    let overlay_opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+    run(
+        "mount",
+        &[
+            "-t",
+            "overlay",
+            "overlay",
+            "-o",
+            &overlay_opts,
+            merged.to_str().unwrap(),
+        ],
+    );
+
+    // readable: every seed file is visible through the merged view, unchanged.
+    log("verifying seed files are readable through the overlay");
+    for (name, expected) in &checksums {
+        let actual = sha256_file(&merged.join(name));
+        assert_eq!(
+            &actual, expected,
+            "checksum mismatch for {name} via overlay"
+        );
+    }
+
+    // writable: a brand-new file lands in the upper layer.
+    log("verifying a new write succeeds in the overlay upper layer");
+    let new_file = merged.join("pod_local_new.bin");
+    write_random_file(&new_file, 64 * 1024);
+    assert!(new_file.exists(), "new file should exist in merged view");
+    assert!(
+        upper.join("pod_local_new.bin").exists(),
+        "new file should be materialised in the tmpfs upperdir"
+    );
+
+    // writable: modifying an existing seed file triggers a copy-up; the merged
+    // checksum changes while the lower (snapshot) copy stays original.
+    log("verifying modifying a seed file copies up (lower stays original)");
+    let victim = &checksums[0].0;
+    {
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(merged.join(victim))
+            .unwrap_or_else(|e| panic!("open {victim} for append: {e}"));
+        f.write_all(b"pod-local-mutation")
+            .expect("append to seed file");
+    }
+    let merged_sum = sha256_file(&merged.join(victim));
+    assert_ne!(
+        &merged_sum, &checksums[0].1,
+        "modified file {victim} should have a new checksum in the merged view"
+    );
+    let lower_sum = sha256_file(&lower.join(victim));
+    assert_eq!(
+        &lower_sum, &checksums[0].1,
+        "lower (snapshot) copy of {victim} must be unchanged by the copy-up"
+    );
+
+    // ── Phase 3: tear the overlay + tmpfs down and prove writes were ephemeral ─
+    log("tearing down overlay + tmpfs upper (drops all pod-local writes)");
+    run("umount", &[merged.to_str().unwrap()]);
+    run("umount", &[scratch.to_str().unwrap()]); // drops the tmpfs upper entirely
+    run("umount", &[lower.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    // Reopen the backing blob writable: the snapshot blob must be byte-for-byte
+    // unchanged — the new file is gone and every seed checksum still matches.
+    let child = start_device(&spec, false);
+    log(&format!(
+        "remounting {dev} writable to verify the blob is untouched"
+    ));
+    run("mount", &[&dev, lower.to_str().unwrap()]);
+    for (name, expected) in &checksums {
+        let actual = sha256_file(&lower.join(name));
+        assert_eq!(
+            &actual, expected,
+            "snapshot blob changed for {name} — overlay writes were not ephemeral"
+        );
+    }
+    assert!(
+        !lower.join("pod_local_new.bin").exists(),
+        "pod-local file leaked into the backing blob (overlay write was not ephemeral)"
+    );
+    run("umount", &[lower.to_str().unwrap()]);
+    stop_device(&dev, child);
+
+    let _ = fs::remove_dir_all(&merged);
+    let _ = fs::remove_dir_all(&scratch);
+    let _ = fs::remove_dir_all(&lower);
+    log("mount overlay ephemeral e2e PASSED ✓");
+}
