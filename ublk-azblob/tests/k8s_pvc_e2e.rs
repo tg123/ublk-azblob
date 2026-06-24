@@ -1657,7 +1657,12 @@ kind: PersistentVolumeClaim
 metadata:
   name: azblob-overlay-pvc
 spec:
-  accessModes: ["ReadOnlyMany"]
+  # ReadWriteOnce so kubelet bind-mounts the volume read-write into the
+  # container: the *pod* must be able to write to the overlay's merged view. The
+  # underlying snapshot device stays read-only (the node forces the overlay path
+  # from the snapshot volume context regardless of access mode), so pod-local
+  # writes land in the upper layer, never the immutable blob.
+  accessModes: ["ReadWriteOnce"]
   storageClassName: azblob-overlay
   resources:
     requests:
