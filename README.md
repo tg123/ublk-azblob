@@ -22,6 +22,32 @@ as a local block device (`/dev/ublkbN`), written in Rust.
 
 ---
 
+## Download (prebuilt static binary)
+
+Every tagged release publishes **fully-static** binaries (musl libc, no glibc,
+no shared-object dependencies) on the
+[Releases page](https://github.com/tg123/ublk-azblob/releases). They run on any
+modern x86-64 / aarch64 Linux host with no runtime to install.
+
+```bash
+# Pick the asset matching your architecture:
+#   ublk-azblob-<tag>-x86_64-unknown-linux-musl.tar.gz   (amd64)
+#   ublk-azblob-<tag>-aarch64-unknown-linux-musl.tar.gz  (arm64)
+tar -xzf ublk-azblob-<tag>-x86_64-unknown-linux-musl.tar.gz
+./ublk-azblob-<tag>-x86_64-unknown-linux-musl/ublk-azblob --version
+
+# Verify it is statically linked (prints "not a dynamic executable"):
+ldd ublk-azblob-<tag>-x86_64-unknown-linux-musl/ublk-azblob
+```
+
+Each archive ships a `.sha256` checksum next to it. The binaries are built with
+the `ublk` and `csi` features enabled.
+
+> The CSI node plugin still shells out to host utilities (`mkfs.ext4`,
+> `mount`/`umount`, `blkid`, `nbd-client`); those must be present on the host.
+
+---
+
 ## Build
 
 ```bash
@@ -39,6 +65,14 @@ cargo build --release -p ublk-azblob --features ublk
 # (needs `protoc` plus the protobuf well-known types, e.g. apt
 #  `protobuf-compiler libprotobuf-dev`; combine with `ublk`)
 cargo build --release -p ublk-azblob --features "ublk csi"
+
+# Build a fully-static binary (musl libc — no glibc / shared-object deps).
+# Needs the musl target and musl-gcc (apt `musl-tools`); the resulting binary
+# matches the prebuilt release assets above.
+rustup target add x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc \
+  cargo build --release --target x86_64-unknown-linux-musl \
+  -p ublk-azblob --features "ublk csi"
 ```
 
 ---
