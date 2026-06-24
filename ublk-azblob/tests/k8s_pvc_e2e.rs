@@ -1683,6 +1683,11 @@ spec:
         .to_string();
     log(&format!("pinning overlay pod to node {node}"));
 
+    // Pin with `nodeSelector`, NOT `spec.nodeName`: the overlay PVC is
+    // `WaitForFirstConsumer`, so the scheduler must process this (its first
+    // consumer) pod to stamp the `selected-node` annotation that triggers
+    // provisioning/binding. `nodeName` bypasses the scheduler, so the PVC would
+    // stay Pending forever and the pod would never become ready.
     let overlay_deploy = format!(
         r#"apiVersion: apps/v1
 kind: Deployment
@@ -1698,7 +1703,8 @@ spec:
       labels:
         app: azblob-overlay-app
     spec:
-      nodeName: {node}
+      nodeSelector:
+        kubernetes.io/hostname: {node}
       containers:
         - name: app
           image: busybox:1.36
