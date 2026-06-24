@@ -396,15 +396,17 @@ pub fn build_backend_concrete(
 ///   streamed copy through `source` (download → upload).
 ///
 /// `source_url` is the raw `templateBlobUrl` (already carrying any `snapshot=` /
-/// SAS query). `dest` must already exist, be at least `total_size`, and be a
-/// freshly-created (all-zero) page blob — the latter is what lets the copy skip
-/// the source's zero ranges (see below).
+/// SAS query). `dest` must already exist and be at least `total_size`; it need
+/// **not** be freshly zeroed — zero ranges are cleared on the destination (see
+/// below), so a retry against an existing same-size blob is safe.
 ///
 /// When the `source` can report its sparseness map (via
-/// [`BlobBackend::data_ranges`]), ranges that the source never wrote are skipped
-/// entirely: neither the server-side nor the streamed path touches them, so the
-/// destination keeps them as zero holes. A source that cannot report ranges
-/// degrades to copying every byte.
+/// [`BlobBackend::data_ranges`]), ranges that the source never wrote are
+/// **cleared** on the destination rather than copied: neither the server-side
+/// nor the streamed path reads them from the source, but both issue
+/// `Clear Pages` / `clear` so the destination reads back as zero there even if
+/// it previously held data. A source that cannot report ranges degrades to
+/// copying every byte.
 pub async fn copy_template(
     dest: &AzurePageBlobBackend,
     source: &dyn BlobBackend,
@@ -413,9 +415,10 @@ pub async fn copy_template(
     dest_auth: &AuthConfig,
     total_size: u64,
 ) -> anyhow::Result<()> {
-    // Best-effort source sparseness map: lets both copy paths skip the source's
-    // unwritten free space (the destination is a fresh zero blob, so skipped
-    // ranges already read back as zero). A missing or errored map copies in full.
+    // Best-effort source sparseness map: lets both copy paths clear (instead of
+    // copying) the source's unwritten free space on the destination, so a
+    // non-empty/retried target is still zeroed there. A missing or errored map
+    // copies in full.
     let data_ranges = match source.data_ranges().await {
         Ok(ranges) => ranges,
         Err(err) => {
@@ -473,9 +476,10 @@ pub async fn copy_template(
 /// Copies in 4 MiB page-aligned chunks; sparse source ranges read back as zeros.
 ///
 /// `source_data_ranges` is the source sparseness map: when `Some`, chunks lying
-/// entirely in a zero gap are skipped (neither read nor written), so the
-/// destination keeps them as zero holes. This is only correct when `dest` is a
-/// freshly-created (all-zero) blob.
+/// entirely in a zero gap are **cleared** on `dest` (via `clear`) rather than
+/// copied — neither read from the source nor written from it — so the
+/// destination reads back as zero there even when it is not a freshly-created
+/// blob (e.g. a retry against an existing same-size target).
 async fn copy_blob_streamed(
     source: &dyn BlobBackend,
     dest: &dyn BlobBackend,

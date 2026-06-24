@@ -134,11 +134,13 @@ impl AzurePageBlobBackend {
     ///
     /// `source_data_ranges` is the source blob's sparseness map (from
     /// [`BlobBackend::data_ranges`]); when `Some`, any chunk lying entirely in a
-    /// zero gap is skipped — no `Put Page From URL` is issued for it, so the
-    /// storage service never copies the source's unwritten free space. This is
-    /// only correct because the destination is a freshly-created page blob that
-    /// already reads back as zero in those ranges; do **not** pass a map when
-    /// copying into a blob that may already hold data. `None` copies every chunk.
+    /// zero gap is **cleared** on the destination (`Clear Pages`) instead of
+    /// being copied — no `Put Page From URL` is issued for it, so the storage
+    /// service never copies the source's unwritten free space, yet the
+    /// destination is still guaranteed to read back as zero there. This is safe
+    /// even when copying into a blob that already holds data (e.g. a retry
+    /// against an idempotently-created same-size target). `None` copies every
+    /// chunk.
     pub async fn copy_pages_from_url(
         &self,
         source_url: &str,
