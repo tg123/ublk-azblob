@@ -1380,8 +1380,10 @@ spec:
     );
 }
 
-/// The Azurite container the read-only snapshot golden image lives in (the Helm
-/// chart's default `container`, which `e2e.values.yaml` does not override).
+/// The Azurite container the overlay golden image is written to and snapshotted
+/// from (the Helm chart's default `container`, which `e2e.values.yaml` does not
+/// override). The golden image is read-write while being seeded, then its
+/// snapshot is mounted read-only as the overlay's immutable lower.
 const OVERLAY_CONTAINER: &str = "ublk-azblob-volumes";
 /// Fixed (template-less) blob path for the overlay golden image, so its name is
 /// predictable and can be snapshotted by `az` after the golden writer flushes it.
@@ -1776,7 +1778,10 @@ spec:
         panic!("overlay consumer pod was not reaped; cannot verify scratch pruning");
     }
     // After unpublish the configured base must hold no per-volume scratch roots.
-    let leftover = exec_node_plugin(&node, &format!("ls -A {OVERLAY_SCRATCH_DIR} 2>/dev/null"));
+    // Keep stderr (don't redirect it away): a missing base would otherwise yield
+    // an empty stdout and spuriously pass — surfacing the error fails the
+    // assertion loudly instead.
+    let leftover = exec_node_plugin(&node, &format!("ls -A {OVERLAY_SCRATCH_DIR}"));
     log(&format!(
         "scratch base {OVERLAY_SCRATCH_DIR} after unpublish on node {node}: {leftover:?}"
     ));
