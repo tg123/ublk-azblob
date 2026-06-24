@@ -3,6 +3,10 @@ name: release
 # Builds fully-static (musl) `ublk-azblob` binaries for linux/amd64 and
 # linux/arm64 and publishes them as downloadable assets on the GitHub Release.
 #
+# The binaries come straight out of `deploy/Dockerfile` (its `binary` stage), so
+# the exact same fully-static musl build that ships in the container image is
+# reused here — no separate build recipe to keep in sync.
+#
 # Triggered automatically when a `v*` tag is pushed, or manually via
 # workflow_dispatch (handy for testing — assets are then attached to a
 # pre-release named after the chosen tag, or just built as artifacts).
@@ -30,44 +34,34 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable (musl target)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          target: ${{ matrix.target }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Install build dependencies
+      - name: Build fully-static binary via Dockerfile
         run: |
-          sudo apt-get update
-          # musl-tools : musl-gcc, the C compiler ring / libublk's C shim link
-          #              against for a fully-static musl binary.
-          # protobuf-compiler + libprotobuf-dev : protoc + well-known types for
-          #              the CSI gRPC bindings (csi feature).
-          # clang + libclang-dev : libclang for the libublk bindgen (ublk feature).
-          sudo apt-get install -y --no-install-recommends \
-            musl-tools clang libclang-dev protobuf-compiler libprotobuf-dev pkg-config
-
-      - name: Build fully-static binary (ublk + csi)
-        env:
-          # Point the musl target's C compiler at musl-gcc so the bundled C code
-          # (ring, libublk shim) is compiled and linked against musl libc.
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
-        run: |
-          cargo build --release --locked \
-            --target ${{ matrix.target }} \
-            -p ublk-azblob --features "ublk csi"
+          # Reuse the exact fully-static (musl) build from deploy/Dockerfile via
+          # its `binary` stage, exporting just the binary to ./dist-bin.  Each
+          # matrix entry runs on its native runner, so the platform build is
+          # native (no QEMU emulation).
+          docker buildx build \
+            --file deploy/Dockerfile \
+            --target binary \
+            --platform ${{ matrix.platform }} \
+            --output type=local,dest=dist-bin \
+            .
 
       - name: Package
         id: package
         run: |
-          bin=target/${{ matrix.target }}/release/ublk-azblob
+          bin=dist-bin/ublk-azblob
           # Confirm it really is a static binary; fail the build otherwise.
           file "$bin"
           ldd_out="$(ldd "$bin" 2>&1 || true)"

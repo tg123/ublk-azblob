@@ -83,6 +83,13 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     file /ublk-azblob | grep -qiE "static-pie|statically linked" && \
     ! file /ublk-azblob | grep -qi "interpreter"
 
+# ── Static binary export ────────────────────────────────────────────────────
+# Minimal stage that contains only the fully-static binary, so the release
+# workflow can reuse this exact build instead of re-implementing the musl static
+# build:  `docker buildx build --target binary --output type=local,dest=out .`
+FROM scratch AS binary
+COPY --from=builder /ublk-azblob /ublk-azblob
+
 # ── Runtime ───────────────────────────────────────────────────────────────────
 # Pulled for the *target* platform; carries the static target-arch binary.
 FROM debian:bookworm-slim
