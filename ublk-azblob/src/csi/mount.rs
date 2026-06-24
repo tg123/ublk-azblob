@@ -499,10 +499,18 @@ pub fn mount(
 /// is presented at the CSI target path. The scratch lives on node disk and is
 /// discarded on unpublish, so writes never reach the immutable backing blob.
 ///
-/// All three dirs are placed as hidden siblings of the CSI target so they share
-/// the target's filesystem (an overlayfs requirement: `upper` and `work` must
-/// be on the same filesystem and outside the merged mount) and are naturally
-/// removed with the per-volume kubelet directory.
+/// `lower` is always placed as a hidden sibling of the CSI target (it is only a
+/// mount point for the immutable filesystem). The writable `upper`/`work` pair
+/// must share one filesystem outside the merged mount (an overlayfs
+/// requirement); where they live depends on the layout:
+///
+///   * Default (`scratch_root = None`): `upper`/`work` are hidden siblings of
+///     the target too, on the per-volume kubelet directory's filesystem, and
+///     are naturally removed with that directory on unpublish.
+///   * Configured scratch base (`scratch_root = Some(_)`): `upper`/`work` live
+///     under an operator-chosen base (`overlayScratchDir`), on that base's
+///     filesystem — not on the target's — and are pruned explicitly via
+///     `scratch_root` on teardown so nothing leaks.
 #[derive(Clone, Debug)]
 pub struct OverlayDirs {
     /// Read-only mount point of the immutable lower filesystem.

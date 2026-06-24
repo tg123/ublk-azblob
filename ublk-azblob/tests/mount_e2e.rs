@@ -1106,7 +1106,7 @@ fn overlay_available() -> bool {
         .unwrap_or(false)
 }
 
-/// DRAFT e2e for "local ephemeral overlay": mount an immutable snapshot as the
+/// e2e for "local ephemeral overlay": mount an immutable snapshot as the
 /// overlayfs **lowerdir**, stack a node-local writable **upperdir** (on tmpfs,
 /// so it is RAM-backed and disappears on unmount), and present the merged view
 /// as the pod-visible mount. Proves the three properties the feature promises:
@@ -1120,9 +1120,10 @@ fn overlay_available() -> bool {
 ///     file is gone and every seed checksum is unchanged: pod-local writes never
 ///     touched the immutable snapshot blob
 ///
-/// This validates the overlay mechanism end-to-end over a real read-only
-/// `/dev/ublkbN` *before* the CSI node plugin wires it behind a StorageClass
-/// flag, so the plumbing change can be implemented against a known-good target.
+/// This is a standalone regression check of the overlay mechanism end-to-end
+/// over a real read-only `/dev/ublkbN`. It exercises the same lower/upper/work
+/// overlayfs stacking the CSI node plugin drives in `mount::mount_overlay`,
+/// independently of the Kubernetes plumbing (covered by the k8s PVC e2e).
 ///
 /// Cycle:
 ///   1. provision the device writable, mkfs.ext4, write random seed files,
