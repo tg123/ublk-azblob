@@ -14,8 +14,9 @@ use azure_storage_blob::{
     models::{
         BlobClientAcquireLeaseResultHeaders, BlobClientDownloadOptions,
         BlobClientGetPropertiesResultHeaders, HttpRange, PageBlobClientClearPagesOptions,
-        PageBlobClientCreateOptions, PageBlobClientUploadPagesFromUrlOptions,
-        PageBlobClientUploadPagesOptions,
+        PageBlobClientClearPagesResultHeaders, PageBlobClientCreateOptions,
+        PageBlobClientUploadPagesFromUrlOptions, PageBlobClientUploadPagesOptions,
+        PageBlobClientUploadPagesResultHeaders,
     },
     BlobClient, BlobContainerClient,
 };
@@ -47,6 +48,15 @@ pub struct AzurePageBlobBackend {
     /// before any I/O is served. `None` means no lease is held (coordination
     /// disabled), and requests are sent without a lease condition.
     lease_id: RwLock<Option<String>>,
+    /// ETag returned by the most recent mutating request (Put Page / Clear
+    /// Pages).
+    ///
+    /// Every page-blob write response already carries the blob's new ETag, so we
+    /// cache it here to let [`BlobBackend::etag`] return the post-write validity
+    /// token without a separate `get_properties` round-trip. `None` until the
+    /// first write of this process's lifetime, in which case `etag` falls back
+    /// to `get_properties`.
+    last_etag: RwLock<Option<String>>,
     /// Optional auth-wired pipeline for `Get Page Ranges` (`?comp=pagelist`),
     /// which the typed SDK 1.0 client no longer exposes.  `None` disables the
     /// [`BlobBackend::data_ranges`] sparseness query (callers then assume every
@@ -66,6 +76,7 @@ impl AzurePageBlobBackend {
             blob_name: blob_name.into(),
             snapshot: None,
             lease_id: RwLock::new(None),
+            last_etag: RwLock::new(None),
             page_list_pipeline: None,
         }
     }
@@ -114,6 +125,14 @@ impl AzurePageBlobBackend {
     /// Snapshot the current lease id, if any.
     fn lease_id(&self) -> Option<String> {
         self.lease_id.read().unwrap().clone()
+    }
+
+    /// Record the ETag carried by a mutating response so a later [`etag`] call
+    /// can avoid a separate `get_properties` round-trip.
+    ///
+    /// [`etag`]: BlobBackend::etag
+    fn record_etag(&self, etag: Option<String>) {
+        *self.last_etag.write().unwrap() = etag;
     }
 
     /// Server-side copy `total_size` bytes from `source_url` into this page blob
@@ -258,6 +277,10 @@ impl AzurePageBlobBackend {
                 cleared_bytes, total_size, "server-side copy cleared source zero ranges"
             );
         }
+        // The server-side copy mutated the blob via many concurrent requests, so
+        // any previously cached write ETag is now stale; drop it so a later
+        // `etag` call re-reads the authoritative value.
+        self.record_etag(None);
         Ok(())
     }
 
@@ -515,6 +538,12 @@ impl BlobBackend for AzurePageBlobBackend {
                     "upload_pages blob '{}' offset={offset} len={len}",
                     self.blob_name
                 )
+            })
+            .map(|resp| {
+                // The Put Page response already carries the blob's new ETag;
+                // cache it so a follow-up flush can read the validity token
+                // without an extra get_properties round-trip.
+                self.record_etag(resp.etag().ok().flatten().map(|e| e.to_string()));
             })?;
         Ok(())
     }
@@ -546,6 +575,11 @@ impl BlobBackend for AzurePageBlobBackend {
                     "clear_pages blob '{}' offset={offset} len={len}",
                     self.blob_name
                 )
+            })
+            .map(|resp| {
+                // Clear Pages also mutates the blob and returns the new ETag;
+                // keep the cached validity token current.
+                self.record_etag(resp.etag().ok().flatten().map(|e| e.to_string()));
             })?;
         Ok(())
     }
@@ -587,6 +621,22 @@ impl BlobBackend for AzurePageBlobBackend {
             )
         })?;
         Ok(len)
+    }
+
+    #[instrument(skip(self), fields(blob = %self.blob_name))]
+    async fn etag(&self) -> anyhow::Result<Option<String>> {
+        // A prior write/clear in this process already learned the blob's current
+        // ETag from its response, so reuse it instead of issuing a separate
+        // get_properties round-trip on the (latency-bound) flush completion path.
+        if let Some(etag) = self.last_etag.read().unwrap().clone() {
+            return Ok(Some(etag));
+        }
+        let blob_client = self.blob_client()?;
+        let props = blob_client
+            .get_properties(None)
+            .await
+            .with_context(|| format!("get_properties for blob '{}'", self.blob_name))?;
+        Ok(props.etag()?.map(|e| e.to_string()))
     }
 }
 
