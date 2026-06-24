@@ -848,7 +848,7 @@ fn nbd_template_copy() {
 ///   1. provision a *sparse* template blob — write a few small regions far
 ///      apart so the bulk of the device stays zero/unwritten, flush, stop
 ///   2. run `ublk-azblob copy` and capture its logs; assert the copy consulted
-///      the source sparseness map and skipped more zero bytes than it copied
+///      the source sparseness map and cleared more zero bytes than it copied
 ///   3. mount the target read-write and assert every written region's checksum
 ///      matches, and that a zero gap reads back as all zeros
 #[test]
@@ -889,7 +889,7 @@ fn nbd_template_copy_skips_zero() {
     stop_server(child);
     wait_for_port_release(NBD_ADDR_TEMPLATE_SPARSE);
 
-    // ── Phase 2: copy and assert zero ranges were skipped ─────────────────────
+    // ── Phase 2: copy and assert zero ranges were cleared ─────────────────────
     let endpoint = env_or("AZURE_STORAGE_ENDPOINT", DEFAULT_ENDPOINT);
     let template_url = format!(
         "{}/{}/{}",
@@ -899,25 +899,25 @@ fn nbd_template_copy_skips_zero() {
     );
     let logs = run_copy(&template_url, &container, &target_blob);
     assert!(
-        logs.contains("skipped source zero ranges"),
-        "copy did not skip source zero ranges; logs:\n{logs}"
+        logs.contains("cleared source zero ranges"),
+        "copy did not clear source zero ranges; logs:\n{logs}"
     );
     let copied = parse_log_field(&logs, "copied_bytes");
-    let skipped = parse_log_field(&logs, "skipped_bytes");
+    let cleared = parse_log_field(&logs, "cleared_bytes");
     log(&format!(
-        "copy copied {copied} bytes, skipped {skipped} bytes"
+        "copy copied {copied} bytes, cleared {cleared} bytes"
     ));
     assert!(
-        skipped > 0,
-        "expected the copy to skip zero ranges, skipped 0"
+        cleared > 0,
+        "expected the copy to clear zero ranges, cleared 0"
     );
     assert!(
         copied < BLOB_SIZE,
-        "copy copied the whole device ({copied}); zero ranges were not skipped"
+        "copy copied the whole device ({copied}); zero ranges were not cleared"
     );
     assert!(
-        skipped > copied,
-        "expected the sparse copy to skip more zero bytes ({skipped}) than it \
+        cleared > copied,
+        "expected the sparse copy to clear more zero bytes ({cleared}) than it \
          copied ({copied})"
     );
 
@@ -933,7 +933,7 @@ fn nbd_template_copy_skips_zero() {
             "copied target differs from template at offset {offset}"
         );
     }
-    // A region that lay entirely in a skipped zero gap must read back as zeros.
+    // A region that lay entirely in a cleared zero gap must read back as zeros.
     let gap_offset = 12 * 1024 * 1024;
     let gap = client.read_at(gap_offset, REGION_LEN as u32);
     assert!(
@@ -958,7 +958,7 @@ fn wait_for_port_release(addr: &str) {
 /// Run the one-shot `ublk-azblob copy --template-url <url>` subcommand, copying
 /// the template into the target `container`/`blob`. Panics on failure. Returns
 /// the captured stdout (where `tracing` logs go) so a test can assert on the
-/// copy's log output (e.g. that it skipped the source's zero ranges).
+/// copy's log output (e.g. that it cleared the source's zero ranges).
 fn run_copy(template_url: &str, container: &str, target_blob: &str) -> String {
     let bin = std::env::var("UBLK_AZBLOB_BIN")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_ublk-azblob").to_string());
