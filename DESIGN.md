@@ -315,6 +315,11 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 - Retry/back-off with exponential jitter; 412 / 429 handling
 - Prometheus metrics (IOPS, latency, error rate)
 - Crash-consistency test suite (power-failure simulation)
+- ✅ Node-local restart safety for the CSI node plugin: ublk user-recovery
+  (`UBLK_F_USER_RECOVERY`) keeps `/dev/ublkbN` alive while the plugin restarts
+  (crash / OOM / DaemonSet upgrade); a per-volume state file under
+  `CSI_STATE_DIR` lets the new plugin re-attach (`run --recover`) and resume I/O
+  without disturbing existing mounts (NBD reconnects `nbd-client` instead)
 - Optional block-blob backend (chunked, cheaper storage, slower random write)
 - Packaging: container image, systemd unit, cloud-init example
 

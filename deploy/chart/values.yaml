@@ -68,6 +68,15 @@ node:
   # - Does not require ublk_drv (Linux >= 6.0)
   # - Slightly lower performance than ublk
   useNbd: false
+
+  # Directory (inside the node plugin container) holding the per-volume recovery
+  # state files. On a node-local restart of the node plugin (crash, OOM, or a
+  # DaemonSet upgrade) the plugin reads these records and re-attaches to the
+  # still-live block devices (ublk user-recovery / NBD reconnect), so running
+  # pods keep their mounts. The default lives under the driver's kubelet plugin
+  # directory (the same persistent hostPath that backs the CSI socket), so it
+  # survives container restarts without an extra volume.
+  stateDir: /csi/state
   
   # NBD configuration (only used when useNbd: true)
   nbd:

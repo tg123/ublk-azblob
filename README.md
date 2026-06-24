@@ -581,6 +581,24 @@ On an Azure VM/AKS node with Managed Identity, drop `accountKey` from the secret
 and add `AZURE_USE_MSI=true` (optionally `AZURE_MSI_CLIENT_ID`) to the driver
 containers instead.
 
+### Node-local restart safety
+
+The node plugin is restart-safe: a crash, OOM kill, or a DaemonSet upgrade **on
+the same node** no longer disrupts pods that already have a volume mounted. Each
+published volume's `run` child is started with ublk **user-recovery**
+(`UBLK_F_USER_RECOVERY`), so when the plugin (and its child cgroup) dies abruptly
+the kernel keeps `/dev/ublkbN` alive but quiesced instead of tearing it down. The
+plugin records a small per-volume state file under `CSI_STATE_DIR`
+(default `/csi/state`, on the persistent kubelet plugin hostPath); on startup it
+reads those records and re-attaches a fresh `run --recover` child to the same
+device id, resuming I/O while the existing mount (same `major:minor`) stays
+valid. NBD volumes have no kernel-side recovery, so they are re-served by
+re-spawning the NBD server and reconnecting `nbd-client` to the same device node.
+Records that can't be recovered (e.g. after a full node reboot that destroyed the
+devices) are pruned so the kubelet re-publishes from scratch. The state file
+holds the child environment, including any credentials passed as mount secrets,
+so securing the node-local state directory is the operator's responsibility.
+
 ### Kubernetes e2e
 
 The **PVC lifecycle** e2e ([tests/k8s_pvc_e2e.rs](ublk-azblob/tests/k8s_pvc_e2e.rs))
