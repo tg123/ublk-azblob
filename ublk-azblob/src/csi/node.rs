@@ -354,7 +354,29 @@ impl Node for NodeService {
             ));
         }
         let overlay_dirs = if overlay_enabled {
-            Some(mount::overlay_dirs(&target))
+            // Optional operator-chosen filesystem for the ephemeral write scratch
+            // (overlayfs upper/work). When unset the scratch lives next to the
+            // CSI target; when set the operator must have pre-created/mounted the
+            // path on this node (e.g. an SSD or tmpfs).
+            let scratch_base = req
+                .volume_context
+                .get("overlayScratchDir")
+                .map(String::as_str)
+                .filter(|s| !s.is_empty());
+            if let Some(base) = scratch_base {
+                let meta = std::fs::metadata(base).map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "overlayScratchDir {base:?} is not accessible on this node \
+                         (must be a pre-created directory): {e}"
+                    ))
+                })?;
+                if !meta.is_dir() {
+                    return Err(Status::invalid_argument(format!(
+                        "overlayScratchDir {base:?} is not a directory"
+                    )));
+                }
+            }
+            Some(mount::overlay_dirs(&target, scratch_base, &volume_id))
         } else {
             None
         };

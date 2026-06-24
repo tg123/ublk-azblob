@@ -51,6 +51,9 @@ parameters:
   {{- if .overlay }}
   overlay: {{ .overlay | quote }}
   {{- end }}
+  {{- if .overlayScratchDir }}
+  overlayScratchDir: {{ .overlayScratchDir | quote }}
+  {{- end }}
   {{- if .fsck }}
   fsck: {{ .fsck | quote }}
   {{- end }}
@@ -102,6 +105,9 @@ parameters:
   {{- end }}
   {{- if .overlay }}
   overlay: {{ .overlay | quote }}
+  {{- end }}
+  {{- if .overlayScratchDir }}
+  overlayScratchDir: {{ .overlayScratchDir | quote }}
   {{- end }}
   {{- if .fsck }}
   fsck: {{ .fsck | quote }}

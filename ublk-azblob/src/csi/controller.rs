@@ -56,6 +56,13 @@ const PARAM_TEMPLATE_BLOB_MOUNT_ARGS: &str = "templateBlobMountArgsOverwrite";
 /// discarded on unpublish (pod-local changes never reach the blob). Only
 /// meaningful for a `templateBlobUrl` that targets a snapshot (`?snapshot=`).
 const PARAM_OVERLAY: &str = "overlay";
+/// Parameter key (StorageClass `parameters`) choosing the node-local filesystem
+/// that backs an ephemeral overlay's writable scratch (`upperdir`/`workdir`).
+/// When unset the scratch lives next to the CSI target (the per-volume kubelet
+/// directory); set it to steer writes onto a chosen mount (e.g. an SSD or tmpfs)
+/// that the operator has pre-created on every node. Only meaningful with
+/// `overlay: "true"`.
+const PARAM_OVERLAY_SCRATCH_DIR: &str = "overlayScratchDir";
 /// Parameter keys for the optional cluster-lease coordination, forwarded to the
 /// node via the volume context (the node's `child_env` reads them).
 const PARAM_COORDINATION: &str = "coordination";
@@ -283,6 +290,9 @@ impl Controller for ControllerService {
                 // without mutating (or copying) the shared golden image.
                 if let Some(v) = req.parameters.get(PARAM_OVERLAY) {
                     volume_context.insert(PARAM_OVERLAY.to_string(), v.clone());
+                }
+                if let Some(v) = req.parameters.get(PARAM_OVERLAY_SCRATCH_DIR) {
+                    volume_context.insert(PARAM_OVERLAY_SCRATCH_DIR.to_string(), v.clone());
                 }
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
