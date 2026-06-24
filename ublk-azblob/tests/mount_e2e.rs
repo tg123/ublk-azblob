@@ -43,6 +43,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -54,9 +55,24 @@ const DEFAULT_ACCOUNT: &str = "devstoreaccount1";
 const DEFAULT_CONTAINER: &str = "e2etest";
 const DEFAULT_BLOB: &str = "mounttest";
 
-// High device id (away from 0,1,…) so these tests don't collide with the ublk
-// devices the k8s CSI e2e auto-assigns from 0 when the whole suite runs together.
-const DEV_ID: &str = "40";
+// Process-wide allocator for the ublk device ids these tests use.
+//
+// Tests in this binary run in parallel threads, each creating its own
+// `/dev/ublkbN`. Rather than hand-pick a number per test (which silently
+// collides the moment two tests choose the same id — and forces every new test
+// to audit which ids are already taken), each test draws a fresh id from this
+// counter via `next_dev_id()`. Uniqueness within the run is therefore
+// guaranteed by construction.
+//
+// The base is high (40) so these ids stay clear of the low ids the k8s CSI e2e
+// auto-assigns from 0 when the whole suite shares one host kernel.
+static NEXT_DEV_ID: AtomicU16 = AtomicU16::new(40);
+
+/// Allocate a fresh, process-unique ublk device id (see [`NEXT_DEV_ID`]).
+fn next_dev_id() -> String {
+    NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
 const BLOB_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB (xfs needs ~300 MiB minimum)
 const NUM_FILES: usize = 8;
 
@@ -418,7 +434,7 @@ fn mount_roundtrip() {
     }
 
     run_mount_roundtrip(DeviceSpec {
-        dev_id: DEV_ID.to_string(),
+        dev_id: next_dev_id(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB),
         cache_dir: None,
@@ -449,9 +465,9 @@ fn mount_roundtrip_file_cache() {
 
     let cache_dir = tempdir("ublk-azblob-cache");
     run_mount_roundtrip(DeviceSpec {
-        // Distinct device id, container and blob so this test never collides
-        // with `mount_roundtrip` (or the k8s CSI e2e's low auto-assigned ids).
-        dev_id: "41".to_string(),
+        // Fresh device id, distinct container and blob so this test never
+        // collides with `mount_roundtrip` (or any other test).
+        dev_id: next_dev_id(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-fcache", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: Some(cache_dir.clone()),
@@ -482,9 +498,8 @@ fn mount_roundtrip_file_cache_budget() {
 
     let cache_dir = tempdir("ublk-azblob-cache-budget");
     run_mount_roundtrip(DeviceSpec {
-        // Distinct device id, container and blob (see other tests' comments).
-        // 44 avoids mount_read_only's 42 and graceful_shutdown's 43.
-        dev_id: "44".to_string(),
+        // Fresh device id, distinct container and blob (see other tests).
+        dev_id: next_dev_id(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!(
             "{}-fcache-budget",
@@ -522,9 +537,8 @@ fn mount_warmup_sparse_image() {
 
     let cache_dir = tempdir("ublk-azblob-cache-warmup");
     let mut spec = DeviceSpec {
-        // 48 avoids mount_fsck's device 45, the other tests' ids (40–44), and
-        // the 46/47 reserved by PR #21's mount_formattable_fs_profiles test.
-        dev_id: "48".to_string(),
+        // Fresh device id, distinct container and blob (see other tests).
+        dev_id: next_dev_id(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-warmup", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: Some(cache_dir.clone()),
@@ -644,19 +658,19 @@ fn mount_formattable_fs_profiles() {
         return;
     }
 
-    // (fs_type, mkfs flags matching `csi::mount::fs_profile`, dev_id). High
-    // device ids avoid colliding with the other mount_e2e tests (40-45) and the
-    // k8s CSI e2e's low auto-assigned ids.
-    let cases: &[(&str, &[&str], &str)] = &[("xfs", &["-f"], "46"), ("btrfs", &["-f"], "47")];
+    // (fs_type, mkfs flags matching `csi::mount::fs_profile`). Each case draws
+    // a fresh device id from `next_dev_id()` so it never collides with the
+    // other mount tests or the k8s CSI e2e's low auto-assigned ids.
+    let cases: &[(&str, &[&str])] = &[("xfs", &["-f"]), ("btrfs", &["-f"])];
 
-    for &(fs, mkfs_flags, dev_id) in cases {
+    for &(fs, mkfs_flags) in cases {
         if !have_tool(&format!("mkfs.{fs}")) {
             eprintln!("skipping {fs}: mkfs.{fs} not installed");
             continue;
         }
 
         let spec = DeviceSpec {
-            dev_id: dev_id.to_string(),
+            dev_id: next_dev_id(),
             container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
             blob: format!("{}-{fs}", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
             cache_dir: None,
@@ -791,9 +805,9 @@ fn mount_read_only() {
     }
 
     let spec = DeviceSpec {
-        // Distinct, high device id and blob so this test never collides with
-        // the other mount tests or the low ids the k8s CSI e2e auto-assigns.
-        dev_id: "42".to_string(),
+        // Fresh device id, distinct container and blob so this test never
+        // collides with the other mount tests.
+        dev_id: next_dev_id(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-ro", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
@@ -915,9 +929,9 @@ fn graceful_shutdown_flush() {
     }
 
     let spec = DeviceSpec {
-        // Distinct device id, container and blob so this test never collides
-        // with the other mount tests (or the k8s CSI e2e's low auto-assigned ids).
-        dev_id: "43".to_string(), // distinct from mount_read_only's 42; see above
+        // Fresh device id, distinct container and blob so this test never
+        // collides with the other mount tests.
+        dev_id: next_dev_id(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-shutdown", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
@@ -1018,9 +1032,9 @@ fn mount_fsck() {
     }
 
     let spec = DeviceSpec {
-        // Distinct, high device id and blob so this test never collides with the
-        // other mount tests (40/41/42/43/44) or the k8s CSI e2e's low ids.
-        dev_id: "45".to_string(),
+        // Fresh device id, distinct container and blob so this test never
+        // collides with the other mount tests.
+        dev_id: next_dev_id(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-fsck", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
@@ -1135,9 +1149,9 @@ fn mount_overlay_ephemeral() {
     }
 
     let spec = DeviceSpec {
-        // Distinct, high device id and blob so this test never collides with the
-        // other mount tests (40/41/42/43/45) or the k8s CSI e2e's low ids.
-        dev_id: "44".to_string(),
+        // Fresh device id, distinct container and blob so this test never
+        // collides with the other mount tests.
+        dev_id: next_dev_id(),
         container: env_or("AZURE_STORAGE_CONTAINER", DEFAULT_CONTAINER),
         blob: format!("{}-overlay", env_or("AZURE_STORAGE_BLOB", DEFAULT_BLOB)),
         cache_dir: None,
