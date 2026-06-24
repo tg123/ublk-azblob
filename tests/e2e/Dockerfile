@@ -1,6 +1,6 @@
 # Unified test-runner image for the ublk-azblob e2e suite.
 #
-# One runner drives every e2e from a single compile (`--features "ublk csi"`):
+# One runner drives every e2e from a single compile (default ublk + csi build):
 #   * mount_e2e / nbd_e2e — run the freshly-built binary against Azurite.
 #   * k8s_pvc_e2e         — package that same binary into a thin image and run
 #                           the CSI driver on the in-compose k3s cluster.
@@ -16,20 +16,26 @@ ARG DOCKER_VERSION=27.5.1
 ARG KUBECTL_VERSION=v1.32.3
 ARG HELM_VERSION=v3.17.3
 
-# - e2fsprogs / util-linux : mkfs.ext4, mount/umount (run by mount_e2e directly)
+# This runner installs NO filesystem tooling of its own. The mount/umount/
+# losetup/blkid/fsck binaries the mount e2e needs come from the base image's
+# essential util-linux package, and the on-device formatters (mkfs.ext*/xfs/
+# btrfs, fsck.ext4) are bridged into the runtime image at run time (see
+# tests/e2e/docker-compose.yml) so the e2e formats devices with the exact tools
+# shipped to production rather than duplicating them here.
 # - libclang-dev           : bindgen for libublk-rs-sys (ublk feature)
 # - protobuf-compiler + libprotobuf-dev : protoc + well-known types (csi feature)
+# - fio / jq               : used by the benchmark pipeline (tests/bench/)
 # (nbd_e2e uses an in-process TCP client and the node plugin's mkfs/mount/
 #  nbd-client live in the driver image, so neither is needed here.)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        e2fsprogs \
-        util-linux \
         ca-certificates \
         curl \
         libclang-dev \
         protobuf-compiler \
         libprotobuf-dev \
+        fio \
+        jq \
  && rm -rf /var/lib/apt/lists/*
 
 # docker CLI (client only) + buildx plugin — talks to the host daemon via the
@@ -60,5 +66,17 @@ RUN ARCH=$(dpkg --print-architecture) \
  && curl -fsSL \
       "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" \
     | tar -xzC /usr/local/bin --strip-components=1 "linux-${ARCH}/helm"
+
+# Azure CLI — used by the mount/NBD read-only e2e tests to snapshot the blob
+# (`az storage blob snapshot`) before reopening it read-only. The official
+# Debian install script sets up the Microsoft apt repo for the build arch
+# (amd64/arm64) and installs `azure-cli`.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        apt-transport-https \
+        lsb-release \
+        gnupg \
+ && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

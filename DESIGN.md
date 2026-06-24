@@ -81,7 +81,7 @@ the `BlobBackend` trait:
 ```
 BlobBackend::read/write/clear/flush/size  ←  only interface the I/O loop sees
 AzurePageBlobBackend                      ←  all SDK types live here
-BufferedBackend                           ←  in-memory write-back cache (wraps any backend)
+BufferedBackend                           ←  in-memory write-back + read cache (wraps any backend)
 FileCacheBackend                          ←  persistent local-disk cache (wraps any backend)
 MemBackend                                ←  in-memory, no network, for unit tests
 ```
@@ -91,7 +91,11 @@ cache — for example `BufferedBackend` (memory) → `FileCacheBackend` (local d
 → `AzurePageBlobBackend` (blob).  The local-disk cache persists its `present` /
 `dirty` page bitmaps so that **dirty pages survive a restart**: on startup the
 cache is recovered from disk and any recovered dirty pages are flushed to the
-blob.
+blob.  Clean pages survive a restart too — including in read-write mode — gated
+by the backing blob's **ETag**: `FileCacheBackend` records the blob ETag (via the
+`BlobBackend::etag` accessor) after each flush and, on reopen, reuses the cached
+clean pages only when the live ETag still matches (proving no external change);
+on a mismatch the stale clean pages are dropped while dirty pages are kept.
 
 A future SDK upgrade only requires modifying `src/backend/azure.rs`.
 
@@ -148,6 +152,39 @@ Phase 1: single queue, single thread.  The libublk queue handler calls
 Phase 2: spawn one Tokio task per ublk queue, use `tokio::spawn` + channel for
 back-pressure.  Map io_uring depth → parallel REST calls.
 
+#### Centralized I/O gateway (`src/backend/io_gateway.rs`)
+
+Every Azure download (read) and upload (write / clear / server-side copy) is
+issued from exactly one place — `AzurePageBlobBackend` — so routing its
+primitives through a single, process-wide `AzureIoGateway` makes it the one
+chokepoint that enforces, *per direction independently*:
+
+1. **Bandwidth** — a byte-rate ceiling backed by a leaky bucket
+   (`leaky-bucket`), one limiter per direction; `0` = unlimited.
+2. **Threads / concurrency** — a single shared pool of consumer worker tasks
+   drawn from by both directions; at most that many Azure requests are in flight
+   at once *combined*. The budget auto-sizes to the logical CPU count, and
+   either direction can use all of it when the other is idle (a dynamic split,
+   not a fixed half each). Optional per-direction ceilings cap how much of the
+   budget each may use.
+3. **Fairness** — a **provider/consumer** model. Producers (on-demand reads,
+   write-back flush, server-side copy, cache warm-up) enqueue work onto a
+   priority queue (`async-priority-channel`); the workers drain it
+   highest-priority-first, so background work cannot starve foreground I/O.
+
+The priority order is **foreground read > flush > copy > warm-up**. Producers
+label their traffic with a task-local `IoClass` (`with_class`); on-demand reads
+default to `ForegroundRead` and writes to `Flush`. Downloads and uploads keep
+separate priority queues and bandwidth limiters (the order is enforced within
+each direction), but share one concurrency budget.
+
+The per-subsystem knobs (`UBLK_FLUSH_CONCURRENCY`,
+`UBLK_CACHE_WARMUP_CONCURRENCY`, `UBLK_COPY_CONCURRENCY`) now only bound how much
+work each producer keeps *enqueued* (pipeline depth / memory); the authoritative
+Azure thread and bandwidth limits live in the gateway (`UBLK_IO_CONCURRENCY` /
+`UBLK_DOWNLOAD_CONCURRENCY` / `UBLK_UPLOAD_CONCURRENCY` /
+`UBLK_DOWNLOAD_BANDWIDTH` / `UBLK_UPLOAD_BANDWIDTH`).
+
 ### 6. Retry / back-off
 
 Phase 1: the Azure SDK's built-in retry policy handles transient 429 (throttled)
@@ -165,7 +202,7 @@ the filesystem or application.  The device does **not** silently eat errors.
 ## Kubernetes CSI Driver
 
 The same binary doubles as a Kubernetes **Container Storage Interface (CSI)**
-driver (built with `--features "ublk csi"`, run via the `csi` subcommand). It
+driver (ublk + CSI are on by default, run via the `csi` subcommand). It
 reuses the ublk + Page Blob stack unchanged: each PVC maps to one page blob,
 attached as a ublk device and mounted as ext4.
 
@@ -231,19 +268,47 @@ Prove range reads work: `nbdkit curl` plugin + SAS URL → confirmed end-to-end.
 ### Phase 1 — MVP *(this PR)*
 - ✅ `BlobBackend` trait + `AzurePageBlobBackend` + `MemBackend`
 - ✅ SharedKey auth (Azurite) + MSI auth wiring
-- ✅ ublk target (real impl gated behind `--features ublk`; stub otherwise)
+- ✅ ublk target (real impl is the default `ublk` feature; `--no-default-features` stub otherwise)
 - ✅ Full mount-based e2e test against Azurite (ext4 on `/dev/ublkbN`)
 - ✅ CI: fmt + clippy + unit tests + mount e2e pipeline
 
 ### Phase 2 — Performance
-- Read cache (LRU, configurable size)
+- ✅ Read cache (LRU): the local-disk cache supports a configurable byte budget
+  (`--cache-max-bytes`) and evicts least-recently-used **clean** pages (by
+  hole-punching the sparse `.dat` file) once the budget is exceeded; dirty pages
+  are never evicted. The budget is shared across every process using the same
+  `--cache-dir` via a `flock`-coordinated, crash-safe `.cache-budget` file, so a
+  single noisy volume cannot fill a shared CSI node's cache disk. Each process
+  evicts only its own clean pages and never touches a peer's cache files. The
+  same LRU bookkeeping (`backend::cache_lru::Lru`) bounds the **in-memory**
+  write-back buffer too: it doubles as a read cache and evicts least-recently-
+  used clean pages once the resident set exceeds `--max-cached-pages` (dirty
+  pages stay pinned).
+- ⚠️ Cross-process clean-page sharing (`--cache-share-pages`) — **implemented but
+  currently disabled in the shipped binary** (the flag is accepted but ignored;
+  every cache is single-process). Design, retained for a later iteration:
+  processes caching
+  the same blob in one `--cache-dir` serve each other's clean pages off local
+  disk via a `flock`-coordinated `.cache-index` (sibling to `.cache-budget`)
+  mapping `(blob, page) → owner .dat + offset`. A read miss consults the index
+  and copies a live peer's clean page read-only instead of fetching the blob,
+  falling back to the blob if the page is absent/stale/peer-dead. Shared reads
+  are not double-counted (one on-disk owner per resident page), and dead-PID
+  entries are pruned exactly as in the budget file.
+- ✅ Copy-on-write writes: before mutating a page a peer owns, the writer
+  withdraws it from the index and writes into its **own** `.dat`, marking it
+  dirty locally — preserving the single-writer-per-file invariant. Dirty pages
+  are never evicted and never served cross-process; once flushed clean the new
+  owner re-publishes the page so later peer reads resolve to it.
 - ✅ Persistent local-disk cache (`FileCacheBackend`), composable into a
   multi-level cache (memory → local disk → blob) with crash-recoverable dirty
   pages that are flushed to the blob on restart
 - Write coalescing (merge adjacent pages before `upload_pages`)
 - Multiple queues / true async (one Tokio task per queue)
 - FLUSH / FUA handling (drain write buffer before responding)
-- `list_page_ranges` sparse map to skip zero reads
+- ✅ `list_page_ranges` sparse map to skip zero reads — warm-up queries
+  `Get Page Ranges` (`?comp=pagelist`) and skips downloading pages that fall in
+  a zero gap; all-zero pages are also left as holes in the local `.dat`
 
 ### Phase 3 — Hardening
 - MSI live testing on Azure VM / AKS
@@ -261,10 +326,10 @@ GitHub-hosted runners do **not** load `ublk_drv` by default, but the module
 ships in `linux-modules-extra-$(uname -r)` and can be loaded with `modprobe`.
 The CI workflow therefore:
 
-1. **Always runs** `cargo fmt --check`, `cargo clippy` (with and without
-   `--features ublk`), and `cargo test` (unit tests against `MemBackend`).
+1. **Always runs** `cargo fmt --check`, `cargo clippy`, and `cargo test` (unit
+   tests against `MemBackend`).
 2. **Runs the full mount e2e** on `ubuntu-22.04`: it loads `ublk_drv`, starts
-   Azurite, builds with `--features ublk`, then mounts an ext4 filesystem on
+   Azurite, builds the default (ublk) binary, then mounts an ext4 filesystem on
    `/dev/ublkbN`, writes random files, forces a flush via `SIGUSR1`, unmounts,
    tears the device down, remounts over the same page blob, and verifies every
    file's SHA-256 checksum.

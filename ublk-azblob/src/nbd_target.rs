@@ -48,6 +48,7 @@ const NBD_FLAG_C_NO_ZEROES: u32 = 1 << 1;
 
 // Transmission flags (advertised in the export info).
 const NBD_FLAG_HAS_FLAGS: u16 = 1 << 0;
+const NBD_FLAG_READ_ONLY: u16 = 1 << 1;
 const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
 const NBD_FLAG_SEND_TRIM: u16 = 1 << 5;
 const NBD_FLAG_SEND_WRITE_ZEROES: u16 = 1 << 6;
@@ -82,6 +83,7 @@ const NBD_CMD_TRIM: u16 = 4;
 const NBD_CMD_WRITE_ZEROES: u16 = 6;
 
 // NBD error codes (a subset of errno used on the wire).
+const NBD_EPERM: u32 = 1;
 const NBD_EIO: u32 = 5;
 const NBD_EINVAL: u32 = 22;
 const NBD_ENOSPC: u32 = 28;
@@ -105,6 +107,7 @@ pub async fn run_nbd_target(
     backend: Arc<dyn BlobBackend>,
     addr: &str,
     dev_size: u64,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
@@ -113,6 +116,7 @@ pub async fn run_nbd_target(
     info!(
         addr = %local,
         dev_size,
+        read_only,
         export = EXPORT_NAME,
         "NBD server listening — connect with e.g. `nbd-client {host} {port} /dev/nbd0`",
         host = local.ip(),
@@ -140,7 +144,7 @@ pub async fn run_nbd_target(
                 let backend = backend.clone();
                 info!(peer = %peer, "NBD client connected");
                 tokio::spawn(async move {
-                    if let Err(e) = serve_connection(stream, backend, dev_size).await {
+                    if let Err(e) = serve_connection(stream, backend, dev_size, read_only).await {
                         // A client disconnecting mid-stream is normal; log at warn so it
                         // is visible without being alarming.
                         warn!(peer = %peer, err = %e, "NBD connection ended");
@@ -171,8 +175,13 @@ pub async fn run_nbd_target(
 // ── Connection handling ────────────────────────────────────────────────────────
 
 /// Transmission flags advertised for the export.
-fn transmission_flags() -> u16 {
-    NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM | NBD_FLAG_SEND_WRITE_ZEROES
+fn transmission_flags(read_only: bool) -> u16 {
+    let mut flags =
+        NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM | NBD_FLAG_SEND_WRITE_ZEROES;
+    if read_only {
+        flags |= NBD_FLAG_READ_ONLY;
+    }
+    flags
 }
 
 /// Drive one client connection: handshake → option haggling → transmission.
@@ -180,6 +189,7 @@ async fn serve_connection(
     mut stream: TcpStream,
     backend: Arc<dyn BlobBackend>,
     dev_size: u64,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true).ok();
 
@@ -196,19 +206,24 @@ async fn serve_connection(
 
     // ── Option haggling ──
     // Returns once the client selects an export (GO/EXPORT_NAME) or aborts.
-    if !negotiate(&mut stream, dev_size, no_zeroes).await? {
+    if !negotiate(&mut stream, dev_size, no_zeroes, read_only).await? {
         // Client aborted or asked only for information; nothing more to do.
         return Ok(());
     }
 
     // ── Transmission phase ──
-    transmission(&mut stream, backend, dev_size).await
+    transmission(&mut stream, backend, dev_size, read_only).await
 }
 
 /// Option haggling loop.  Returns `Ok(true)` when the client has selected an
 /// export and the connection should proceed to the transmission phase, or
 /// `Ok(false)` when the client aborted / only queried information.
-async fn negotiate(stream: &mut TcpStream, dev_size: u64, no_zeroes: bool) -> anyhow::Result<bool> {
+async fn negotiate(
+    stream: &mut TcpStream,
+    dev_size: u64,
+    no_zeroes: bool,
+    read_only: bool,
+) -> anyhow::Result<bool> {
     loop {
         let magic = stream.read_u64().await.context("read option magic")?;
         if magic != IHAVEOPT {
@@ -227,7 +242,7 @@ async fn negotiate(stream: &mut TcpStream, dev_size: u64, no_zeroes: bool) -> an
                 // Legacy selection: reply with the export tuple and switch to
                 // transmission immediately (no reply header, no trailing ACK).
                 stream.write_u64(dev_size).await?;
-                stream.write_u16(transmission_flags()).await?;
+                stream.write_u16(transmission_flags(read_only)).await?;
                 if !no_zeroes {
                     stream.write_all(&[0u8; 124]).await?;
                 }
@@ -235,7 +250,7 @@ async fn negotiate(stream: &mut TcpStream, dev_size: u64, no_zeroes: bool) -> an
                 return Ok(true);
             }
             NBD_OPT_INFO | NBD_OPT_GO => {
-                send_export_info(stream, opt, dev_size).await?;
+                send_export_info(stream, opt, dev_size, read_only).await?;
                 send_opt_reply(stream, opt, NBD_REP_ACK, &[]).await?;
                 stream.flush().await?;
                 if opt == NBD_OPT_GO {
@@ -269,12 +284,17 @@ async fn negotiate(stream: &mut TcpStream, dev_size: u64, no_zeroes: bool) -> an
 
 /// Send an `NBD_REP_INFO` (`NBD_INFO_EXPORT` + `NBD_INFO_BLOCK_SIZE`) in
 /// response to `NBD_OPT_GO` / `NBD_OPT_INFO`.
-async fn send_export_info(stream: &mut TcpStream, opt: u32, dev_size: u64) -> anyhow::Result<()> {
+async fn send_export_info(
+    stream: &mut TcpStream,
+    opt: u32,
+    dev_size: u64,
+    read_only: bool,
+) -> anyhow::Result<()> {
     // NBD_INFO_EXPORT: u16 type, u64 size, u16 transmission flags.
     let mut export = Vec::with_capacity(12);
     export.extend_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
     export.extend_from_slice(&dev_size.to_be_bytes());
-    export.extend_from_slice(&transmission_flags().to_be_bytes());
+    export.extend_from_slice(&transmission_flags(read_only).to_be_bytes());
     send_opt_reply(stream, opt, NBD_REP_INFO, &export).await?;
 
     // NBD_INFO_BLOCK_SIZE: u16 type, u32 min, u32 preferred, u32 max.
@@ -309,6 +329,7 @@ async fn transmission(
     stream: &mut TcpStream,
     backend: Arc<dyn BlobBackend>,
     dev_size: u64,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     loop {
         // Request header: magic, flags, type, handle, offset, length.
@@ -361,6 +382,13 @@ async fn transmission(
                     .read_exact(&mut buf)
                     .await
                     .context("read write payload")?;
+                // Reject writes on a read-only export (the payload has already
+                // been drained above to keep the stream in sync).
+                if read_only {
+                    simple_reply(stream, NBD_EPERM, handle, &[]).await?;
+                    stream.flush().await?;
+                    continue;
+                }
                 if let Some(err) = bounds_error(offset, length, dev_size) {
                     simple_reply(stream, err, handle, &[]).await?;
                     stream.flush().await?;
@@ -382,6 +410,11 @@ async fn transmission(
                 }
             },
             NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES => {
+                if read_only {
+                    simple_reply(stream, NBD_EPERM, handle, &[]).await?;
+                    stream.flush().await?;
+                    continue;
+                }
                 if let Some(err) = bounds_error(offset, length, dev_size) {
                     simple_reply(stream, err, handle, &[]).await?;
                     stream.flush().await?;
@@ -446,6 +479,11 @@ mod tests {
     /// Spawn an NBD server on an ephemeral port backed by a `MemBackend` and
     /// return its address plus the backend (for assertions).
     async fn spawn_server(size: u64) -> (String, Arc<dyn BlobBackend>) {
+        spawn_server_with(size, false).await
+    }
+
+    /// Like [`spawn_server`] but lets the caller choose the read-only mode.
+    async fn spawn_server_with(size: u64, read_only: bool) -> (String, Arc<dyn BlobBackend>) {
         let backend: Arc<dyn BlobBackend> = Arc::new(MemBackend::new(size).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -453,7 +491,7 @@ mod tests {
         tokio::spawn(async move {
             // Accept a single connection and serve it.
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = serve_connection(stream, b, size).await;
+            let _ = serve_connection(stream, b, size, read_only).await;
         });
         (addr, backend)
     }
@@ -593,5 +631,41 @@ mod tests {
         let (err, handle) = read_reply(&mut s).await;
         assert_eq!(err, NBD_ENOSPC);
         assert_eq!(handle, 11);
+    }
+
+    #[tokio::test]
+    async fn read_only_rejects_writes() {
+        let (addr, _backend) = spawn_server_with(4096, true).await;
+        let mut s = handshake(&addr).await;
+
+        // Writes are rejected with EPERM on a read-only export.
+        let payload = vec![0xABu8; 512];
+        send_request(&mut s, NBD_CMD_WRITE, 1, 512, 512, &payload).await;
+        let (err, handle) = read_reply(&mut s).await;
+        assert_eq!(err, NBD_EPERM);
+        assert_eq!(handle, 1);
+
+        // Trim / write-zeroes are likewise rejected.
+        send_request(&mut s, NBD_CMD_TRIM, 2, 0, 512, &[]).await;
+        let (err, handle) = read_reply(&mut s).await;
+        assert_eq!(err, NBD_EPERM);
+        assert_eq!(handle, 2);
+
+        // Reads still succeed.
+        send_request(&mut s, NBD_CMD_READ, 3, 0, 512, &[]).await;
+        let (err, handle) = read_reply(&mut s).await;
+        assert_eq!(err, 0);
+        assert_eq!(handle, 3);
+        let mut got = vec![0u8; 512];
+        s.read_exact(&mut got).await.unwrap();
+    }
+
+    #[test]
+    fn read_only_export_advertises_flag() {
+        assert_eq!(transmission_flags(false) & NBD_FLAG_READ_ONLY, 0);
+        assert_eq!(
+            transmission_flags(true) & NBD_FLAG_READ_ONLY,
+            NBD_FLAG_READ_ONLY
+        );
     }
 }

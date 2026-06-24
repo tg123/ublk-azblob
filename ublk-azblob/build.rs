@@ -2,9 +2,9 @@
 //!
 //! Generates Rust bindings for the Container Storage Interface (CSI) gRPC
 //! service from the vendored `proto/csi/csi.proto`, but **only** when the `csi`
-//! Cargo feature is enabled.  This keeps the default build (and the existing
-//! `protoc`-less CI) working without any extra tooling: `protoc` is required
-//! only for `--features csi`.
+//! Cargo feature is enabled.  `csi` is on by default, so `protoc` is required
+//! for a default build; a `--no-default-features` build skips this step and
+//! needs no extra tooling.
 
 fn main() {
     // Cargo sets `CARGO_FEATURE_<NAME>` for every enabled feature.

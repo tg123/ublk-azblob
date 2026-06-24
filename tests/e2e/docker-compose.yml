@@ -1,6 +1,7 @@
 # Unified docker-compose for the entire ublk-azblob e2e suite.
 #
-# A single `runner` compiles the crate once (`--features "ublk csi"`) and then:
+# A single `runner` compiles the crate once (full default feature set:
+# ublk + csi) and then:
 #   1. runs the mount/NBD e2e against the compose `azurite`,
 #   2. packages that same binary into a thin `ublk-azblob:e2e` image, and
 #   3. runs the Kubernetes PVC e2e on the in-compose k3s cluster (which deploys
@@ -10,6 +11,9 @@
 #   - Docker daemon at /var/run/docker.sock
 #   - ublk_drv loaded: `sudo modprobe ublk_drv`
 #   - A shared mount for CSI mount propagation (CI: /var/lib/kubelet; local: /tmp).
+#
+# The Rust mount e2e (`tests/mount_e2e.rs`) includes the read-only mount test and
+# the NBD e2e (`tests/nbd_e2e.rs`) includes the read-only export test.
 #
 # Usage (local):
 #   sudo modprobe ublk_drv
@@ -140,6 +144,18 @@ services:
         cid=$$(docker create ublk-azblob:e2e)
         docker cp "$$cid:/usr/local/bin/ublk-azblob" target/ublk-azblob-shipped
         docker rm "$$cid" >/dev/null
+        # The on-device filesystem formatters are not installed in this runner;
+        # they live only in the runtime image (deploy/Dockerfile ships
+        # e2fsprogs/xfsprogs/btrfs-progs). Bridge mkfs.*/fsck.ext4 into that image
+        # so the mount e2e formats devices with the exact tools shipped to
+        # production. They operate on the shared /dev block devices, so a sibling
+        # container with /dev bind-mounted is equivalent. mount/umount stay in
+        # this runner (they must affect the test's own mount namespace) and come
+        # from the base util-linux.
+        for tool in mkfs.ext2 mkfs.ext3 mkfs.ext4 mkfs.xfs mkfs.btrfs fsck.ext4; do
+          printf '#!/bin/sh\nexec docker run --rm --privileged -v /dev:/dev --entrypoint %s %s "$$@"\n' "$$tool" "$$E2E_IMAGE" > /usr/local/bin/"$$tool"
+          chmod +x /usr/local/bin/"$$tool"
+        done
         for i in $$(seq 1 60); do
           [ -f /kubeconfig/kubeconfig.yaml ] && break
           echo "waiting for kubeconfig... ($$i/60)"; sleep 1
@@ -148,7 +164,12 @@ services:
         sed -i 's|https://127.0.0.1:6443|https://k3s-server:6443|g' /tmp/kubeconfig.yaml
         export KUBECONFIG=/tmp/kubeconfig.yaml
         kubectl wait --for=condition=Ready nodes --all --timeout=120s
-        cargo test --release --features "ublk csi" -p ublk-azblob \
+        # Integration e2e (run as root): mount_e2e covers the precooked formattable
+        # filesystem profiles (ext4 via mount_roundtrip, xfs/btrfs via
+        # mount_formattable_fs_profiles) on real ublk devices; the non-root bin
+        # unit tests (e.g. mkfs_rejects_unformattable_filesystems) run in the CI
+        # `cargo test` job.
+        cargo test --release -p ublk-azblob \
           --test mount_e2e --test nbd_e2e --test k8s_pvc_e2e \
           -- --nocapture --test-threads=1
 

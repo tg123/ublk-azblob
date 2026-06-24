@@ -39,8 +39,20 @@ parameters:
   {{- if .blobPathTemplate }}
   blobPathTemplate: {{ .blobPathTemplate | quote }}
   {{- end }}
-  {{- if .fsType }}
-  fsType: {{ .fsType }}
+  {{- if .newBlobFsType }}
+  newBlobFsType: {{ .newBlobFsType | quote }}
+  {{- end }}
+  {{- if .templateBlobFsType }}
+  templateBlobFsType: {{ .templateBlobFsType | quote }}
+  {{- end }}
+  {{- if .templateBlobMountArgsOverwrite }}
+  templateBlobMountArgsOverwrite: {{ .templateBlobMountArgsOverwrite | quote }}
+  {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
+  {{- end }}
+  {{- if .templateBlobUrl }}
+  templateBlobUrl: {{ .templateBlobUrl | quote }}
   {{- end }}
   {{- end }}
 reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
@@ -76,8 +88,20 @@ parameters:
   {{- if .blobPathTemplate }}
   blobPathTemplate: {{ .blobPathTemplate | quote }}
   {{- end }}
-  {{- if .fsType }}
-  fsType: {{ .fsType }}
+  {{- if .newBlobFsType }}
+  newBlobFsType: {{ .newBlobFsType | quote }}
+  {{- end }}
+  {{- if .templateBlobFsType }}
+  templateBlobFsType: {{ .templateBlobFsType | quote }}
+  {{- end }}
+  {{- if .templateBlobMountArgsOverwrite }}
+  templateBlobMountArgsOverwrite: {{ .templateBlobMountArgsOverwrite | quote }}
+  {{- end }}
+  {{- if .fsck }}
+  fsck: {{ .fsck | quote }}
+  {{- end }}
+  {{- if .templateBlobUrl }}
+  templateBlobUrl: {{ .templateBlobUrl | quote }}
   {{- end }}
   {{- end }}
 reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}

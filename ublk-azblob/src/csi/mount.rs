@@ -1,7 +1,7 @@
-//! Node-side OS helpers: ublk device discovery, `mkfs`, `mount` / `umount`.
+//! Node-side OS helpers: ublk device discovery, `mkfs`, `fsck`, `mount` / `umount`.
 //!
-//! These are blocking operations (they shell out to `mkfs`, `mount`, `blkid`,
-//! `umount` and poll `/dev`); the node service runs them on a blocking thread.
+//! These are blocking operations (they shell out to `mkfs`, `fsck`, `mount`,
+//! `blkid`, `umount` and poll `/dev`); the node service runs them on a blocking thread.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -305,25 +305,155 @@ pub fn has_filesystem(dev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Built-in `mkfs` and mount options for a supported filesystem type.
+///
+/// A profile bundles the sensible defaults for a filesystem so a StorageClass
+/// only has to pick a type (`newBlobFsType` / `templateBlobFsType`) instead of
+/// hand-rolling `mkfs`/mount flags.
+pub struct FsProfile {
+    /// Options passed to `mkfs.<fs>` before the device argument, or `None` when
+    /// the filesystem cannot be created on a live device (mount-only image /
+    /// pool filesystems and unknown types).
+    pub mkfs_options: Option<&'static [&'static str]>,
+    /// Default mount `-o` options applied when mounting the filesystem.
+    pub mount_options: &'static [&'static str],
+}
+
+/// Return the built-in formatting/mount profile for `fs_type`.
+///
+/// Supported profiles cover ext2/3/4, xfs, btrfs, squashfs, zfs and ntfs.
+/// squashfs, zfs and ntfs are image / pool filesystems that we only ever mount
+/// from a template (never freshly format on a live device), so they have no
+/// `mkfs` options (`None`). Unknown types also map to `None`, so [`mkfs`]
+/// rejects them instead of shelling out to a non-existent `mkfs.<fs>`.
+pub fn fs_profile(fs_type: &str) -> FsProfile {
+    match fs_type {
+        "ext2" | "ext3" | "ext4" => FsProfile {
+            // `-F` forces creation without interactive confirmation; `-E
+            // nodiscard` avoids a full TRIM pass (faster, and discard maps onto
+            // Clear Pages); lazy_itable_init / lazy_journal_init speed up mkfs on
+            // large devices (no zeroing of inode tables and journal).
+            mkfs_options: Some(&[
+                "-F",
+                "-E",
+                "nodiscard,lazy_itable_init=1,lazy_journal_init=1",
+            ]),
+            mount_options: &[],
+        },
+        // `-f` forces formatting even when an old signature is present.
+        "xfs" => FsProfile {
+            mkfs_options: Some(&["-f"]),
+            mount_options: &[],
+        },
+        "btrfs" => FsProfile {
+            mkfs_options: Some(&["-f"]),
+            mount_options: &[],
+        },
+        // Image / pool filesystems: only ever mounted from a template, never
+        // formatted on a freshly-provisioned device. squashfs/zfs are read-only
+        // images; ntfs is a template-only image too — we do not create NTFS
+        // (no reliable read-write NTFS formatting, and `mkfs.ntfs` isn't shipped
+        // in the runtime image), so it can only be mounted from a template.
+        "squashfs" | "zfs" | "ntfs" => FsProfile {
+            mkfs_options: None,
+            mount_options: &[],
+        },
+        _ => FsProfile {
+            mkfs_options: None,
+            mount_options: &[],
+        },
+    }
+}
+
 /// Create a filesystem of type `fs_type` on `dev` (only call on a blank device).
+///
+/// The built-in `mkfs` options come from the filesystem [`fs_profile`]. Returns
+/// an error for filesystem types that cannot be created on a live device
+/// (mount-only image / pool filesystems such as squashfs/zfs, and unknown
+/// types).
 pub fn mkfs(dev: &str, fs_type: &str) -> anyhow::Result<()> {
+    let mkfs_options = fs_profile(fs_type).mkfs_options.ok_or_else(|| {
+        anyhow::anyhow!("filesystem type {fs_type:?} does not support mkfs (cannot format {dev})")
+    })?;
     let mkfs_bin = format!("mkfs.{fs_type}");
     info!(dev, fs_type, "creating filesystem");
-    // `-F` forces creation without interactive confirmation; `-E nodiscard`
-    // avoids a full TRIM pass (faster, and discard maps onto Clear Pages).
-    // For ext4, use lazy_itable_init and lazy_journal_init to speed up mkfs
-    // on large devices (avoids writing zeros to entire inode tables and journal).
-    let args: Vec<&str> = if fs_type == "ext4" || fs_type == "ext3" || fs_type == "ext2" {
-        vec![
-            "-F",
-            "-E",
-            "nodiscard,lazy_itable_init=1,lazy_journal_init=1",
-            dev,
-        ]
-    } else {
-        vec![dev]
-    };
+    let mut args: Vec<&str> = mkfs_options.to_vec();
+    args.push(dev);
     run(&mkfs_bin, &args)
+}
+
+/// How to run `fsck` on a device before mounting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsckMode {
+    /// Don't run `fsck` (default).
+    Off,
+    /// `fsck -a`: automatically repair (preen) the filesystem; only minor,
+    /// safe-to-fix problems are corrected without prompting.
+    Preen,
+    /// `fsck -f -y`: force a full check even on a clean filesystem and answer
+    /// "yes" to every repair prompt.
+    Force,
+}
+
+impl FsckMode {
+    /// Parse a volume-context `fsck` value. Recognised values (case-insensitive):
+    /// `""`/`false`/`off`/`no`/`none`/`0` ⇒ [`FsckMode::Off`];
+    /// `true`/`auto`/`preen`/`yes`/`on`/`1` ⇒ [`FsckMode::Preen`];
+    /// `force`/`full` ⇒ [`FsckMode::Force`].
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "false" | "off" | "no" | "none" | "0" => Ok(FsckMode::Off),
+            "true" | "auto" | "preen" | "yes" | "on" | "1" => Ok(FsckMode::Preen),
+            "force" | "full" => Ok(FsckMode::Force),
+            other => bail!(
+                "invalid fsck value {other:?}; expected one of \
+                 false/off, true/preen/auto, or force"
+            ),
+        }
+    }
+}
+
+/// Run `fsck` on `dev` according to `mode` before mounting.
+///
+/// Only call this on a writable device that already carries a filesystem.
+/// `fsck` repairs in place, so the backing device must be read-write. Exit
+/// codes are interpreted per the `fsck(8)` bitmask: `0` (clean) and `1`
+/// (errors corrected) are treated as success; anything else — including `2`
+/// (corrected, reboot recommended), `4` (errors left uncorrected) and operational
+/// failures — is an error.
+pub fn fsck(dev: &str, fs_type: &str, mode: FsckMode) -> anyhow::Result<()> {
+    let args: Vec<&str> = match mode {
+        FsckMode::Off => return Ok(()),
+        // `-a` preens (auto-repair without prompting); non-interactive.
+        FsckMode::Preen => vec!["-t", fs_type, "-a", dev],
+        // `-f` forces a full check, `-y` answers yes to every prompt.
+        FsckMode::Force => vec!["-t", fs_type, "-f", "-y", dev],
+    };
+    info!(dev, fs_type, ?mode, "running fsck");
+    let output = Command::new("fsck")
+        .args(&args)
+        .output()
+        .with_context(|| format!("spawn `fsck {}`", args.join(" ")))?;
+    // `fsck` returns a bitmask: bit 0 (1) = errors corrected, bit 1 (2) = reboot
+    // recommended, bit 2 (4) = errors left uncorrected, bit 3 (8) = operational
+    // error, etc. Treat 0 (clean) and 1 (corrected) as success.
+    if let Some(code) = output.status.code() {
+        if code == 0 || code == 1 {
+            if code == 1 {
+                warn!(dev, "fsck corrected filesystem errors");
+            }
+            return Ok(());
+        }
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "`fsck {}` failed ({}): {} {}",
+        args.join(" "),
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    );
 }
 
 /// Mount `dev` at `target`, creating the mount point if needed.
@@ -340,6 +470,14 @@ pub fn mount(
     let mut options: Vec<String> = mount_flags.to_vec();
     if readonly {
         options.push("ro".into());
+        // The backing block device is hardware read-only, so the kernel cannot
+        // replay an ext journal. For an unclean ext2/3/4 image (e.g. a
+        // crash-consistent snapshot) a plain `-o ro` mount fails with "write
+        // access unavailable, cannot proceed (try mounting with noload)". Add
+        // `noload` so journal recovery is skipped and the image mounts read-only.
+        if matches!(fs_type, "ext2" | "ext3" | "ext4") && !options.iter().any(|o| o == "noload") {
+            options.push("noload".into());
+        }
     }
     if !options.is_empty() {
         args.push("-o".into());
@@ -399,4 +537,181 @@ fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Filesystems whose built-in profile must be able to format a fresh blob.
+    const FORMATTABLE: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs"];
+    /// Mount-only image / pool filesystems: never freshly formatted on a live
+    /// device (squashfs/zfs are read-only images; ntfs has no reliable
+    /// read-write mkfs we ship), so their profile must reject `mkfs`.
+    const MOUNT_ONLY: &[&str] = &["squashfs", "zfs", "ntfs"];
+
+    #[test]
+    fn fsck_mode_parses_off_values() {
+        for v in ["", "  ", "false", "OFF", "No", "none", "0"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Off, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_parses_preen_values() {
+        for v in ["true", "TRUE", "auto", "preen", "yes", "on", "1"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Preen, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_parses_force_values() {
+        for v in ["force", "Full"] {
+            assert_eq!(FsckMode::parse(v).unwrap(), FsckMode::Force, "value: {v:?}");
+        }
+    }
+
+    #[test]
+    fn fsck_mode_rejects_unknown_values() {
+        assert!(FsckMode::parse("maybe").is_err());
+    }
+
+    #[test]
+    fn fs_profile_formattable_types_have_mkfs_options() {
+        for fs in FORMATTABLE {
+            assert!(
+                fs_profile(fs).mkfs_options.is_some(),
+                "formattable filesystem {fs:?} must have built-in mkfs options"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_profile_mount_only_and_unknown_types_have_no_mkfs_options() {
+        for fs in MOUNT_ONLY.iter().chain(["not-a-fs", ""].iter()) {
+            assert!(
+                fs_profile(fs).mkfs_options.is_none(),
+                "mount-only / unknown filesystem {fs:?} must not advertise mkfs options"
+            );
+        }
+    }
+
+    /// `mkfs` returns a "format not supported" error (instead of shelling out to
+    /// a missing `mkfs.<fs>`) for every filesystem that cannot be created on a
+    /// live device.
+    #[test]
+    fn mkfs_rejects_unformattable_filesystems() {
+        for fs in MOUNT_ONLY.iter().chain(["not-a-fs"].iter()) {
+            let err = mkfs("/dev/null", fs).expect_err(&format!(
+                "mkfs({fs:?}) must fail for an unformattable filesystem"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not support mkfs"),
+                "unexpected error for {fs:?}: {msg}"
+            );
+        }
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: `geteuid` has no preconditions and never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn have_tool(bin: &str) -> bool {
+        Command::new(bin)
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// End-to-end check that every formattable profile actually formats and
+    /// mounts: back a loop device with a sparse image, run the real
+    /// [`mkfs`]/[`mount`]/[`umount`] (which source their flags from the built-in
+    /// profile), and round-trip a file through the mounted filesystem.
+    ///
+    /// Needs root + loop devices + the per-filesystem `mkfs.<fs>` tool; it skips
+    /// (rather than fails) when the environment cannot provide them. CI's
+    /// `cargo test` job runs as a non-root user, so this skips there; it
+    /// exercises the full format+mount path only when invoked as root locally.
+    /// In CI the equivalent coverage comes from the `mount_e2e`
+    /// `mount_formattable_fs_profiles` integration test, which formats+mounts the
+    /// xfs/btrfs profiles on real ublk devices on the privileged e2e runner.
+    #[test]
+    fn formattable_profiles_format_and_mount() {
+        if !is_root() || !have_tool("losetup") {
+            eprintln!("skipping formattable_profiles_format_and_mount: needs root + losetup");
+            return;
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp =
+            std::env::temp_dir().join(format!("ublk-mkfs-e2e-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        for fs in FORMATTABLE {
+            // ext2/ext3/ext4 all share `mkfs.ext*`; xfs needs ~300 MiB minimum,
+            // so size every image generously at 512 MiB (sparse, so cheap).
+            if !have_tool(&format!("mkfs.{fs}")) {
+                eprintln!("skipping {fs}: mkfs.{fs} not installed");
+                continue;
+            }
+
+            let img = tmp.join(format!("{fs}.img"));
+            {
+                let f = std::fs::File::create(&img).expect("create image file");
+                f.set_len(512 * 1024 * 1024).expect("size image file");
+            }
+            let img_str = img.to_str().unwrap();
+
+            // Attach a loop device for the image.
+            let out = Command::new("losetup")
+                .args(["--find", "--show", img_str])
+                .output()
+                .expect("spawn losetup");
+            if !out.status.success() {
+                // No usable loop device (e.g. a root container without loop
+                // support): skip rather than fail, matching the documented intent.
+                eprintln!(
+                    "skipping {fs}: losetup --find failed (no usable loop device): {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let _ = std::fs::remove_file(&img);
+                continue;
+            }
+            let dev = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+            let mount_point = tmp.join(format!("{fs}.mnt"));
+            let mount_point_str = mount_point.to_str().unwrap();
+
+            // Format and mount via the real profile-driven helpers.
+            mkfs(&dev, fs).unwrap_or_else(|e| panic!("mkfs.{fs} failed: {e}"));
+            let mount_opts: Vec<String> = fs_profile(fs)
+                .mount_options
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            mount(&dev, mount_point_str, fs, &mount_opts, false)
+                .unwrap_or_else(|e| panic!("mount {fs} failed: {e}"));
+
+            // Round-trip a file through the mounted filesystem.
+            let payload = b"precooked-fs-roundtrip";
+            let file = mount_point.join("probe");
+            std::fs::write(&file, payload).expect("write probe file");
+            let read = std::fs::read(&file).expect("read probe file");
+            assert_eq!(read, payload, "{fs} round-trip mismatch");
+
+            umount(mount_point_str).unwrap_or_else(|e| panic!("umount {fs} failed: {e}"));
+            let _ = Command::new("losetup").args(["-d", &dev]).status();
+            let _ = std::fs::remove_file(&img);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

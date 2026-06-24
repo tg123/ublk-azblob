@@ -27,12 +27,17 @@
 //! `present` (clean) pages are an optimization only; losing a `present` bit just
 //! forces a re-read from the inner backend, so those updates are not `fsync`ed.
 
+use super::cache_budget::CacheBudget;
+use super::cache_index::CacheIndex;
+use super::cache_lru::Lru;
+use super::io_gateway::{with_class, IoClass};
 use super::BlobBackend;
 use anyhow::{bail, Context as _};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 use tracing::{info, trace, warn};
@@ -49,10 +54,28 @@ const HEADER_SIZE: u64 = 64;
 pub struct FileCacheConfig {
     /// Directory that holds the cache data and metadata files.
     pub dir: PathBuf,
-    /// Base file name (without extension) for the cache files.
+    /// Base file name (without extension) for the cache files.  Must be unique
+    /// per cache instance within `dir`; when [`share_pages`](Self::share_pages)
+    /// is set it is also the *owner* key peers use to locate this cache's data
+    /// file for cross-process page sharing.
     pub name: String,
     /// Size of each cache page in bytes (must be a non-zero multiple of 512).
     pub page_size: u64,
+    /// Maximum total bytes of cached page data on local disk, **shared across
+    /// all processes** using the same `dir` (see [`CacheBudget`]).  `0` means
+    /// unlimited (no eviction), preserving the original grow-only behaviour.
+    pub max_bytes: u64,
+    /// Identity of the backing blob this cache mirrors.  Caches in the same
+    /// `dir` that share a `blob_identity` may serve each other's clean pages
+    /// (cross-process page sharing); only used when
+    /// [`share_pages`](Self::share_pages) is set.  Typically the container/blob
+    /// (or golden-image) identity.
+    pub blob_identity: String,
+    /// Enable cross-process clean-page sharing via a shared `.cache-index`
+    /// (see [`CacheIndex`]).  `false` (default) preserves the original
+    /// behaviour with zero overhead — each cache only ever reads its own pages
+    /// and the blob.
+    pub share_pages: bool,
 }
 
 impl Default for FileCacheConfig {
@@ -61,6 +84,9 @@ impl Default for FileCacheConfig {
             dir: PathBuf::from("."),
             name: "ublk-azblob-cache".to_string(),
             page_size: 1024 * 1024, // 1 MiB
+            max_bytes: 0,           // unlimited
+            blob_identity: String::new(),
+            share_pages: false,
         }
     }
 }
@@ -69,6 +95,21 @@ impl Default for FileCacheConfig {
 pub struct FileCacheBackend {
     inner: std::sync::Arc<dyn BlobBackend>,
     page_size: u64,
+    /// Shared cross-process byte budget; `None` when unlimited.
+    budget: Option<CacheBudget>,
+    /// Shared cross-process clean-page index; `None` when page sharing is off.
+    index: Option<CacheIndex>,
+    /// Whether the cache dir's filesystem supports `FALLOC_FL_PUNCH_HOLE`.
+    /// Used both to reclaim disk on eviction and to keep all-zero pages sparse
+    /// (a hole reads back as zeros); on a filesystem that lacks it (NFS, some
+    /// overlay / virtio-fs) eviction degrades to grow-only and zero pages are
+    /// written out as zeros instead. Probed once at [`FileCacheBackend::open`].
+    punch_hole_supported: bool,
+    /// Path of the `<name>.etag` file recording the inner backend's validity
+    /// token (blob ETag) that the resident clean pages correspond to.  On reopen
+    /// a matching token proves the backing blob was not modified externally, so
+    /// the local cache can be reused; a mismatch drops the stale clean pages.
+    etag_path: PathBuf,
     state: Mutex<CacheState>,
 }
 
@@ -85,6 +126,11 @@ struct CacheState {
     present: Vec<u8>,
     /// Bitmap: page is dirty (cached but not yet flushed to the inner backend).
     dirty: Vec<u8>,
+    /// Bytes of resident (present) page data this backend holds on disk.  Only
+    /// meaningful when a budget is active.
+    resident_bytes: u64,
+    /// LRU bookkeeping for eviction.  Only populated when a budget is active.
+    lru: Lru,
 }
 
 #[inline]
@@ -120,10 +166,20 @@ impl FileCacheBackend {
     ///
     /// Returns the cache plus the number of *dirty* pages recovered from disk so
     /// the caller can decide whether to flush them to the inner backend on start.
+    ///
+    /// `current_etag` is the inner backend's live validity token (blob ETag) at
+    /// open time, or `None` if the backend cannot report one.  It is compared
+    /// against the token recorded the last time this cache wrote the blob: a
+    /// mismatch means the blob changed externally, so the resident *clean* pages
+    /// are stale and dropped (they will be re-fetched on demand).  Dirty
+    /// (unflushed) pages are this process's own pending writes and are always
+    /// kept.  When the token is `None`, validation is skipped and the cache is
+    /// trusted as before.
     pub fn open(
         inner: std::sync::Arc<dyn BlobBackend>,
         cfg: FileCacheConfig,
         dev_size: u64,
+        current_etag: Option<String>,
     ) -> anyhow::Result<(Self, u64)> {
         if cfg.page_size == 0 || !cfg.page_size.is_multiple_of(512) {
             bail!(
@@ -140,6 +196,7 @@ impl FileCacheBackend {
 
         let data_path = cfg.dir.join(format!("{}.dat", cfg.name));
         let meta_path = cfg.dir.join(format!("{}.meta", cfg.name));
+        let etag_path = cfg.dir.join(format!("{}.etag", cfg.name));
 
         let num_pages = dev_size.div_ceil(cfg.page_size);
 
@@ -161,7 +218,7 @@ impl FileCacheBackend {
             .open(&meta_path)
             .with_context(|| format!("open cache meta file {}", meta_path.display()))?;
 
-        let (present, dirty, recovered_dirty) =
+        let (mut present, dirty, recovered_dirty) =
             load_or_init_meta(&meta, cfg.page_size, dev_size, num_pages)?;
 
         if recovered_dirty > 0 {
@@ -172,6 +229,115 @@ impl FileCacheBackend {
             );
         }
 
+        // The recorded validity token from the previous run (read once, before
+        // this open overwrites it below), used both for the reuse decision and
+        // the open-time diagnostics.
+        let recorded_etag = read_recorded_etag(&etag_path);
+
+        // Validate the resident clean pages against the backing blob's validity
+        // token.  When the live token differs from the one recorded the last
+        // time this cache wrote the blob, the blob was changed externally and
+        // the clean pages are stale, so drop them (dirty pages are kept and
+        // re-flushed).  When the backend cannot report a token, skip validation.
+        if let Some(current) = &current_etag {
+            if recorded_etag.as_deref() != Some(current.as_str()) {
+                let dropped =
+                    drop_clean_pages(&meta, &mut present, &dirty, num_pages, HEADER_SIZE)?;
+                if dropped > 0 {
+                    info!(
+                        dir = %cfg.dir.display(),
+                        dropped,
+                        "backing blob changed since last run; discarded stale clean cache pages"
+                    );
+                }
+            } else {
+                // The recorded token matches the live blob, so the resident clean
+                // pages are still valid: reuse them rather than re-fetching from
+                // the backing store (e.g. across a process/pod restart).
+                let reused = count_clean_pages(&present, &dirty, num_pages);
+                if reused > 0 {
+                    info!(
+                        dir = %cfg.dir.display(),
+                        reused,
+                        "validated local disk cache against backing blob; reusing clean cache pages"
+                    );
+                }
+            }
+            // Record the live token so the next restart can validate against it.
+            write_recorded_etag(&etag_path, current);
+        }
+
+        // Unconditional open-time summary so a cache mount's reuse decision is
+        // always observable: which pages were recovered, and whether the backing
+        // blob's validity token matched the one recorded by the previous run.
+        {
+            // Single O(N) pass over the bitmaps for all three counts.
+            let (mut present_count, mut dirty_count, mut clean_count) = (0u64, 0u64, 0u64);
+            for i in 0..num_pages {
+                let p = bit_get(&present, i);
+                let d = bit_get(&dirty, i);
+                if p {
+                    present_count += 1;
+                    if !d {
+                        clean_count += 1;
+                    }
+                }
+                if d {
+                    dirty_count += 1;
+                }
+            }
+            info!(
+                dir = %cfg.dir.display(),
+                name = %cfg.name,
+                num_pages,
+                present_count,
+                clean_count,
+                dirty_count,
+                has_current_etag = current_etag.is_some(),
+                etag_matches = current_etag.is_some()
+                    && recorded_etag.as_deref() == current_etag.as_deref(),
+                "opened local disk cache"
+            );
+        }
+
+        // Optional shared cross-process byte budget.  When active, seed the LRU
+        // and resident-byte accounting from the pages recovered off disk.
+        let budget = CacheBudget::open(&cfg.dir, &cfg.name, cfg.max_bytes)
+            .context("open shared cache budget")?;
+
+        let mut lru = Lru::default();
+        let mut resident_bytes: u64 = 0;
+        if budget.is_some() {
+            for page_idx in 0..num_pages {
+                if bit_get(&present, page_idx) {
+                    let offset = page_idx * cfg.page_size;
+                    let page_len = cfg.page_size.min(dev_size.saturating_sub(offset));
+                    let is_dirty = bit_get(&dirty, page_idx);
+                    // A recovered *clean* page whose data-file region is a sparse
+                    // hole uses no disk: keep it present but exclude it from the
+                    // budget/LRU (mirrors the live store_clean_page path), so the
+                    // seeded resident bytes reflect real disk usage.
+                    if !is_dirty && region_is_hole(&data, offset, page_len) {
+                        continue;
+                    }
+                    resident_bytes = resident_bytes.saturating_add(page_len);
+                    // Dirty pages are present but not evictable until flushed.
+                    lru.touch(page_idx, !is_dirty);
+                }
+            }
+            if let Some(b) = &budget {
+                let over = b.reset(resident_bytes).context("seed cache budget")?;
+                if over > 0 {
+                    info!(
+                        over_bytes = over,
+                        max_bytes = cfg.max_bytes,
+                        "local disk cache over shared budget after recovery; \
+                         clean pages will be evicted on demand"
+                    );
+                }
+            }
+        }
+
         let state = CacheState {
             data,
             meta,
@@ -179,12 +345,54 @@ impl FileCacheBackend {
             num_pages,
             present,
             dirty,
+            resident_bytes,
+            lru,
         };
+
+        // Optional shared cross-process clean-page index.  When active, publish
+        // every page recovered as present **and clean** so peers caching the
+        // same blob can read it from our data file instead of the blob.
+        let index = if cfg.share_pages {
+            let idx = CacheIndex::open(&cfg.dir, &cfg.name, &cfg.blob_identity, cfg.page_size)
+                .context("open shared cache index")?;
+            for page_idx in 0..state.num_pages {
+                if bit_get(&state.present, page_idx) && !bit_get(&state.dirty, page_idx) {
+                    let offset = page_idx * cfg.page_size;
+                    let page_len = cfg.page_size.min(dev_size.saturating_sub(offset));
+                    idx.publish(page_idx, page_len)
+                        .context("publish recovered clean page")?;
+                }
+            }
+            Some(idx)
+        } else {
+            None
+        };
+
+        // `FALLOC_FL_PUNCH_HOLE` is used both to reclaim disk on eviction and to
+        // keep all-zero pages sparse. Probe support once, unconditionally, so the
+        // zero-page path falls back to writing zeros quietly (rather than failing
+        // a punch per page) on a filesystem that lacks it (NFS, some
+        // overlay/virtio-fs). Only warn when a budget is set, since that is the
+        // case where the missing capability changes behaviour (eviction disabled
+        // → byte budget not enforced).
+        let punch_hole_supported = probe_punch_hole(&cfg.dir);
+        if budget.is_some() && !punch_hole_supported {
+            warn!(
+                dir = %cfg.dir.display(),
+                "cache filesystem does not support FALLOC_FL_PUNCH_HOLE; \
+                 disabling eviction (cache grows without reclaiming disk and \
+                 the byte budget is not enforced)"
+            );
+        }
 
         Ok((
             Self {
                 inner,
                 page_size: cfg.page_size,
+                budget,
+                index,
+                punch_hole_supported,
+                etag_path,
                 state: Mutex::new(state),
             },
             recovered_dirty,
@@ -208,6 +416,169 @@ impl FileCacheBackend {
             &state.present,
             &state.dirty,
         )?;
+        // All pages were dropped, so reset eviction accounting too.
+        state.resident_bytes = 0;
+        state.lru.clear();
+        if let Some(b) = &self.budget {
+            b.reset(0).context("reset cache budget on reinit")?;
+        }
+        if let Some(idx) = &self.index {
+            idx.unpublish_all().context("clear cache index on reinit")?;
+        }
+        // The blob was (re)created, so any recorded validity token is stale; drop
+        // it.  A fresh token is recorded on the next flush.
+        self.forget_recorded_etag();
+        Ok(())
+    }
+
+    /// Persist `etag` as the validity token the resident clean pages correspond
+    /// to.  Best-effort: a failure only forces the next restart to re-fetch the
+    /// clean pages (the safe direction), so it is logged rather than fatal.
+    fn persist_etag(&self, etag: &str) {
+        write_recorded_etag(&self.etag_path, etag);
+    }
+
+    /// Remove the recorded validity token (best-effort), e.g. after the blob is
+    /// (re)created or deleted so a stale token can never be trusted.
+    fn forget_recorded_etag(&self) {
+        match std::fs::remove_file(&self.etag_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => warn!(
+                path = %self.etag_path.display(),
+                %err,
+                "failed to remove recorded cache etag (non-fatal)"
+            ),
+        }
+    }
+
+    /// Valid byte length of `page_idx` (the final page may be short).
+    #[inline]
+    fn page_len(&self, state: &CacheState, page_idx: u64) -> u64 {
+        let offset = page_idx * self.page_size;
+        self.page_size.min(state.dev_size.saturating_sub(offset))
+    }
+
+    /// Account `page_idx` as a present page (updating LRU recency and, for newly
+    /// resident pages, the shared budget) then evict our own clean pages if the
+    /// admission pushed the shared total over its limit.  `clean` says whether
+    /// the page is currently evictable (present and not dirty).
+    ///
+    /// A no-op when no budget is configured.
+    fn account_present(
+        &self,
+        state: &mut CacheState,
+        page_idx: u64,
+        clean: bool,
+        disk_len: u64,
+    ) -> anyhow::Result<()> {
+        let Some(budget) = &self.budget else {
+            return Ok(());
+        };
+
+        // A sparse hole (an all-zero clean page left unwritten) uses no local
+        // disk, so it must not charge the byte budget and must not be evictable
+        // (punching its non-existent disk reclaims nothing). It stays `present`
+        // — served as zeros and never re-fetched — but is invisible to the
+        // budget/LRU.
+        if disk_len == 0 {
+            return Ok(());
+        }
+
+        let already = state.lru.contains(page_idx);
+        state.lru.touch(page_idx, clean);
+        if already {
+            // Recency/evictability updated; no new disk bytes admitted.
+            return Ok(());
+        }
+
+        state.resident_bytes = state.resident_bytes.saturating_add(disk_len);
+        let over = budget.admit(disk_len).context("admit cache budget")?;
+        if over > 0 {
+            // Protect the page we just admitted from being evicted immediately.
+            self.evict_clean(state, over, Some(page_idx))?;
+        }
+        Ok(())
+    }
+
+    /// Drop up to `over` bytes of our least-recently-used *clean* pages, punching
+    /// holes to actually reclaim disk space and clearing their `present` bits.
+    /// Dirty pages are never evicted (they would lose unflushed data).
+    fn evict_clean(
+        &self,
+        state: &mut CacheState,
+        mut over: u64,
+        protect: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let Some(budget) = &self.budget else {
+            return Ok(());
+        };
+        if !self.punch_hole_supported {
+            // Grow-only: this filesystem can't reclaim disk via hole-punching, so
+            // we keep all pages rather than failing the live write (warned once at
+            // open). The byte budget is effectively unenforced.
+            return Ok(());
+        }
+
+        let mut evicted = 0u64;
+        while over > 0 {
+            let Some(page_idx) = state.lru.pop_lru(protect) else {
+                break; // nothing else we own is evictable
+            };
+            let offset = page_idx * self.page_size;
+            let len = self.page_len(state, page_idx);
+
+            // Withdraw the page from the shared index *before* punching its hole
+            // so no peer can be mid-read of bytes we are about to deallocate
+            // (`read_peer_page` and `unpublish` are mutually exclusive under the
+            // index lock).
+            if let Some(idx) = &self.index {
+                idx.unpublish(page_idx)
+                    .with_context(|| format!("unpublish evicted page {page_idx}"))?;
+            }
+
+            if len > 0 {
+                if let Err(err) = punch_hole(&state.data, offset, len) {
+                    // Couldn't reclaim this page's disk (e.g. a transient
+                    // fallocate failure on an otherwise-supported FS). Restore it
+                    // to a consistent state — back into the LRU and re-published —
+                    // and stop evicting rather than failing the live write or
+                    // leaving the LRU/budget out of sync. We may briefly run over
+                    // budget until the next eviction pass.
+                    warn!(page_idx, %err, "punch hole failed; skipping eviction this pass");
+                    state.lru.touch(page_idx, true);
+                    if let Some(idx) = &self.index {
+                        let _ = idx.publish(page_idx, len);
+                    }
+                    break;
+                }
+            }
+            // Clear the present bit and persist it.  A clean bit needs no fsync:
+            // if the cleared bit is lost on crash the worst case is a redundant
+            // re-read from the inner backend.
+            bit_set(&mut state.present, page_idx, false);
+            let byte = page_idx / 8;
+            let present_off = HEADER_SIZE + byte;
+            if let Err(err) = state
+                .meta
+                .write_all_at(&[state.present[byte as usize]], present_off)
+            {
+                warn!(page_idx, %err, "failed to persist evicted present bit (non-fatal)");
+            }
+
+            state.resident_bytes = state.resident_bytes.saturating_sub(len);
+            budget.release(len).context("release cache budget")?;
+            over = over.saturating_sub(len);
+            evicted += 1;
+        }
+
+        if evicted > 0 {
+            trace!(
+                evicted_pages = evicted,
+                resident_bytes = state.resident_bytes,
+                "evicted clean cache pages to honour shared budget"
+            );
+        }
         Ok(())
     }
 
@@ -234,8 +605,9 @@ impl FileCacheBackend {
     }
 
     /// Ensure page `page_idx` is fully present in the data file, loading it from
-    /// the inner backend if necessary.  Returns the page's valid length (the last
-    /// page may be shorter than `page_size`).
+    /// a peer cache (cross-process sharing) or the inner backend if necessary.
+    /// Returns the page's valid length (the last page may be shorter than
+    /// `page_size`).
     async fn ensure_page(&self, state: &mut CacheState, page_idx: u64) -> anyhow::Result<u64> {
         let offset = page_idx * self.page_size;
         let page_len = self.page_size.min(state.dev_size.saturating_sub(offset));
@@ -244,26 +616,71 @@ impl FileCacheBackend {
             return Ok(page_len);
         }
 
-        // Load existing content for this page from the inner backend.
-        let data = self
-            .inner
-            .read(offset, page_len)
-            .await
-            .with_context(|| format!("load page {page_idx} from inner backend"))?;
-        if data.len() as u64 != page_len {
-            bail!(
-                "inner backend returned {} bytes for page {page_idx} (expected {page_len})",
-                data.len()
-            );
+        // Prefer a live peer's clean copy of this page (copy-on-write: cheaper
+        // than a blob round-trip); fall back to the inner backend.
+        let data: Vec<u8> = match self.try_peer_page(page_idx, page_len)? {
+            Some(buf) => buf,
+            None => {
+                let data = self
+                    .inner
+                    .read(offset, page_len)
+                    .await
+                    .with_context(|| format!("load page {page_idx} from inner backend"))?;
+                if data.len() as u64 != page_len {
+                    bail!(
+                        "inner backend returned {} bytes for page {page_idx} (expected {page_len})",
+                        data.len()
+                    );
+                }
+                data.to_vec()
+            }
+        };
+        self.store_clean_page(state, page_idx, offset, &data)?;
+        Ok(page_len)
+    }
+
+    /// Write a freshly-fetched **clean** page into the cache file, mark it
+    /// present (persisting the bit; a lost bit just causes a re-read, so the
+    /// write is non-fatal), and account it against the byte budget. Shared by
+    /// [`ensure_page`](Self::ensure_page) and the concurrent warm-up path.
+    fn store_clean_page(
+        &self,
+        state: &mut CacheState,
+        page_idx: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        // An all-zero page is kept sparse (no blocks allocated) so zero regions
+        // of the blob — e.g. an ext4 image's free space — consume no local disk.
+        // We *punch a hole* over the region rather than merely skipping the
+        // write: skipping is unsafe because the `.dat` region may hold stale
+        // non-zero bytes from a page whose present bit was never made durable
+        // before an unclean shutdown (data is fsynced before the present bit),
+        // which would otherwise read back as garbage instead of zeros. Where
+        // hole-punching is unsupported, fall back to writing the zeros (correct,
+        // but consumes disk).
+        let is_zero = !data.iter().any(|&b| b != 0);
+        let page_len = self.page_len(state, page_idx);
+        let mut is_hole = false;
+        if is_zero && self.punch_hole_supported {
+            match punch_hole(&state.data, offset, page_len) {
+                Ok(()) => is_hole = true,
+                Err(err) => {
+                    warn!(page_idx, %err, "punch hole for zero page failed; writing zeros");
+                    state
+                        .data
+                        .write_all_at(data, offset)
+                        .with_context(|| format!("write zero page {page_idx} to cache file"))?;
+                }
+            }
+        } else {
+            state
+                .data
+                .write_all_at(data, offset)
+                .with_context(|| format!("write page {page_idx} to cache file"))?;
         }
-        state
-            .data
-            .write_all_at(&data, offset)
-            .with_context(|| format!("write page {page_idx} to cache file"))?;
 
         bit_set(&mut state.present, page_idx, true);
-        // A freshly loaded clean page does not need an fsync: if the present bit
-        // is lost on crash it is simply re-read from the inner backend.
         let byte = page_idx / 8;
         let present_off = HEADER_SIZE + byte;
         if let Err(err) = state
@@ -273,7 +690,87 @@ impl FileCacheBackend {
             warn!(page_idx, %err, "failed to persist clean present bit (non-fatal)");
         }
 
+        // Account the newly-resident clean page and evict if over budget. The
+        // page just loaded is protected from immediate eviction. A punched hole
+        // uses no disk, so it is admitted as zero bytes (charges nothing, not
+        // evictable); a written page (incl. the no-punch zero fallback) occupies
+        // a full page.
+        let disk_len = if is_hole { 0 } else { page_len };
+        self.account_present(state, page_idx, true, disk_len)?;
+        Ok(())
+    }
+
+    /// Make `page_idx` resident as a clean page, fetching it from a peer or the
+    /// inner backend **without holding the state lock** during the fetch — so
+    /// warm-up can run many fetches concurrently (the serial `ensure_page` holds
+    /// the lock across the blob read, which would serialize them). The lock is
+    /// taken only to check presence and to store the bytes. Returns the number
+    /// of newly-warmed bytes (0 if the page was already present / lost a race).
+    async fn warm_one_page(&self, page_idx: u64) -> anyhow::Result<u64> {
+        let (offset, page_len) = {
+            let state = self.state.lock().await;
+            if bit_get(&state.present, page_idx) {
+                return Ok(0);
+            }
+            let offset = page_idx * self.page_size;
+            (
+                offset,
+                self.page_size.min(state.dev_size.saturating_sub(offset)),
+            )
+        };
+        if page_len == 0 {
+            return Ok(0);
+        }
+
+        // Fetch with no state lock held, so concurrent warm-up pages overlap.
+        let data: Vec<u8> = match self.try_peer_page(page_idx, page_len)? {
+            Some(buf) => buf,
+            None => {
+                let d = with_class(IoClass::Warmup, self.inner.read(offset, page_len))
+                    .await
+                    .with_context(|| format!("warm-up read page {page_idx}"))?;
+                if d.len() as u64 != page_len {
+                    bail!(
+                        "inner backend returned {} bytes for page {page_idx} (expected {page_len})",
+                        d.len()
+                    );
+                }
+                d.to_vec()
+            }
+        };
+
+        // Store under a brief lock; another warm-up task may have raced us here.
+        let mut state = self.state.lock().await;
+        if bit_get(&state.present, page_idx) {
+            return Ok(0);
+        }
+        self.store_clean_page(&mut state, page_idx, offset, &data)?;
+        if let Some(idx) = &self.index {
+            if !bit_get(&state.dirty, page_idx) {
+                idx.publish(page_idx, page_len)
+                    .with_context(|| format!("publish warmed page {page_idx}"))?;
+            }
+        }
         Ok(page_len)
+    }
+
+    /// Try to fetch a full page from a live peer's cache via the shared index.
+    /// Returns the page bytes on a sharing hit, `None` when no peer has it (so
+    /// the caller fetches from the blob).  A no-op when sharing is disabled.
+    fn try_peer_page(&self, page_idx: u64, page_len: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(idx) = &self.index else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; page_len as usize];
+        if idx
+            .read_peer_page(page_idx, &mut buf)
+            .with_context(|| format!("read peer copy of page {page_idx}"))?
+        {
+            trace!(page_idx, len = page_len, "served page from peer cache");
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Flush a single dirty page to the inner backend and clear its dirty bit.
@@ -307,6 +804,16 @@ impl FileCacheBackend {
 
         bit_set(&mut state.dirty, page_idx, false);
         Self::persist_meta_bit(state, page_idx)?;
+        // Now clean again: the page becomes an eviction candidate.
+        if self.budget.is_some() {
+            state.lru.touch(page_idx, true);
+        }
+        // A freshly-flushed page is clean and resident, so peers caching the
+        // same blob may now read it from our data file (cross-process sharing).
+        if let Some(idx) = &self.index {
+            idx.publish(page_idx, page_len)
+                .with_context(|| format!("publish flushed page {page_idx}"))?;
+        }
         Ok(())
     }
 
@@ -320,6 +827,15 @@ impl FileCacheBackend {
         page_offset: u64,
         payload: &[u8],
     ) -> anyhow::Result<()> {
+        // Copy-on-write: withdraw this page from the shared index *before*
+        // mutating it so peers stop reading our (now diverging) copy and never
+        // observe a torn write.  The page becomes private to us until it is
+        // flushed clean again (and re-published).
+        if let Some(idx) = &self.index {
+            idx.unpublish(page_idx)
+                .with_context(|| format!("unpublish dirtied page {page_idx}"))?;
+        }
+
         let offset = page_idx * self.page_size + page_offset;
         state
             .data
@@ -332,6 +848,11 @@ impl FileCacheBackend {
         bit_set(&mut state.present, page_idx, true);
         bit_set(&mut state.dirty, page_idx, true);
         Self::persist_meta_bit(state, page_idx)?;
+        // Account the page as resident but *not* evictable (it is dirty).  For a
+        // page that was already present this just reclassifies it. A write always
+        // stores real data, so it occupies a full page on disk.
+        let disk_len = self.page_len(state, page_idx);
+        self.account_present(state, page_idx, false, disk_len)?;
         Ok(())
     }
 
@@ -342,6 +863,21 @@ impl FileCacheBackend {
         (0..state.num_pages)
             .filter(|&i| bit_get(&state.dirty, i))
             .count() as u64
+    }
+
+    /// Count of pages currently marked present (used by tests).
+    #[cfg(test)]
+    async fn present_count(&self) -> u64 {
+        let state = self.state.lock().await;
+        (0..state.num_pages)
+            .filter(|&i| bit_get(&state.present, i))
+            .count() as u64
+    }
+
+    /// This backend's resident byte accounting (used by tests).
+    #[cfg(test)]
+    async fn resident_bytes(&self) -> u64 {
+        self.state.lock().await.resident_bytes
     }
 }
 
@@ -354,6 +890,84 @@ fn check_in_bounds(op: &str, offset: u64, len: u64, dev_size: u64) -> anyhow::Re
         bail!("{op} out of bounds: offset={offset} len={len} dev_size={dev_size}");
     }
     Ok(())
+}
+
+/// Punch a hole in `file` over `[offset, offset+len)`, deallocating those blocks
+/// so the disk space is actually reclaimed while the file keeps its logical size
+/// (the region reads back as zeros).  Used when evicting a clean cache page.
+///
+/// `FALLOC_FL_PUNCH_HOLE` is a Linux-only syscall, so this is the Linux impl.
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &File, offset: u64, len: u64) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+    let ret = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error()).context("fallocate punch hole");
+    }
+    Ok(())
+}
+
+/// Non-Linux fallback: hole punching (`FALLOC_FL_PUNCH_HOLE`) is a Linux-only
+/// syscall. Report it as unsupported so [`probe_punch_hole`] returns `false` and
+/// the cache degrades to grow-only (no eviction), exactly like a filesystem that
+/// doesn't support hole punching. Keeps the portable core build compiling on
+/// non-Linux targets.
+#[cfg(not(target_os = "linux"))]
+fn punch_hole(_file: &File, _offset: u64, _len: u64) -> anyhow::Result<()> {
+    anyhow::bail!("hole punching (FALLOC_FL_PUNCH_HOLE) is only supported on Linux")
+}
+
+/// Whether `[offset, offset+len)` in `file` is entirely a sparse hole (no blocks
+/// allocated), via `lseek(SEEK_DATA)`: if the next data byte at/after `offset`
+/// lies beyond the region (or there is no data after it, `ENXIO`), the region is
+/// unallocated.  Used at recovery to exclude clean holes from the byte budget.
+#[cfg(target_os = "linux")]
+fn region_is_hole(file: &File, offset: u64, len: u64) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+    if len == 0 {
+        return true;
+    }
+    let ret = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
+    if ret < 0 {
+        // ENXIO means there is no data at/after `offset` → the region is a hole.
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO);
+    }
+    (ret as u64) >= offset.saturating_add(len)
+}
+
+/// Non-Linux fallback: without `SEEK_DATA` we cannot detect holes, so treat every
+/// region as allocated (the conservative choice — never under-counts the budget).
+#[cfg(not(target_os = "linux"))]
+fn region_is_hole(_file: &File, _offset: u64, _len: u64) -> bool {
+    false
+}
+
+/// Probe whether `dir`'s filesystem supports `FALLOC_FL_PUNCH_HOLE` by punching a
+/// hole in a throwaway temp file. Returns `false` on `EOPNOTSUPP` (or any other
+/// failure), in which case eviction is disabled and the cache runs grow-only.
+fn probe_punch_hole(dir: &Path) -> bool {
+    let path = dir.join(format!(".punch-probe.{}", std::process::id()));
+    let ok = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .and_then(|f| {
+            f.set_len(4096)?;
+            // 4096 is a safe, alignment-agnostic probe length.
+            punch_hole(&f, 0, 4096).map_err(std::io::Error::other)
+        })
+        .is_ok();
+    let _ = std::fs::remove_file(&path);
+    ok
 }
 
 #[async_trait]
@@ -376,10 +990,11 @@ impl BlobBackend for FileCacheBackend {
             bail!("read: offset ({offset}) and len ({len}) must be 512-byte aligned");
         }
 
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         check_in_bounds("read", offset, len, state.dev_size)?;
 
         let page_size = self.page_size;
+        let track_lru = self.budget.is_some();
         let mut result = BytesMut::zeroed(len as usize);
         let mut pos: u64 = 0;
 
@@ -400,28 +1015,161 @@ impl BlobBackend for FileCacheBackend {
                     .with_context(|| {
                         format!("read cache file offset={abs_offset} len={chunk_len}")
                     })?;
-            } else {
-                // Cache miss: read straight from the inner backend.  Pure reads do
-                // not populate the cache to avoid evicting/overwriting dirty data
-                // and to keep read latency predictable.
-                let data = self
-                    .inner
-                    .read(abs_offset, chunk_len)
-                    .await
-                    .with_context(|| format!("read offset={abs_offset} len={chunk_len}"))?;
-                if data.len() as u64 != chunk_len {
-                    bail!(
-                        "inner backend returned {} bytes for read offset={abs_offset} len={chunk_len}",
-                        data.len()
-                    );
+                // A cache hit refreshes the page's LRU recency (keeping its
+                // current clean/dirty evictability classification).
+                if track_lru {
+                    let clean = !bit_get(&state.dirty, page_idx);
+                    state.lru.touch(page_idx, clean);
                 }
-                result[pos as usize..(pos + chunk_len) as usize].copy_from_slice(&data);
+            } else {
+                // Cache miss.  When cross-process sharing is on, try to serve
+                // the page from a live peer's local copy (a peer that already
+                // fetched this blob page) before falling back to the inner
+                // backend.  Pure reads do not populate our own cache — keeping
+                // read latency predictable and the byte budget single-owner:
+                // the page stays resident only in the peer that owns it.
+                let page_len = self.page_len(&state, page_idx);
+                let mut served = false;
+                if let Some(page) = self.try_peer_page(page_idx, page_len)? {
+                    let start = page_offset as usize;
+                    result[pos as usize..(pos + chunk_len) as usize]
+                        .copy_from_slice(&page[start..start + chunk_len as usize]);
+                    served = true;
+                }
+                if !served {
+                    let data = self
+                        .inner
+                        .read(abs_offset, chunk_len)
+                        .await
+                        .with_context(|| format!("read offset={abs_offset} len={chunk_len}"))?;
+                    if data.len() as u64 != chunk_len {
+                        bail!(
+                            "inner backend returned {} bytes for read offset={abs_offset} len={chunk_len}",
+                            data.len()
+                        );
+                    }
+                    result[pos as usize..(pos + chunk_len) as usize].copy_from_slice(&data);
+                }
             }
 
             pos += chunk_len;
         }
 
         Ok(result.freeze())
+    }
+
+    async fn prefetch(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if !offset.is_multiple_of(512) || !len.is_multiple_of(512) {
+            bail!("prefetch: offset ({offset}) and len ({len}) must be 512-byte aligned");
+        }
+
+        let page_size = self.page_size;
+        let dev_size = {
+            let state = self.state.lock().await;
+            state.dev_size
+        };
+        check_in_bounds("prefetch", offset, len, dev_size)?;
+
+        // Align the start down to a page boundary and walk page-by-page, taking
+        // the lock for one page at a time so live I/O can interleave during a
+        // long warm-up.  `ensure_page` fetches the page (from a peer or the
+        // inner backend) and stores it locally as a clean page; when cross-process
+        // sharing is on we also publish it so peers caching the same blob can read
+        // it from our data file (this is what makes warm-up populate the *shared*
+        // cache, not just our own — otherwise clean warmed pages stay unpublished).
+        let end = offset + len;
+        let mut page_off = offset - (offset % page_size);
+        while page_off < end {
+            let page_idx = page_off / page_size;
+            {
+                let mut state = self.state.lock().await;
+                let page_len = self.ensure_page(&mut state, page_idx).await?;
+                if let Some(idx) = &self.index {
+                    // Only publish genuinely clean pages: a page already dirtied
+                    // by a concurrent write must not be advertised as a clean copy.
+                    if page_len > 0 && !bit_get(&state.dirty, page_idx) {
+                        idx.publish(page_idx, page_len)
+                            .with_context(|| format!("publish warmed page {page_idx}"))?;
+                    }
+                }
+            }
+            page_off += page_size;
+        }
+        Ok(())
+    }
+
+    async fn warmup(&self, dev_size: u64, _page_size: u64, limit_bytes: u64, concurrency: usize) {
+        use futures::stream::{self, StreamExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Warm in this cache's own page units, regardless of the caller's
+        // `page_size` hint (the cache can only make whole pages resident).
+        let page_size = self.page_size;
+        let limit = limit_bytes.min(dev_size);
+        if limit == 0 {
+            return;
+        }
+        let n_pages = limit.div_ceil(page_size);
+        let conc = concurrency.max(1);
+
+        // Query sparseness map to skip zero regions; best-effort, so a failure
+        // falls back to warming everything.
+        let data_ranges = match self.data_ranges().await {
+            Ok(ranges) => ranges,
+            Err(err) => {
+                warn!(%err, "data-ranges query failed; warming the whole device");
+                None
+            }
+        };
+        if let Some(ranges) = &data_ranges {
+            let data_bytes: u64 = ranges.iter().map(|&(_, len)| len).sum();
+            info!(
+                data_ranges = ranges.len(),
+                data_bytes, "warm-up using blob sparseness map (skipping zero regions)"
+            );
+        }
+
+        let warmed = AtomicU64::new(0);
+        let skipped = AtomicU64::new(0);
+
+        // Fetch up to `conc` pages from the blob at once (each `warm_one_page`
+        // does its blob read with no state lock held, tagged `Warmup` so the I/O
+        // gateway lets foreground reads preempt it), turning warm-up from a
+        // latency-bound serial scan into a bandwidth-bound parallel one.
+        stream::iter(0..n_pages)
+            .for_each_concurrent(conc, |page_idx| {
+                let warmed = &warmed;
+                let skipped = &skipped;
+                let data_ranges = &data_ranges;
+                async move {
+                    let offset = page_idx * page_size;
+                    let len = page_size.min(dev_size.saturating_sub(offset));
+                    if let Some(ranges) = data_ranges {
+                        if !super::range_intersects(ranges, offset, len) {
+                            skipped.fetch_add(len, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    match self.warm_one_page(page_idx).await {
+                        Ok(n) => {
+                            warmed.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(err) => warn!(page_idx, %err, "warm-up page failed (continuing)"),
+                    }
+                }
+            })
+            .await;
+
+        info!(
+            warmed_bytes = warmed.load(Ordering::Relaxed),
+            skipped_bytes = skipped.load(Ordering::Relaxed),
+            limit_bytes = limit,
+            concurrency = conc,
+            "cache warm-up complete"
+        );
     }
 
     async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
@@ -494,25 +1242,50 @@ impl BlobBackend for FileCacheBackend {
         Ok(())
     }
 
+    async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+        // Sparseness is a property of the backing blob, not the local cache.
+        self.inner.data_ranges().await
+    }
+
     async fn flush(&self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         let dirty: Vec<u64> = (0..state.num_pages)
             .filter(|&i| bit_get(&state.dirty, i))
             .collect();
 
-        if !dirty.is_empty() {
+        let flushed_any = !dirty.is_empty();
+        if flushed_any {
             info!(
                 dirty_pages = dirty.len(),
                 "flushing dirty cache pages to inner backend"
             );
-            for page_idx in dirty {
-                self.flush_page(&mut state, page_idx).await?;
-            }
+            with_class(IoClass::Flush, async {
+                for page_idx in dirty {
+                    self.flush_page(&mut state, page_idx).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
         }
 
         // Propagate to the inner backend in case it buffers too.
         drop(state);
-        self.inner.flush().await
+        self.inner.flush().await?;
+
+        // Flushing mutates the blob, changing its validity token.  Record the
+        // new token so a later restart can tell *our own* flush apart from an
+        // external modification and safely reuse the now-clean local cache.
+        if flushed_any {
+            match self.inner.etag().await {
+                Ok(Some(etag)) => self.persist_etag(&etag),
+                Ok(None) => {}
+                Err(err) => warn!(
+                    %err,
+                    "failed to read backing store etag after flush (non-fatal)"
+                ),
+            }
+        }
+        Ok(())
     }
 
     async fn delete(&self) -> anyhow::Result<()> {
@@ -521,6 +1294,17 @@ impl BlobBackend for FileCacheBackend {
         let num_pages = state.num_pages;
         state.present = vec![0u8; bitmap_bytes(num_pages)];
         state.dirty = vec![0u8; bitmap_bytes(num_pages)];
+        // Forget all resident pages for budget/eviction accounting too.
+        state.resident_bytes = 0;
+        state.lru.clear();
+        if let Some(b) = &self.budget {
+            b.reset(0).context("reset cache budget on delete")?;
+        }
+        if let Some(idx) = &self.index {
+            idx.unpublish_all().context("clear cache index on delete")?;
+        }
+        // The blob is gone, so its recorded validity token must not be trusted.
+        self.forget_recorded_etag();
         drop(state);
         self.inner.delete().await
     }
@@ -529,6 +1313,92 @@ impl BlobBackend for FileCacheBackend {
         let state = self.state.lock().await;
         Ok(state.dev_size)
     }
+
+    async fn etag(&self) -> anyhow::Result<Option<String>> {
+        self.inner.etag().await
+    }
+}
+
+/// Read the recorded validity token (blob ETag) from `<name>.etag`, if any.
+///
+/// Returns `None` when the file is absent, empty, or unreadable — all of which
+/// simply mean "no trusted token", forcing clean pages to be re-validated.
+fn read_recorded_etag(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            warn!(path = %path.display(), %err, "failed to read recorded cache etag");
+            None
+        }
+    }
+}
+
+/// Persist `etag` to `<name>.etag` (with `fsync`).  Best-effort: a failure only
+/// forces the next restart to re-fetch the clean pages (the safe direction), so
+/// it is logged rather than propagated.
+fn write_recorded_etag(path: &Path, etag: &str) {
+    let write = || -> std::io::Result<()> {
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        f.write_all_at(etag.as_bytes(), 0)?;
+        f.set_len(etag.len() as u64)?;
+        f.sync_data()?;
+        Ok(())
+    };
+    if let Err(err) = write() {
+        warn!(path = %path.display(), %err, "failed to persist cache etag (non-fatal)");
+    }
+}
+
+/// Clear the `present` bit of every page that is present **and clean** (not
+/// dirty), persisting the updated `present` bitmap.  Used to discard stale
+/// clean pages when the backing blob changed externally; dirty pages are left
+/// untouched so unflushed writes are never lost.  Returns the number dropped.
+fn drop_clean_pages(
+    meta: &File,
+    present: &mut [u8],
+    dirty: &[u8],
+    num_pages: u64,
+    present_off: u64,
+) -> anyhow::Result<u64> {
+    let mut dropped = 0u64;
+    for i in 0..num_pages {
+        if bit_get(present, i) && !bit_get(dirty, i) {
+            bit_set(present, i, false);
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        meta.write_all_at(present, present_off)
+            .context("persist present bitmap after cache invalidation")?;
+        meta.sync_data()
+            .context("fsync cache metadata after invalidation")?;
+    }
+    Ok(dropped)
+}
+
+/// Count the pages that are present **and clean** (not dirty).  Used to report
+/// how many valid clean pages are reused from the local cache after the backing
+/// blob's validity token is confirmed unchanged.
+fn count_clean_pages(present: &[u8], dirty: &[u8], num_pages: u64) -> u64 {
+    let mut clean = 0u64;
+    for i in 0..num_pages {
+        if bit_get(present, i) && !bit_get(dirty, i) {
+            clean += 1;
+        }
+    }
+    clean
 }
 
 /// Load the metadata bitmaps from `meta`, validating the header.  If the file is
@@ -622,6 +1492,27 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    #[test]
+    fn count_clean_pages_counts_present_and_clean_only() {
+        let num_pages = 8u64;
+        let mut present = vec![0u8; bitmap_bytes(num_pages)];
+        let mut dirty = vec![0u8; bitmap_bytes(num_pages)];
+
+        // No pages present yet → nothing clean.
+        assert_eq!(count_clean_pages(&present, &dirty, num_pages), 0);
+
+        // Pages 0,1,2 present; page 1 is dirty → only 0 and 2 are clean.
+        bit_set(&mut present, 0, true);
+        bit_set(&mut present, 1, true);
+        bit_set(&mut present, 2, true);
+        bit_set(&mut dirty, 1, true);
+        assert_eq!(count_clean_pages(&present, &dirty, num_pages), 2);
+
+        // A dirty bit without the present bit is not counted.
+        bit_set(&mut dirty, 5, true);
+        assert_eq!(count_clean_pages(&present, &dirty, num_pages), 2);
+    }
+
     fn tmp_dir(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         let uniq = format!(
@@ -642,14 +1533,54 @@ mod tests {
         page_size: u64,
         dev_size: u64,
     ) -> (FileCacheBackend, u64) {
+        open_budgeted(inner, dir, page_size, dev_size, 0)
+    }
+
+    fn open_budgeted(
+        inner: Arc<dyn BlobBackend>,
+        dir: &Path,
+        page_size: u64,
+        dev_size: u64,
+        max_bytes: u64,
+    ) -> (FileCacheBackend, u64) {
         FileCacheBackend::open(
             inner,
             FileCacheConfig {
                 dir: dir.to_path_buf(),
                 name: "test".to_string(),
                 page_size,
+                max_bytes,
+                blob_identity: String::new(),
+                share_pages: false,
             },
             dev_size,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Open a sharing-enabled cache with a given owner `name` and shared
+    /// `blob_identity` so two instances in one dir can serve each other's pages.
+    fn open_shared(
+        inner: Arc<dyn BlobBackend>,
+        dir: &Path,
+        name: &str,
+        blob_identity: &str,
+        page_size: u64,
+        dev_size: u64,
+    ) -> (FileCacheBackend, u64) {
+        FileCacheBackend::open(
+            inner,
+            FileCacheConfig {
+                dir: dir.to_path_buf(),
+                name: name.to_string(),
+                page_size,
+                max_bytes: 0,
+                blob_identity: blob_identity.to_string(),
+                share_pages: true,
+            },
+            dev_size,
+            None,
         )
         .unwrap()
     }
@@ -860,8 +1791,211 @@ mod tests {
 
         let (b, _) = open(inner.clone(), &dir, 1024, 4096);
         assert_eq!(b.read(0, 512).await.unwrap(), Bytes::from(vec![0x6E; 512]));
-        // Read does not dirty anything.
+        // Read does not dirty anything, and the page stays absent from the cache.
         assert_eq!(b.dirty_count().await, 0);
+        assert_eq!(b.present_count().await, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn prefetch_populates_cache_as_clean_pages() {
+        // Warm-up's prefetch makes pages resident locally (clean, not dirty) so
+        // later reads are served from the cache file even if the inner backend
+        // changes, and no write-back is scheduled.
+        let dir = tmp_dir("prefetch");
+        let inner = Arc::new(MemBackend::new(8192).unwrap());
+        inner.write(0, Bytes::from(vec![0xAB; 2048])).await.unwrap();
+
+        let (b, _) = open(inner.clone(), &dir, 1024, 4096);
+        // Prefetch the first two 1 KiB pages.
+        b.prefetch(0, 2048).await.unwrap();
+
+        // Both pages are now resident and clean (no write-back pending).
+        assert_eq!(b.present_count().await, 2);
+        assert_eq!(b.dirty_count().await, 0);
+
+        // Mutate the inner backend; the cache must serve the warmed copy.
+        inner.write(0, Bytes::from(vec![0x00; 2048])).await.unwrap();
+        assert_eq!(
+            b.read(0, 2048).await.unwrap(),
+            Bytes::from(vec![0xAB; 2048])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn prefetch_zero_page_leaves_sparse_hole() {
+        // An all-zero page is marked present and reads back as zeros,
+        // but is left as a sparse hole in the data file (no blocks allocated).
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmp_dir("zerohole");
+        // Inner backend is all zeros (MemBackend starts zero-filled).
+        let inner = Arc::new(MemBackend::new(1 << 20).unwrap());
+        let (b, _) = open(inner, &dir, 65536, 1 << 20);
+
+        b.prefetch(0, 1 << 20).await.unwrap();
+
+        // Every page is resident (so reads never hit the inner backend again)...
+        assert_eq!(b.present_count().await, 16);
+        // ...and reads back as zeros.
+        assert_eq!(b.read(0, 4096).await.unwrap(), Bytes::from(vec![0u8; 4096]));
+
+        // The data file is logically 1 MiB but allocates ~no blocks (a hole).
+        let meta = std::fs::metadata(dir.join("test.dat")).unwrap();
+        assert_eq!(meta.len(), 1 << 20);
+        // 512-byte blocks; a fully written 1 MiB file would be ~2048 blocks.
+        assert!(
+            meta.blocks() < 64,
+            "expected a sparse data file, got {} blocks",
+            meta.blocks()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn zero_page_overwrites_stale_dat_bytes() {
+        // Simulate an unclean shutdown that left non-zero bytes in the `.dat`
+        // file at a page whose present bit was never persisted (data is fsynced
+        // before the present bit). Warming that page when the blob region is zero
+        // must read back as zeros — not the stale bytes — so store_clean_page
+        // punches a hole / writes zeros rather than skipping the write.
+        use std::os::unix::fs::FileExt as _;
+        let dir = tmp_dir("stale-zero");
+        let page = 4096u64;
+        let dev = 2 * page;
+        let inner = Arc::new(MemBackend::new(dev).unwrap()); // all zeros
+        let (b, _) = open(inner, &dir, page, dev);
+
+        // Corrupt the data file: stale non-zero bytes at page 1, left un-present.
+        {
+            let dat = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("test.dat"))
+                .unwrap();
+            dat.write_all_at(&vec![0xFF; page as usize], page).unwrap();
+        }
+
+        // Warm page 1 (blob region is zero): must yield zeros, not 0xFF.
+        b.prefetch(page, page).await.unwrap();
+        assert_eq!(
+            b.read(page, page).await.unwrap(),
+            Bytes::from(vec![0u8; page as usize])
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn warmup_concurrent_populates_all_pages() {
+        // The concurrent warm-up (`warmup` with concurrency > 1) fetches every
+        // page from the inner backend and makes it resident as a clean page.
+        let dir = tmp_dir("warmup-conc");
+        let page = 1024u64;
+        let dev = 16 * page; // 16 pages
+        let inner = Arc::new(MemBackend::new(dev).unwrap());
+        inner
+            .write(0, Bytes::from(vec![0x5A; dev as usize]))
+            .await
+            .unwrap();
+
+        let (b, _) = open(inner.clone(), &dir, page, dev);
+        // Warm the whole device, 8 pages in flight at once.
+        b.warmup(dev, page, dev, 8).await;
+
+        assert_eq!(b.present_count().await, 16);
+        assert_eq!(b.dirty_count().await, 0);
+
+        // Mutate inner; every page must now be served from the warmed cache.
+        inner
+            .write(0, Bytes::from(vec![0x00; dev as usize]))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.read(0, dev).await.unwrap(),
+            Bytes::from(vec![0x5A; dev as usize])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A wrapper that delegates to an inner backend but reports a fixed
+    /// sparseness map via `data_ranges()` and counts reads, so the file-cache
+    /// warm-up's zero-gap skip branch can be unit-tested (MemBackend reports
+    /// `None`, which never exercises it).
+    struct SparseBackend {
+        inner: Arc<dyn BlobBackend>,
+        ranges: Vec<(u64, u64)>,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl SparseBackend {
+        fn new(inner: Arc<dyn BlobBackend>, ranges: Vec<(u64, u64)>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                ranges,
+                reads: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+        fn read_count(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for SparseBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+        async fn data_ranges(&self) -> anyhow::Result<Option<Vec<(u64, u64)>>> {
+            Ok(Some(self.ranges.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_skips_zero_gap_pages_via_data_ranges() {
+        // With a sparse `data_ranges()` map, warm-up must populate only the
+        // pages overlapping a data range and never fetch (or make resident) the
+        // pages lying entirely in a zero gap.
+        let dir = tmp_dir("warmup-sparse");
+        let page = 1024u64;
+        let dev = 16 * page; // 16 pages
+
+        // Data lives only in pages [4, 8); the rest of the device is a zero gap.
+        let data_off = 4 * page;
+        let data_len = 4 * page;
+        let inner = Arc::new(MemBackend::new(dev).unwrap());
+        inner
+            .write(data_off, Bytes::from(vec![0x5A; data_len as usize]))
+            .await
+            .unwrap();
+        let sparse = SparseBackend::new(inner, vec![(data_off, data_len)]);
+
+        let (b, _) = open(sparse.clone(), &dir, page, dev);
+        b.warmup(dev, page, dev, 8).await;
+
+        // Only the 4 data pages are resident; the 12 zero-gap pages were skipped.
+        assert_eq!(b.present_count().await, 4);
+        // And only those 4 pages were ever fetched from the backend.
+        assert_eq!(sparse.read_count(), 4);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -904,6 +2038,934 @@ mod tests {
         // After reset the page reads back as zero from the fresh inner backend.
         let read = b.read(0, 512).await.unwrap();
         assert!(read.iter().all(|&x| x == 0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn budget_evicts_lru_clean_pages() {
+        // Budget of two 1 KiB pages.  Reading three different pages must keep the
+        // cache at two resident pages, evicting the least-recently-used one.
+        let dir = tmp_dir("evict");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        for (i, byte) in [0x10u8, 0x20, 0x30, 0x40].into_iter().enumerate() {
+            inner
+                .write(i as u64 * 1024, Bytes::from(vec![byte; 1024]))
+                .await
+                .unwrap();
+        }
+        // Populate pages by writing them (full-page writes mark them present).
+        let (b, _) = open_budgeted(inner.clone(), &dir, 1024, 4096, 2048);
+
+        // Make pages clean+resident by writing then flushing each.
+        b.write(0, Bytes::from(vec![0xA0; 1024])).await.unwrap();
+        b.write(1024, Bytes::from(vec![0xA1; 1024])).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 2);
+        assert_eq!(b.resident_bytes().await, 2048);
+
+        // Touch page 0 so page 1 becomes the LRU victim.
+        let _ = b.read(0, 512).await.unwrap();
+
+        // A third clean page must evict exactly one page to stay within budget.
+        b.write(2048, Bytes::from(vec![0xA2; 1024])).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 2);
+        assert_eq!(b.resident_bytes().await, 2048);
+
+        // Page 1 (LRU) was evicted: it now re-reads from the inner backend value.
+        assert_eq!(
+            b.read(1024, 1024).await.unwrap(),
+            Bytes::from(vec![0xA1; 1024])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn zero_hole_pages_do_not_consume_budget() {
+        // A budget of two 1 KiB pages. Page 0 has real data; pages 1..4 are zero.
+        // Warming (prefetch) leaves the zero pages as sparse holes that must
+        // charge no budget — so the one real page is never evicted for holes.
+        let dir = tmp_dir("hole-budget");
+        let page = 1024u64;
+        let dev = 4 * page;
+        let inner = Arc::new(MemBackend::new(dev).unwrap());
+        inner
+            .write(0, Bytes::from(vec![0xC3; page as usize]))
+            .await
+            .unwrap();
+        let (b, _) = open_budgeted(inner.clone(), &dir, page, dev, 2 * page);
+
+        // Prefetch the whole device: page 0 is real, pages 1..4 are zero holes.
+        b.prefetch(0, dev).await.unwrap();
+
+        // All four pages are present (none re-fetched on read), but only the
+        // single real page counts against the budget — the holes are free.
+        assert_eq!(b.present_count().await, 4);
+        assert_eq!(b.resident_bytes().await, page);
+
+        // The real page was not evicted: mutate the inner backend and confirm the
+        // cached value is still served; the holes still read back as zeros.
+        inner
+            .write(0, Bytes::from(vec![0x00; page as usize]))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.read(0, page).await.unwrap(),
+            Bytes::from(vec![0xC3; page as usize])
+        );
+        assert_eq!(
+            b.read(page, page).await.unwrap(),
+            Bytes::from(vec![0u8; page as usize])
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn budget_never_evicts_dirty_pages() {
+        // Even when way over budget, unflushed (dirty) pages must never be
+        // dropped — that would lose data.
+        let dir = tmp_dir("evictdirty");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        // Tiny budget: one page.
+        let (b, _) = open_budgeted(inner.clone(), &dir, 1024, 4096, 1024);
+
+        // Dirty three pages without flushing.
+        b.write(0, Bytes::from(vec![0xB0; 1024])).await.unwrap();
+        b.write(1024, Bytes::from(vec![0xB1; 1024])).await.unwrap();
+        b.write(2048, Bytes::from(vec![0xB2; 1024])).await.unwrap();
+
+        // All three remain present (dirty, non-evictable) despite the 1-page budget.
+        assert_eq!(b.dirty_count().await, 3);
+        assert_eq!(b.present_count().await, 3);
+
+        // They all flush correctly (no data lost to eviction).
+        b.flush().await.unwrap();
+        assert_eq!(
+            inner.read(0, 1024).await.unwrap(),
+            Bytes::from(vec![0xB0; 1024])
+        );
+        assert_eq!(
+            inner.read(1024, 1024).await.unwrap(),
+            Bytes::from(vec![0xB1; 1024])
+        );
+        assert_eq!(
+            inner.read(2048, 1024).await.unwrap(),
+            Bytes::from(vec![0xB2; 1024])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unlimited_budget_never_evicts() {
+        // max_bytes == 0 preserves the original grow-only behaviour.
+        let dir = tmp_dir("unlimited");
+        let inner = Arc::new(MemBackend::new(4096).unwrap());
+        let (b, _) = open_budgeted(inner.clone(), &dir, 1024, 4096, 0);
+        for i in 0..4u64 {
+            b.write(i * 1024, Bytes::from(vec![0xC0 + i as u8; 1024]))
+                .await
+                .unwrap();
+        }
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn evicted_pages_reload_correct_data() {
+        // After a clean page is evicted to honour the budget, a later read of it
+        // must transparently reload the exact bytes from the inner backend, while
+        // the most-recently-written page stays resident in the cache.
+        let dir = tmp_dir("reload");
+        let inner = Arc::new(MemBackend::new(8192).unwrap());
+        let (b, _) = open_budgeted(inner.clone(), &dir, 4096, 8192, 4096);
+
+        // Page 0 becomes clean + resident, filling the whole one-page budget.
+        b.write(0, Bytes::from(vec![0xD0; 4096])).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 1);
+
+        // Writing page 1 admits it over budget and evicts the older clean page 0.
+        b.write(4096, Bytes::from(vec![0xD1; 4096])).await.unwrap();
+        b.flush().await.unwrap();
+        assert_eq!(b.present_count().await, 1);
+        assert_eq!(b.resident_bytes().await, 4096);
+
+        // Both pages read back their correct values: page 1 from the resident
+        // cache, page 0 reloaded from the blob after its eviction.
+        assert_eq!(
+            b.read(4096, 4096).await.unwrap(),
+            Bytes::from(vec![0xD1; 4096])
+        );
+        assert_eq!(
+            b.read(0, 4096).await.unwrap(),
+            Bytes::from(vec![0xD0; 4096])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn eviction_reclaims_disk_space() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // Eviction must physically reclaim disk via PUNCH_HOLE, not merely clear
+        // a bit: with a 4-page budget, churning through 8 pages keeps the data
+        // file's allocated block count near 4 pages, far below the 8 pages it
+        // would reach if nothing were reclaimed.
+        let dir = tmp_dir("reclaim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = 4096u64;
+        let dev_size = 8 * page;
+        let inner = Arc::new(MemBackend::new(dev_size).unwrap());
+        let (b, _) = open_budgeted(inner.clone(), &dir, page, dev_size, 4 * page);
+
+        let data_file = dir.join("test.dat");
+        let blocks = || std::fs::metadata(&data_file).unwrap().blocks();
+        let page_blocks = page / 512;
+
+        // Fill the budget with four clean pages.
+        for i in 0..4u64 {
+            b.write(i * page, Bytes::from(vec![0xE0 + i as u8; page as usize]))
+                .await
+                .unwrap();
+        }
+        b.flush().await.unwrap();
+        let baseline = blocks();
+
+        // Write four more pages; each admission evicts an LRU clean page.
+        for i in 4..8u64 {
+            b.write(i * page, Bytes::from(vec![0xE0 + i as u8; page as usize]))
+                .await
+                .unwrap();
+            b.flush().await.unwrap();
+        }
+
+        assert_eq!(b.present_count().await, 4);
+        assert_eq!(b.resident_bytes().await, 4 * page);
+        // Without reclaiming, all eight pages would stay allocated (≈ 2×baseline).
+        // Allow one page of slack for filesystem rounding.
+        assert!(
+            blocks() <= baseline + page_blocks,
+            "data file kept {} blocks (baseline {baseline}); holes were not punched",
+            blocks()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `BlobBackend` decorator that counts how many `read` calls reach it, so
+    /// cross-process sharing tests can assert a peer served a page with **zero**
+    /// blob reads.
+    struct CountingBackend {
+        inner: Arc<dyn BlobBackend>,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingBackend {
+        fn new(inner: Arc<dyn BlobBackend>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                reads: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+        fn read_count(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for CountingBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+    }
+
+    /// A `BlobBackend` decorator with a controllable validity token (ETag) and a
+    /// read counter, so the cache's cross-restart validation can be exercised:
+    /// a matching token must reuse the local clean pages (no blob read), a
+    /// changed token must drop them (forcing a blob read).
+    struct EtagBackend {
+        inner: Arc<dyn BlobBackend>,
+        etag: std::sync::Mutex<Option<String>>,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl EtagBackend {
+        fn new(inner: Arc<dyn BlobBackend>, etag: &str) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                etag: std::sync::Mutex::new(Some(etag.to_string())),
+                reads: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+        fn set_etag(&self, etag: &str) {
+            *self.etag.lock().unwrap() = Some(etag.to_string());
+        }
+        fn current_etag(&self) -> Option<String> {
+            self.etag.lock().unwrap().clone()
+        }
+        fn read_count(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for EtagBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+        async fn etag(&self) -> anyhow::Result<Option<String>> {
+            Ok(self.current_etag())
+        }
+    }
+
+    /// Open a cache against `inner` honouring its reported validity token, the
+    /// way the production wiring does (fetch the live token, pass it to `open`).
+    async fn open_validated(
+        inner: Arc<dyn BlobBackend>,
+        dir: &Path,
+        page_size: u64,
+        dev_size: u64,
+    ) -> (FileCacheBackend, u64) {
+        let etag = inner.etag().await.unwrap();
+        FileCacheBackend::open(
+            inner,
+            FileCacheConfig {
+                dir: dir.to_path_buf(),
+                name: "test".to_string(),
+                page_size,
+                max_bytes: 0,
+                blob_identity: String::new(),
+                share_pages: false,
+            },
+            dev_size,
+            etag,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unchanged_etag_reuses_clean_cache_across_restart() {
+        // Write+flush, then reopen with the *same* blob etag: the clean page is
+        // reused from local disk and no blob read is issued.
+        let dir = tmp_dir("etag-reuse");
+        let page = 4096u64;
+        let mem = Arc::new(MemBackend::new(page).unwrap());
+        let backend = EtagBackend::new(mem, "etag-1");
+
+        {
+            let (b, _) = open_validated(backend.clone(), &dir, page, page).await;
+            b.write(0, Bytes::from(vec![0xAB; page as usize]))
+                .await
+                .unwrap();
+            b.flush().await.unwrap();
+        }
+
+        // Reopen: same etag → clean page stays resident, read served locally.
+        let reads_before = backend.read_count();
+        let (b, recovered) = open_validated(backend.clone(), &dir, page, page).await;
+        assert_eq!(
+            recovered, 0,
+            "flushed pages are clean, none recovered dirty"
+        );
+        assert_eq!(
+            b.present_count().await,
+            1,
+            "clean page reused after restart"
+        );
+        let got = b.read(0, page).await.unwrap();
+        assert_eq!(got, Bytes::from(vec![0xAB; page as usize]));
+        assert_eq!(
+            backend.read_count(),
+            reads_before,
+            "served from local cache; the blob was not read"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn changed_etag_drops_stale_clean_cache() {
+        // Write+flush, then reopen with a *different* blob etag (external change):
+        // the stale clean page is dropped and the next read falls through to the
+        // blob.
+        let dir = tmp_dir("etag-drop");
+        let page = 4096u64;
+        let mem = Arc::new(MemBackend::new(page).unwrap());
+        let backend = EtagBackend::new(mem, "etag-1");
+
+        {
+            let (b, _) = open_validated(backend.clone(), &dir, page, page).await;
+            b.write(0, Bytes::from(vec![0xAB; page as usize]))
+                .await
+                .unwrap();
+            b.flush().await.unwrap();
+        }
+
+        // Simulate an external modification: the blob's etag changes.
+        backend.set_etag("etag-2");
+        let reads_before = backend.read_count();
+        let (b, recovered) = open_validated(backend.clone(), &dir, page, page).await;
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            b.present_count().await,
+            0,
+            "stale clean page dropped after external change"
+        );
+        // The read now misses the cache and reaches the blob.
+        let _ = b.read(0, page).await.unwrap();
+        assert_eq!(
+            backend.read_count(),
+            reads_before + 1,
+            "dropped page re-fetched from the blob"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn changed_etag_keeps_dirty_pages() {
+        // An unflushed (dirty) page must survive an etag change: it is this
+        // process's own pending write and is recovered + kept, never dropped.
+        let dir = tmp_dir("etag-dirty");
+        let page = 4096u64;
+        let mem = Arc::new(MemBackend::new(2 * page).unwrap());
+        let backend = EtagBackend::new(mem, "etag-1");
+
+        {
+            let (b, _) = open_validated(backend.clone(), &dir, page, 2 * page).await;
+            // Page 0 written+flushed (clean); page 1 written but NOT flushed (dirty).
+            b.write(0, Bytes::from(vec![0xAB; page as usize]))
+                .await
+                .unwrap();
+            b.flush().await.unwrap();
+            b.write(page, Bytes::from(vec![0xCD; page as usize]))
+                .await
+                .unwrap();
+        }
+
+        backend.set_etag("etag-2");
+        let (b, recovered) = open_validated(backend.clone(), &dir, page, 2 * page).await;
+        assert_eq!(recovered, 1, "the unflushed page is recovered as dirty");
+        // The dirty page is still present with its data; the clean one was dropped.
+        let got = b.read(page, page).await.unwrap();
+        assert_eq!(
+            got,
+            Bytes::from(vec![0xCD; page as usize]),
+            "dirty page data preserved across etag change"
+        );
+        assert_eq!(b.dirty_count().await, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn peer_serves_clean_page_without_blob_read() {
+        // Stage 2: process A populates the cache for a blob; process B (a second
+        // cache of the *same* blob_identity in the same dir) serves a read of
+        // that page from A's data file without ever reading the blob.
+        let dir = tmp_dir("share-read");
+        let page = 4096u64;
+        let dev = 2 * page;
+
+        // A's own blob, seeded so page 0 has known content.
+        let a_inner = Arc::new(MemBackend::new(dev).unwrap());
+        a_inner
+            .write(0, Bytes::from(vec![0xA7; page as usize]))
+            .await
+            .unwrap();
+        let (a, _) = open_shared(a_inner.clone(), &dir, "volA", "golden", page, dev);
+
+        // A writes page 0 and flushes → it is now clean, resident and published.
+        a.write(0, Bytes::from(vec![0xA7; page as usize]))
+            .await
+            .unwrap();
+        a.flush().await.unwrap();
+
+        // B caches the same golden identity but its own (empty) blob whose reads
+        // we count.  Its data file starts empty (page 0 absent).
+        let b_blob = Arc::new(MemBackend::new(dev).unwrap());
+        let b_counting = CountingBackend::new(b_blob);
+        let (b, _) = open_shared(b_counting.clone(), &dir, "volB", "golden", page, dev);
+
+        // B reads page 0: it is absent locally but A published it, so B copies
+        // A's bytes — with zero reads against B's own blob.
+        let got = b.read(0, page).await.unwrap();
+        assert_eq!(got, Bytes::from(vec![0xA7; page as usize]));
+        assert_eq!(
+            b_counting.read_count(),
+            0,
+            "page should come from peer, not blob"
+        );
+
+        // A page no peer published still falls back to the blob (one read).
+        let _ = b.read(page, page).await.unwrap();
+        assert_eq!(b_counting.read_count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn warmup_publishes_clean_pages_for_peers() {
+        // Warm-up (prefetch) must publish the clean pages it makes resident so a
+        // peer caching the same blob_identity can read them from the warmer's data
+        // file — the read-only golden-image use case, where no process ever
+        // writes+flushes. Without publishing, the peer would always miss.
+        let dir = tmp_dir("share-warmup");
+        let page = 4096u64;
+        let dev = 2 * page;
+
+        // A's blob, seeded so page 0 has known content; A only *prefetches* it.
+        let a_inner = Arc::new(MemBackend::new(dev).unwrap());
+        a_inner
+            .write(0, Bytes::from(vec![0xC3; page as usize]))
+            .await
+            .unwrap();
+        let (a, _) = open_shared(a_inner.clone(), &dir, "volA", "golden", page, dev);
+
+        // Warm page 0 into A's cache (clean, resident, and — with the fix —
+        // published). No write/flush happens.
+        a.prefetch(0, page).await.unwrap();
+        assert_eq!(a.present_count().await, 1);
+        assert_eq!(a.dirty_count().await, 0);
+
+        // B caches the same golden identity but its own (empty) blob whose reads
+        // we count.
+        let b_blob = Arc::new(MemBackend::new(dev).unwrap());
+        let b_counting = CountingBackend::new(b_blob);
+        let (b, _) = open_shared(b_counting.clone(), &dir, "volB", "golden", page, dev);
+
+        // B reads page 0 from A's warmed copy — zero reads against B's own blob.
+        let got = b.read(0, page).await.unwrap();
+        assert_eq!(got, Bytes::from(vec![0xC3; page as usize]));
+        assert_eq!(
+            b_counting.read_count(),
+            0,
+            "warmed page should come from peer, not blob"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cow_writers_do_not_corrupt_each_other() {
+        // Stage 3: two caches share a blob_identity.  When each writes the same
+        // page, it copies-on-write into its own data file and withdraws the page
+        // from the index, so neither observes the other's bytes.
+        let dir = tmp_dir("share-cow");
+        let page = 4096u64;
+        let dev = page;
+
+        let a_inner = Arc::new(MemBackend::new(dev).unwrap());
+        let (a, _) = open_shared(a_inner.clone(), &dir, "cowA", "golden", page, dev);
+        let b_inner = Arc::new(MemBackend::new(dev).unwrap());
+        let (b, _) = open_shared(b_inner.clone(), &dir, "cowB", "golden", page, dev);
+
+        // A writes and flushes page 0, publishing it.
+        a.write(0, Bytes::from(vec![0x11; page as usize]))
+            .await
+            .unwrap();
+        a.flush().await.unwrap();
+
+        // B writes its own value to page 0.  Because B dirties the page it must
+        // withdraw any inherited copy and keep its write private to its file.
+        b.write(0, Bytes::from(vec![0x22; page as usize]))
+            .await
+            .unwrap();
+        b.flush().await.unwrap();
+
+        // Each reads back its own value; neither is corrupted by the other.
+        assert_eq!(
+            a.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x11; page as usize])
+        );
+        assert_eq!(
+            b.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x22; page as usize])
+        );
+        // And each backing blob holds its own value.
+        assert_eq!(
+            a_inner.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x11; page as usize])
+        );
+        assert_eq!(
+            b_inner.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x22; page as usize])
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dirtying_page_withdraws_it_from_peers() {
+        // A page a peer is serving must stop being shared the moment its owner
+        // dirties it (so peers never read a diverging/torn copy).
+        let dir = tmp_dir("share-withdraw");
+        let page = 4096u64;
+        let dev = page;
+
+        let a_inner = Arc::new(MemBackend::new(dev).unwrap());
+        let (a, _) = open_shared(a_inner.clone(), &dir, "wA", "golden", page, dev);
+        a.write(0, Bytes::from(vec![0x55; page as usize]))
+            .await
+            .unwrap();
+        a.flush().await.unwrap();
+
+        // B can see A's published page.
+        let b_blob = Arc::new(MemBackend::new(dev).unwrap());
+        let b_counting = CountingBackend::new(b_blob);
+        let (b, _) = open_shared(b_counting.clone(), &dir, "wB", "golden", page, dev);
+        assert_eq!(
+            b.read(0, page).await.unwrap(),
+            Bytes::from(vec![0x55; page as usize])
+        );
+        assert_eq!(b_counting.read_count(), 0);
+
+        // A dirties the page (without flushing) → it is withdrawn from sharing.
+        a.write(0, Bytes::from(vec![0x66; page as usize]))
+            .await
+            .unwrap();
+
+        // B now misses the peer and falls back to its own blob.
+        let _ = b.read(0, page).await.unwrap();
+        assert_eq!(
+            b_counting.read_count(),
+            1,
+            "withdrawn page must hit the blob"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lru_orders_by_recency() {
+        let mut lru = Lru::default();
+        lru.touch(0, true);
+        lru.touch(1, true);
+        lru.touch(2, true);
+        // Least-recently-used first.
+        assert_eq!(lru.pop_lru(None), Some(0));
+        assert_eq!(lru.pop_lru(None), Some(1));
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_touch_refreshes_recency() {
+        let mut lru = Lru::default();
+        lru.touch(0, true);
+        lru.touch(1, true);
+        lru.touch(2, true);
+        // Re-touching page 0 makes it most-recently-used.
+        lru.touch(0, true);
+        assert_eq!(lru.pop_lru(None), Some(1));
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), Some(0));
+    }
+
+    #[test]
+    fn lru_dirty_pages_are_not_evictable() {
+        let mut lru = Lru::default();
+        lru.touch(0, true); // clean
+        lru.touch(1, false); // dirty
+        lru.touch(2, true); // clean
+                            // Page 1 is present but never an eviction candidate.
+        assert!(lru.contains(1));
+        assert_eq!(lru.pop_lru(None), Some(0));
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), None);
+        assert!(lru.contains(1));
+    }
+
+    #[test]
+    fn lru_reclassifies_between_clean_and_dirty() {
+        let mut lru = Lru::default();
+        lru.touch(0, true); // evictable
+        lru.touch(0, false); // now dirty → no longer evictable
+        assert_eq!(lru.pop_lru(None), None);
+        lru.touch(0, true); // flushed → evictable again
+        assert_eq!(lru.pop_lru(None), Some(0));
+    }
+
+    #[test]
+    fn lru_pop_skips_protected_page() {
+        let mut lru = Lru::default();
+        lru.touch(0, true);
+        lru.touch(1, true);
+        // The LRU page (0) is protected, so page 1 is chosen instead.
+        assert_eq!(lru.pop_lru(Some(0)), Some(1));
+        // Page 0 is still present; with no protection it is now evictable.
+        assert!(lru.contains(0));
+        assert_eq!(lru.pop_lru(Some(0)), None);
+        assert_eq!(lru.pop_lru(None), Some(0));
+    }
+
+    #[test]
+    fn lru_clear_empties_all_state() {
+        let mut lru = Lru::default();
+        lru.touch(0, true);
+        lru.touch(1, false);
+        lru.clear();
+        assert!(!lru.contains(0));
+        assert!(!lru.contains(1));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_empty_has_nothing() {
+        let mut lru = Lru::default();
+        assert!(!lru.contains(0));
+        assert!(!lru.contains(u64::MAX));
+        assert_eq!(lru.pop_lru(None), None);
+        assert_eq!(lru.pop_lru(Some(0)), None);
+    }
+
+    #[test]
+    fn lru_pop_removes_from_contains() {
+        // Popping a page must drop it from the resident set, not just the
+        // evictable index (otherwise byte accounting would double-count).
+        let mut lru = Lru::default();
+        lru.touch(7, true);
+        assert!(lru.contains(7));
+        assert_eq!(lru.pop_lru(None), Some(7));
+        assert!(!lru.contains(7));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_clean_page_is_popped_exactly_once() {
+        // Repeated touches of the same clean page collapse to a single resident,
+        // single-evictable entry.
+        let mut lru = Lru::default();
+        lru.touch(3, true);
+        lru.touch(3, true);
+        lru.touch(3, true);
+        assert_eq!(lru.pop_lru(None), Some(3));
+        assert_eq!(lru.pop_lru(None), None);
+        assert!(!lru.contains(3));
+    }
+
+    #[test]
+    fn lru_dirty_retouch_stays_non_evictable() {
+        // Re-touching a dirty page (e.g. a second write before flush) updates its
+        // recency but it must never become an eviction candidate.
+        let mut lru = Lru::default();
+        lru.touch(0, false);
+        lru.touch(0, false);
+        assert!(lru.contains(0));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_protecting_dirty_page_still_evicts_clean() {
+        // Protecting a page that isn't evictable anyway is a no-op; the clean LRU
+        // page is still chosen.
+        let mut lru = Lru::default();
+        lru.touch(0, false); // dirty
+        lru.touch(1, true); // clean
+        assert_eq!(lru.pop_lru(Some(0)), Some(1));
+        assert_eq!(lru.pop_lru(None), None);
+        assert!(lru.contains(0));
+    }
+
+    #[test]
+    fn lru_clear_allows_fresh_reuse() {
+        // After clear, the recency clock restarts and ordering is correct again.
+        let mut lru = Lru::default();
+        lru.touch(5, true);
+        lru.touch(6, true);
+        lru.clear();
+        lru.touch(2, true);
+        lru.touch(1, true);
+        // Insertion order after clear: 2 then 1 → 2 is least-recently-used.
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), Some(1));
+        assert_eq!(lru.pop_lru(None), None);
+    }
+
+    #[test]
+    fn lru_mixed_workload_order() {
+        // Comprehensive interleaving: clean inserts, a dirty page, a flush
+        // (dirty→clean), a re-touch, and a protected pop.
+        let mut lru = Lru::default();
+        lru.touch(0, true); // clean, oldest
+        lru.touch(1, false); // dirty (pinned)
+        lru.touch(2, true); // clean
+        lru.touch(3, true); // clean
+        lru.touch(0, true); // re-touch 0 → now newest clean
+        lru.touch(1, true); // flush page 1 → becomes evictable (newest)
+
+        // Evictable clean pages by recency: 2, 3, 0, 1.
+        assert_eq!(lru.pop_lru(Some(2)), Some(3)); // 2 protected → next LRU is 3
+        assert_eq!(lru.pop_lru(None), Some(2));
+        assert_eq!(lru.pop_lru(None), Some(0));
+        assert_eq!(lru.pop_lru(None), Some(1));
+        assert_eq!(lru.pop_lru(None), None);
+        assert!(!lru.contains(0));
+        assert!(!lru.contains(1));
+    }
+
+    /// MemBackend wrapper reporting a mutable ETag (bumped on every mutation),
+    /// like Azure changing the blob ETag on each Put Page.
+    struct EtagMem {
+        inner: Arc<MemBackend>,
+        rev: std::sync::atomic::AtomicU64,
+    }
+    impl EtagMem {
+        fn new(size: u64) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(MemBackend::new(size).unwrap()),
+                rev: std::sync::atomic::AtomicU64::new(1),
+            })
+        }
+        fn bump(&self) {
+            self.rev.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl BlobBackend for EtagMem {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.bump();
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.bump();
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.bump();
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+        async fn etag(&self) -> anyhow::Result<Option<String>> {
+            Ok(Some(format!(
+                "etag-{}",
+                self.rev.load(std::sync::atomic::Ordering::SeqCst)
+            )))
+        }
+    }
+
+    fn open_with_etag(
+        inner: Arc<dyn BlobBackend>,
+        dir: &Path,
+        page_size: u64,
+        dev_size: u64,
+        current_etag: Option<String>,
+    ) -> (FileCacheBackend, u64) {
+        FileCacheBackend::open(
+            inner,
+            FileCacheConfig {
+                dir: dir.to_path_buf(),
+                name: "test".to_string(),
+                page_size,
+                max_bytes: 0,
+                blob_identity: String::new(),
+                share_pages: false,
+            },
+            dev_size,
+            current_etag,
+        )
+        .unwrap()
+    }
+
+    /// Reproduces the PR #23 cache-reload scenario WITHOUT ublk/k8s: write through
+    /// BufferedBackend -> FileCacheBackend over an etag-reporting inner, flush,
+    /// drop (simulate the node-plugin restart), reopen the FileCacheBackend, and
+    /// assert the flushed pages recover CLEAN and are reused (not dirty).
+    #[tokio::test]
+    async fn cache_reload_reuses_clean_pages_through_buffered() {
+        use crate::backend::buffered::{BufferedBackend, BufferedConfig};
+
+        let dir = tmp_dir("reload-reuse");
+        let cache_page = 1024u64;
+        let buf_page = 4096u64; // a buffered page spans 4 cache pages, like the e2e
+        let dev = 16 * cache_page;
+
+        let inner = EtagMem::new(dev);
+        inner.create(dev).await.unwrap();
+
+        // "Writer": write 8 cache pages of data through the buffer, then flush.
+        {
+            let etag0 = inner.etag().await.unwrap();
+            let (fc, recovered) = open_with_etag(inner.clone(), &dir, cache_page, dev, etag0);
+            assert_eq!(recovered, 0);
+            let fc: Arc<dyn BlobBackend> = Arc::new(fc);
+            let buffered = BufferedBackend::new(
+                fc,
+                BufferedConfig {
+                    page_size: buf_page,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            buffered
+                .write(0, Bytes::from(vec![0x5A; 8 * cache_page as usize]))
+                .await
+                .unwrap();
+            buffered.flush().await.unwrap();
+            // drop buffered + fc → simulate the process exiting after a clean flush
+        }
+
+        // "Reader" after restart: reopen the FileCacheBackend over the same dir.
+        let current = inner.etag().await.unwrap();
+        let (fc2, recovered_dirty) = open_with_etag(inner.clone(), &dir, cache_page, dev, current);
+
+        assert_eq!(
+            recovered_dirty, 0,
+            "flushed pages must recover CLEAN, but {recovered_dirty} came back dirty"
+        );
+        assert_eq!(
+            fc2.present_count().await,
+            8,
+            "expected 8 clean data pages present and reusable after reload"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
