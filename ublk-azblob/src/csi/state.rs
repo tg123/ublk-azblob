@@ -102,10 +102,10 @@ fn state_file(dir: &Path, volume_id: &str) -> PathBuf {
     }
     // FNV-1a 64-bit over the original bytes: deterministic, dependency-free, and
     // recomputed identically by `remove()`, so the filename is a stable 1:1 map.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash: u64 = 0xcbf29ce484222325;
     for b in volume_id.as_bytes() {
         hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash = hash.wrapping_mul(0x00000100000001b3);
     }
     name.push_str(&format!("-{hash:016x}.json"));
     dir.join(name)
