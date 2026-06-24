@@ -1058,6 +1058,14 @@ async fn run_template_copy(
     let src_container = auth::build_container_client(&src_service_url, &tmpl.container, &src_auth)
         .context("build template container client")?;
     let mut source = AzurePageBlobBackend::new(src_container, tmpl.blob.clone());
+    // Auth-wired pipeline for `Get Page Ranges` so the copy can query the
+    // source's sparseness map and skip its zero ranges; best-effort.
+    match auth::build_pipeline(&src_auth) {
+        Ok(pipeline) => source = source.with_page_list(pipeline),
+        Err(err) => {
+            warn!(%err, "source page-ranges query disabled (could not build auth pipeline)")
+        }
+    }
     if let Some(snapshot) = &tmpl.snapshot {
         source = source.with_snapshot(snapshot.clone());
     }

@@ -47,7 +47,7 @@ pub mod proto {
 use anyhow::Context as _;
 use std::path::Path;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::{self, AuthConfig, UserAssignedIdentity};
 use crate::backend::{azure::AzurePageBlobBackend, BlobBackend};
@@ -349,6 +349,14 @@ pub fn build_template_backend(
     let container_client = auth::build_container_client(&service_url, &tmpl.container, &auth)
         .context("build template container client")?;
     let mut backend = AzurePageBlobBackend::new(container_client, tmpl.blob.clone());
+    // Auth-wired pipeline for `Get Page Ranges` so the copy can query the
+    // source's sparseness map and skip its zero ranges; best-effort.
+    match auth::build_pipeline(&auth) {
+        Ok(pipeline) => backend = backend.with_page_list(pipeline),
+        Err(err) => {
+            warn!(%err, "source page-ranges query disabled (could not build auth pipeline)")
+        }
+    }
     if let Some(snapshot) = &tmpl.snapshot {
         backend = backend.with_snapshot(snapshot.clone());
     }
@@ -388,7 +396,17 @@ pub fn build_backend_concrete(
 ///   streamed copy through `source` (download → upload).
 ///
 /// `source_url` is the raw `templateBlobUrl` (already carrying any `snapshot=` /
-/// SAS query). `dest` must already exist and be at least `total_size`.
+/// SAS query). `dest` must already exist and be at least `total_size`; it need
+/// **not** be freshly zeroed — zero ranges are cleared on the destination (see
+/// below), so a retry against an existing same-size blob is safe.
+///
+/// When the `source` can report its sparseness map (via
+/// [`BlobBackend::data_ranges`]), ranges that the source never wrote are
+/// **cleared** on the destination rather than copied: neither the server-side
+/// nor the streamed path reads them from the source, but both issue
+/// `Clear Pages` / `clear` so the destination reads back as zero there even if
+/// it previously held data. A source that cannot report ranges degrades to
+/// copying every byte.
 pub async fn copy_template(
     dest: &AzurePageBlobBackend,
     source: &dyn BlobBackend,
@@ -397,6 +415,26 @@ pub async fn copy_template(
     dest_auth: &AuthConfig,
     total_size: u64,
 ) -> anyhow::Result<()> {
+    // Best-effort source sparseness map: lets both copy paths clear (instead of
+    // copying) the source's unwritten free space on the destination, so a
+    // non-empty/retried target is still zeroed there. A missing or errored map
+    // copies in full.
+    let data_ranges = match source.data_ranges().await {
+        Ok(ranges) => ranges,
+        Err(err) => {
+            warn!(%err, "source data-ranges query failed; copying the whole blob");
+            None
+        }
+    };
+    if let Some(ranges) = &data_ranges {
+        let data_bytes: u64 = ranges.iter().map(|&(_, len)| len).sum();
+        info!(
+            data_ranges = ranges.len(),
+            data_bytes, "copy using source sparseness map (skipping zero ranges)"
+        );
+    }
+    let data_ranges = data_ranges.as_deref();
+
     // A SAS in the URL authenticates the source itself; otherwise the storage
     // service needs an Entra copy-source authorization (minted per batch inside
     // `copy_pages_from_url`). SharedKey with no SAS can't authenticate a
@@ -413,21 +451,22 @@ pub async fn copy_template(
             total_size,
             "server-side copy (Put Page From URL, SAS source)"
         );
-        dest.copy_pages_from_url(source_url, total_size, None).await
+        dest.copy_pages_from_url(source_url, total_size, None, data_ranges)
+            .await
     } else if entra_token.is_some() {
         info!(
             total_size,
             "server-side copy (Put Page From URL, Entra source)"
         );
         // Pass the auth (not the probe token) so the token is re-minted per batch.
-        dest.copy_pages_from_url(source_url, total_size, Some(dest_auth.clone()))
+        dest.copy_pages_from_url(source_url, total_size, Some(dest_auth.clone()), data_ranges)
             .await
     } else {
         info!(
             total_size,
             "no copy-source authorization (SharedKey, no SAS); streaming the copy"
         );
-        copy_blob_streamed(source, dest, total_size).await
+        copy_blob_streamed(source, dest, total_size, data_ranges).await
     }
 }
 
@@ -435,10 +474,17 @@ pub async fn copy_template(
 /// fallback used by [`copy_template`] when a server-side copy isn't possible).
 ///
 /// Copies in 4 MiB page-aligned chunks; sparse source ranges read back as zeros.
+///
+/// `source_data_ranges` is the source sparseness map: when `Some`, chunks lying
+/// entirely in a zero gap are **cleared** on `dest` (via `clear`) rather than
+/// copied — neither read from the source nor written from it — so the
+/// destination reads back as zero there even when it is not a freshly-created
+/// blob (e.g. a retry against an existing same-size target).
 async fn copy_blob_streamed(
     source: &dyn BlobBackend,
     dest: &dyn BlobBackend,
     total_size: u64,
+    source_data_ranges: Option<&[(u64, u64)]>,
 ) -> anyhow::Result<()> {
     use crate::backend::io_gateway::{with_class, IoClass};
     // Tag both the source reads (downloads) and destination writes (uploads) as
@@ -447,8 +493,27 @@ async fn copy_blob_streamed(
     with_class(IoClass::Copy, async move {
         let chunk = crate::backend::copy_chunk_bytes();
         let mut offset = 0u64;
+        let mut copied_bytes = 0u64;
+        let mut cleared_bytes = 0u64;
         while offset < total_size {
             let len = chunk.min(total_size - offset);
+            if let Some(ranges) = source_data_ranges {
+                if !crate::backend::range_intersects(ranges, offset, len) {
+                    // Zero gap in the source: clear the destination range rather
+                    // than copying zeros. This avoids the source read but still
+                    // guarantees the destination reads back as zero there even
+                    // when it is not a freshly-created blob (create() is
+                    // idempotent and does not zero an existing same-size target,
+                    // so a retry could otherwise retain stale data and corrupt
+                    // the clone).
+                    dest.clear(offset, len)
+                        .await
+                        .with_context(|| format!("clear copy offset={offset} len={len}"))?;
+                    cleared_bytes += len;
+                    offset += len;
+                    continue;
+                }
+            }
             let data = source
                 .read(offset, len)
                 .await
@@ -456,9 +521,16 @@ async fn copy_blob_streamed(
             dest.write(offset, data)
                 .await
                 .with_context(|| format!("write copy offset={offset} len={len}"))?;
+            copied_bytes += len;
             offset += len;
         }
         dest.flush().await.context("flush copied blob")?;
+        if source_data_ranges.is_some() {
+            info!(
+                copied_bytes,
+                cleared_bytes, total_size, "streamed copy cleared source zero ranges"
+            );
+        }
         Ok(())
     })
     .await
