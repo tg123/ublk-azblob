@@ -68,7 +68,9 @@ jobs:
           echo "$ldd_out"
           echo "$ldd_out" | grep -qiE "not a dynamic executable|statically linked" || \
             { echo "::error::binary is not statically linked"; exit 1; }
-          strip "$bin" || true
+          # NOTE: do not strip here — the Dockerfile already strips in the
+          # builder, so this binary is byte-for-byte identical to the one the
+          # published Docker image ships. Stripping again would diverge them.
 
           name="ublk-azblob-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$name"

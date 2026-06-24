@@ -81,12 +81,19 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     cp "/build/target/${TARGET_TRIPLE}/release/ublk-azblob" /ublk-azblob && \
     # Fail the build unless the binary is fully static (no ELF interpreter).
     file /ublk-azblob | grep -qiE "static-pie|statically linked" && \
-    ! file /ublk-azblob | grep -qi "interpreter"
+    ! file /ublk-azblob | grep -qi "interpreter" && \
+    # Strip here, once, so the runtime image and the release tarball ship the
+    # byte-for-byte identical artifact (both consume the `binary` stage below,
+    # and the release workflow no longer re-strips).
+    strip /ublk-azblob
 
 # ── Static binary export ────────────────────────────────────────────────────
-# Minimal stage that contains only the fully-static binary, so the release
-# workflow can reuse this exact build instead of re-implementing the musl static
-# build:  `docker buildx build --target binary --output type=local,dest=out .`
+# Minimal stage that contains only the fully-static, stripped binary, so the
+# release workflow can reuse this exact build instead of re-implementing the
+# musl static build:
+#   docker buildx build --target binary --output type=local,dest=out .
+# The runtime stage below copies the *same* stage, so the published image binary
+# and the release tarball binary are identical.
 FROM scratch AS binary
 COPY --from=builder /ublk-azblob /ublk-azblob
 
@@ -115,6 +122,6 @@ RUN apt-get update && apt-get install -y \
         nbd-client \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /ublk-azblob /usr/local/bin/ublk-azblob
+COPY --from=binary /ublk-azblob /usr/local/bin/ublk-azblob
 
 ENTRYPOINT ["/usr/local/bin/ublk-azblob"]
