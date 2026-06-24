@@ -491,6 +491,159 @@ pub fn mount(
     run("mount", &arg_refs)
 }
 
+/// Node-local scratch directories backing an *ephemeral overlay* mount.
+///
+/// For a read-only (snapshot) volume the immutable filesystem is mounted at
+/// `lower` and an `overlayfs` is stacked on top with a writable `upper` (the
+/// pod-local change layer) and an empty `work` dir. The merged, writable view
+/// is presented at the CSI target path. The scratch lives on node disk and is
+/// discarded on unpublish, so writes never reach the immutable backing blob.
+///
+/// `lower` is always placed as a hidden sibling of the CSI target (it is only a
+/// mount point for the immutable filesystem). The writable `upper`/`work` pair
+/// must share one filesystem outside the merged mount (an overlayfs
+/// requirement); where they live depends on the layout:
+///
+///   * Default (`scratch_root = None`): `upper`/`work` are hidden siblings of
+///     the target too, on the per-volume kubelet directory's filesystem, and
+///     are naturally removed with that directory on unpublish.
+///   * Configured scratch base (`scratch_root = Some(_)`): `upper`/`work` live
+///     under an operator-chosen base (`overlayScratchDir`), on that base's
+///     filesystem — not on the target's — and are pruned explicitly via
+///     `scratch_root` on teardown so nothing leaks.
+#[derive(Clone, Debug)]
+pub struct OverlayDirs {
+    /// Read-only mount point of the immutable lower filesystem.
+    pub lower: String,
+    /// Writable upper layer (pod-local changes land here).
+    pub upper: String,
+    /// overlayfs work directory (must be empty and on the same fs as `upper`).
+    pub work: String,
+    /// Per-volume scratch root holding `upper`/`work` when an operator-chosen
+    /// scratch base is used (`None` for the default hidden-sibling layout).
+    /// Removed on teardown so nothing leaks on the configured filesystem.
+    pub scratch_root: Option<String>,
+}
+
+/// Sanitize a string to a filesystem-safe component (alphanumerics plus `-` and
+/// `_`), so an operator-supplied scratch base plus the volume id can't traverse
+/// paths (e.g. `..`) outside the configured scratch directory.
+fn sanitize_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// Derive the per-volume overlay scratch directories from the CSI `target` path.
+///
+/// `lower` is always a hidden sibling of `target` (it is only a mount point for
+/// the immutable filesystem). The writable `upper`/`work` pair must live on a
+/// single filesystem:
+///
+///   * With `scratch_base = None` (default) they are hidden siblings of `target`
+///     too — i.e. on the per-volume kubelet directory's filesystem — and are
+///     cleaned up together with the volume. Behaviour is unchanged.
+///   * With `scratch_base = Some(dir)` they are placed under
+///     `<dir>/<sanitized volume id>/{upper,work}`, letting operators steer the
+///     ephemeral write scratch onto a chosen filesystem (e.g. an SSD or tmpfs
+///     mount). The per-volume subdirectory keeps concurrent volumes isolated and
+///     is removed on teardown.
+pub fn overlay_dirs(target: &str, scratch_base: Option<&str>, volume_id: &str) -> OverlayDirs {
+    let parent = Path::new(target).parent().unwrap_or_else(|| Path::new("/"));
+    let sibling = |name: &str| parent.join(name).to_string_lossy().into_owned();
+    let lower = sibling(".ublk-overlay-lower");
+    match scratch_base {
+        Some(base) => {
+            let root = Path::new(base).join(sanitize_component(volume_id));
+            let upper = root.join("upper").to_string_lossy().into_owned();
+            let work = root.join("work").to_string_lossy().into_owned();
+            OverlayDirs {
+                lower,
+                upper,
+                work,
+                scratch_root: Some(root.to_string_lossy().into_owned()),
+            }
+        }
+        None => OverlayDirs {
+            lower,
+            upper: sibling(".ublk-overlay-upper"),
+            work: sibling(".ublk-overlay-work"),
+            scratch_root: None,
+        },
+    }
+}
+
+/// Mount `dev` read-only as the overlay lower, then stack a writable overlayfs
+/// with a node-local upper/work at `target`.
+///
+/// `dev` carries the immutable (snapshot) filesystem; it is mounted read-only at
+/// `dirs.lower` (reusing the read-only mount path, including the ext `noload`
+/// fixup), then an `overlay` filesystem is mounted at `target` presenting a
+/// writable merged view whose writes land in `dirs.upper`.
+pub fn mount_overlay(
+    dev: &str,
+    target: &str,
+    fs_type: &str,
+    mount_flags: &[String],
+    dirs: &OverlayDirs,
+) -> anyhow::Result<()> {
+    // Start from clean scratch dirs: a stale, non-empty work dir makes the
+    // overlay mount fail, and a leftover upper would resurrect prior writes.
+    let _ = std::fs::remove_dir_all(&dirs.upper);
+    let _ = std::fs::remove_dir_all(&dirs.work);
+    for d in [&dirs.lower, &dirs.upper, &dirs.work] {
+        std::fs::create_dir_all(d).with_context(|| format!("create overlay dir {d}"))?;
+    }
+
+    // Mount the immutable lower read-only (ro + ext `noload` are added by
+    // `mount` when `readonly` is set).
+    mount(dev, &dirs.lower, fs_type, mount_flags, true)?;
+
+    std::fs::create_dir_all(target).with_context(|| format!("create overlay target {target}"))?;
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        dirs.lower, dirs.upper, dirs.work
+    );
+    info!(target, lower = %dirs.lower, "mounting ephemeral overlay");
+    if let Err(e) = run("mount", &["-t", "overlay", "overlay", "-o", &opts, target]) {
+        // Roll back the lower mount so a failed overlay doesn't leak it.
+        let _ = umount(&dirs.lower);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Tear down an ephemeral overlay: unmount the merged view and the lower, then
+/// remove the node-local scratch (discarding all pod-local writes). Idempotent.
+pub fn umount_overlay(target: &str, dirs: &OverlayDirs) -> anyhow::Result<()> {
+    umount(target)?;
+    umount(&dirs.lower)?;
+    // Best-effort scratch removal; the writes are already gone once unmounted.
+    for d in [&dirs.upper, &dirs.work, &dirs.lower] {
+        if let Err(e) = std::fs::remove_dir_all(d) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(dir = %d, error = %e, "overlay scratch removal failed");
+            }
+        }
+    }
+    // For an operator-configured scratch base, also prune the per-volume root
+    // (which holds `upper`/`work`) so nothing leaks on the chosen filesystem.
+    if let Some(root) = &dirs.scratch_root {
+        if let Err(e) = std::fs::remove_dir_all(root) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(dir = %root, error = %e, "overlay scratch root removal failed");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Unmount `target` (idempotent: a "not mounted" result is treated as success).
 pub fn umount(target: &str) -> anyhow::Result<()> {
     if !Path::new(target).exists() {
@@ -574,6 +727,57 @@ mod tests {
     #[test]
     fn fsck_mode_rejects_unknown_values() {
         assert!(FsckMode::parse("maybe").is_err());
+    }
+
+    #[test]
+    fn overlay_dirs_are_hidden_siblings_of_target() {
+        let dirs = overlay_dirs(
+            "/var/lib/kubelet/pods/abc/volumes/x/pvc-1/mount",
+            None,
+            "pvc-1",
+        );
+        let parent = "/var/lib/kubelet/pods/abc/volumes/x/pvc-1";
+        assert_eq!(dirs.lower, format!("{parent}/.ublk-overlay-lower"));
+        assert_eq!(dirs.upper, format!("{parent}/.ublk-overlay-upper"));
+        assert_eq!(dirs.work, format!("{parent}/.ublk-overlay-work"));
+        assert!(dirs.scratch_root.is_none());
+        // upper and work must share the target's parent filesystem and must not
+        // sit inside the merged target (an overlayfs requirement).
+        for d in [&dirs.upper, &dirs.work, &dirs.lower] {
+            assert!(!d.starts_with("/var/lib/kubelet/pods/abc/volumes/x/pvc-1/mount/"));
+            assert!(d.starts_with(parent));
+        }
+    }
+
+    #[test]
+    fn overlay_dirs_use_configured_scratch_base() {
+        let dirs = overlay_dirs(
+            "/var/lib/kubelet/pods/abc/volumes/x/pvc-1/mount",
+            Some("/mnt/ssd/overlay"),
+            "pvc-1",
+        );
+        let root = "/mnt/ssd/overlay/pvc-1";
+        // lower stays a hidden sibling of the target (it is only a mount point).
+        assert_eq!(
+            dirs.lower,
+            "/var/lib/kubelet/pods/abc/volumes/x/pvc-1/.ublk-overlay-lower"
+        );
+        // upper and work move onto the configured base, under a per-volume root
+        // so they share one filesystem and can't collide across volumes.
+        assert_eq!(dirs.upper, format!("{root}/upper"));
+        assert_eq!(dirs.work, format!("{root}/work"));
+        assert_eq!(dirs.scratch_root.as_deref(), Some(root));
+    }
+
+    #[test]
+    fn overlay_dirs_sanitize_volume_id_for_scratch_base() {
+        // A volume id with path separators must not escape the scratch base.
+        let dirs = overlay_dirs("/tgt/mount", Some("/mnt/ssd"), "../../etc/evil");
+        assert_eq!(
+            dirs.scratch_root.as_deref(),
+            Some("/mnt/ssd/______etc_evil")
+        );
+        assert!(dirs.upper.starts_with("/mnt/ssd/______etc_evil/"));
     }
 
     #[test]
