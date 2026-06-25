@@ -28,19 +28,29 @@ permissions:
 jobs:
   build:
     name: build static ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    # Both targets build on an amd64 runner and cross-compile via
+    # deploy/Dockerfile's `binary` stage (zig/cargo-zigbuild — no emulated
+    # compile). Building both arches the *same way* the multi-arch image is
+    # built (cross-from-amd64 in docker.yml) guarantees each release tarball is
+    # byte-for-byte identical to the binary shipped in the published image.
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             platform: linux/amd64
-            runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             platform: linux/arm64
-            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+
+      # Registers binfmt so buildx accepts the linux/arm64 platform. The actual
+      # Rust compile is cross-compiled on the native amd64 builder (the builder
+      # stage is pinned to $BUILDPLATFORM) and the `binary` stage is `scratch`
+      # with no foreign-arch RUN, so nothing is emulated here.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -48,9 +58,8 @@ jobs:
       - name: Build fully-static binary via Dockerfile
         run: |
           # Reuse the exact fully-static (musl) build from deploy/Dockerfile via
-          # its `binary` stage, exporting just the binary to ./dist-bin.  Each
-          # matrix entry runs on its native runner, so the platform build is
-          # native (no QEMU emulation).
+          # its `binary` stage, exporting just the binary to ./dist-bin.  The
+          # cross-compile runs on the native amd64 builder (no QEMU compile).
           docker buildx build \
             --file deploy/Dockerfile \
             --target binary \
@@ -62,15 +71,17 @@ jobs:
         id: package
         run: |
           bin=dist-bin/ublk-azblob
-          # Confirm it really is a static binary; fail the build otherwise.
+          # Confirm it really is a fully-static binary; fail otherwise. Use
+          # `file` (reads the ELF header) rather than `ldd` — the arm64 artifact
+          # is cross-built on this amd64 runner, so `ldd` cannot load it.
           file "$bin"
-          ldd_out="$(ldd "$bin" 2>&1 || true)"
-          echo "$ldd_out"
-          echo "$ldd_out" | grep -qiE "not a dynamic executable|statically linked" || \
+          file "$bin" | grep -qiE "static-pie linked|statically linked" || \
             { echo "::error::binary is not statically linked"; exit 1; }
-          # NOTE: do not strip here — the Dockerfile already strips in the
-          # builder, so this binary is byte-for-byte identical to the one the
-          # published Docker image ships. Stripping again would diverge them.
+          file "$bin" | grep -qi "interpreter" && \
+            { echo "::error::binary has an ELF interpreter (not static)"; exit 1; } || true
+          # NOTE: do not strip here — the release profile already strips at build
+          # time, so this binary is byte-for-byte identical to the one the
+          # published Docker image ships (both come from the same `binary` stage).
 
           name="ublk-azblob-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$name"

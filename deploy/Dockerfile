@@ -10,36 +10,63 @@
 # slim Debian runtime because the node plugin shells out to userspace tools
 # (`mkfs.ext4`, `mount`/`umount`, `blkid`, `nbd-client`, …).
 #
-# The builder runs on the *target* platform (emulated under QEMU for a foreign
-# arch by `docker buildx`).  This keeps the toolchain simple: the target-arch
-# `musl-gcc` and a native `clang`/`protoc` are all that bindgen, the `ring`
-# crypto C code, and the CSI proto compiler need — no cross sysroot juggling.
+# Multi-arch (linux/amd64 + linux/arm64) is built by *cross-compiling* on the
+# native build platform with `cargo-zigbuild` — never under QEMU emulation. Zig
+# ships its own cross C compiler, linker and musl sysroot, so a single amd64
+# builder produces the static arm64 binary at native speed with no per-arch
+# toolchain juggling (no cross GCC, no sysroot headers). The builder stage is
+# pinned to `$BUILDPLATFORM`; only the small runtime stage is pulled for the
+# target platform.
 #
 # Build from the repository root:
 #   docker build -f deploy/Dockerfile -t ghcr.io/tg123/ublk-azblob:latest .
 
 # ── Builder ───────────────────────────────────────────────────────────────────
-FROM rust:1.96-bookworm AS builder
+# Pinned to the native build platform so the Rust/zig toolchain runs on real
+# hardware; the target architecture is reached via cross-compilation, not QEMU.
+FROM --platform=$BUILDPLATFORM rust:1.96-bookworm AS builder
 
 # Provided automatically by BuildKit.
 ARG TARGETARCH
 
-# Install build dependencies (all native to the builder's own architecture):
+# Pinned tool versions for reproducible builds.
+ARG ZIG_VERSION=0.13.0
+ARG CARGO_ZIGBUILD_VERSION=0.19.8
+
+# Install build dependencies (all native to the builder's own architecture —
+# nothing here is target-arch specific, because zig provides the cross compiler):
 # - protobuf-compiler, libprotobuf-dev: protoc and well-known types for CSI gRPC
 # - libclang-dev, clang: libclang for bindgen (used by libublk-rs-sys)
-# - musl-tools: musl-gcc, the C compiler the static musl binary links against
-#   (compiles the ring crypto C code and the libublk C shim against musl libc)
-# - cmake: native build of the aws-lc-sys / ring crypto crates
-# - pkg-config: build dependency probing
+# - cmake, pkg-config: native build deps for some -sys crates
+# - curl, xz-utils: fetch + unpack the zig toolchain
 RUN apt-get update && apt-get install -y \
         protobuf-compiler \
         libprotobuf-dev \
         libclang-dev \
         clang \
-        musl-tools \
         cmake \
         pkg-config \
+        curl \
+        xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Install zig (the cross C compiler + linker + bundled musl sysroot) for the
+# builder's own architecture, plus cargo-zigbuild which drives cargo through it.
+RUN <<'EOF'
+set -eux
+case "$(dpkg --print-architecture)" in
+    amd64) zig_arch=x86_64 ;;
+    arm64) zig_arch=aarch64 ;;
+    *) echo "unsupported builder arch: $(dpkg --print-architecture)" >&2; exit 1 ;;
+esac
+curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${zig_arch}-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+mkdir -p /opt/zig
+tar -C /opt/zig --strip-components=1 -xf /tmp/zig.tar.xz
+rm /tmp/zig.tar.xz
+/opt/zig/zig version
+EOF
+ENV PATH="/opt/zig:${PATH}"
+RUN cargo install cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}" --locked
 
 WORKDIR /src
 
@@ -53,17 +80,6 @@ case "$TARGETARCH" in
 esac
 rustup target add "$triple"
 echo "export TARGET_TRIPLE=$triple" > /target-env.sh
-# Upper/lower-case underscore forms used by cargo/cc env var names.
-triple_us=$(echo "$triple" | tr '-' '_')
-{
-    echo "export CARGO_BUILD_TARGET=$triple"
-    # Point the musl target's C compiler at musl-gcc so the bundled C code
-    # (ring, libublk shim) is compiled against musl libc.  Rust's musl target
-    # already links the final binary fully static (crt-static + self-contained
-    # startup objects); do NOT override the linker, which would disable that and
-    # produce a dynamically-linked musl executable.
-    echo "export CC_${triple_us}=musl-gcc"
-} >> /target-env.sh
 cat /target-env.sh
 EOF
 
@@ -77,15 +93,15 @@ RUN --mount=type=bind,source=.,target=/src,readonly \
     --mount=type=cache,id=cargo-target-${TARGETARCH},target=/build/target \
     . /target-env.sh && \
     cd /src && \
-    CARGO_TARGET_DIR=/build/target cargo build --release -p ublk-azblob && \
+    # cargo-zigbuild cross-compiles to the musl target via zig (no QEMU). The
+    # release profile sets `strip = true`, so the artifact is already stripped —
+    # no separate `strip` step (which would fail on a cross-arch binary anyway).
+    CARGO_TARGET_DIR=/build/target cargo zigbuild --release \
+        --target "${TARGET_TRIPLE}" -p ublk-azblob && \
     cp "/build/target/${TARGET_TRIPLE}/release/ublk-azblob" /ublk-azblob && \
     # Fail the build unless the binary is fully static (no ELF interpreter).
     file /ublk-azblob | grep -qiE "static-pie|statically linked" && \
-    ! file /ublk-azblob | grep -qi "interpreter" && \
-    # Strip here, once, so the runtime image and the release tarball ship the
-    # byte-for-byte identical artifact (both consume the `binary` stage below,
-    # and the release workflow no longer re-strips).
-    strip /ublk-azblob
+    ! file /ublk-azblob | grep -qi "interpreter"
 
 # ── Static binary export ────────────────────────────────────────────────────
 # Minimal stage that contains only the fully-static, stripped binary, so the

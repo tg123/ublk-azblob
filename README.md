@@ -67,12 +67,15 @@ cargo build --release -p ublk-azblob
 cargo build --release -p ublk-azblob --no-default-features
 
 # Build a fully-static binary (musl libc — no glibc / shared-object deps).
-# Needs the musl target and musl-gcc (apt `musl-tools`); the resulting binary
-# matches the prebuilt release assets above.
+# The release assets and the container-image binary are built with
+# `cargo-zigbuild` (zig provides the cross C toolchain + musl sysroot), so use
+# it here to reproduce the published artifact exactly. Needs the musl target,
+# `zig`, and `cargo-zigbuild` (`cargo install cargo-zigbuild`).
 rustup target add x86_64-unknown-linux-musl
-CC_x86_64_unknown_linux_musl=musl-gcc \
-  cargo build --release --target x86_64-unknown-linux-musl \
-  -p ublk-azblob
+cargo zigbuild --release --target x86_64-unknown-linux-musl -p ublk-azblob
+# Cross-build the arm64 release artifact from the same host (no emulation):
+rustup target add aarch64-unknown-linux-musl
+cargo zigbuild --release --target aarch64-unknown-linux-musl -p ublk-azblob
 ```
 
 ---
