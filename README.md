@@ -22,6 +22,35 @@ as a local block device (`/dev/ublkbN`), written in Rust.
 
 ---
 
+## Download (prebuilt static binary)
+
+Every tagged release publishes **fully-static** binaries (musl libc, no glibc,
+no shared-object dependencies) on the
+[Releases page](https://github.com/tg123/ublk-azblob/releases). They run on any
+modern x86-64 / aarch64 Linux host with no runtime to install.
+
+```bash
+# Pick the asset matching your architecture:
+#   ublk-azblob-<tag>-x86_64-unknown-linux-musl.tar.gz   (amd64)
+#   ublk-azblob-<tag>-aarch64-unknown-linux-musl.tar.gz  (arm64)
+tar -xzf ublk-azblob-<tag>-x86_64-unknown-linux-musl.tar.gz
+./ublk-azblob-<tag>-x86_64-unknown-linux-musl/ublk-azblob --version
+
+```
+
+Each archive ships a `.sha256` checksum next to it. The binaries are built with
+the `ublk` and `csi` features enabled.
+
+The release binary is the **exact same artifact** shipped inside the container
+image (`ghcr.io/tg123/ublk-azblob`): both are extracted from the `binary` stage
+of [`deploy/Dockerfile`](deploy/Dockerfile), so the downloaded binary and the
+one in the image are byte-for-byte identical (same SHA256).
+
+> The CSI node plugin still shells out to host utilities (`mkfs.ext4`,
+> `mount`/`umount`, `blkid`, `nbd-client`); those must be present on the host.
+
+---
+
 ## Build
 
 ```bash
@@ -36,6 +65,17 @@ cargo build --release -p ublk-azblob
 
 # Core-only build for any kernel / macOS (no ublk, no CSI, no protoc needed)
 cargo build --release -p ublk-azblob --no-default-features
+
+# Build a fully-static binary (musl libc — no glibc / shared-object deps).
+# The release assets and the container-image binary are built with
+# `cargo-zigbuild` (zig provides the cross C toolchain + musl sysroot), so use
+# it here to reproduce the published artifact exactly. Needs the musl target,
+# `zig`, and `cargo-zigbuild` (`cargo install cargo-zigbuild`).
+rustup target add x86_64-unknown-linux-musl
+cargo zigbuild --release --target x86_64-unknown-linux-musl -p ublk-azblob
+# Cross-build the arm64 release artifact from the same host (no emulation):
+rustup target add aarch64-unknown-linux-musl
+cargo zigbuild --release --target aarch64-unknown-linux-musl -p ublk-azblob
 ```
 
 ---
