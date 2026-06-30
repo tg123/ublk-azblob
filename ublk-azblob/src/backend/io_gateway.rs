@@ -672,4 +672,321 @@ mod tests {
         .expect("permit was not freed after the dropped submission was cancelled; B timed out");
         assert_eq!(out, 42);
     }
+
+    // ── Pure-function / helper coverage ────────────────────────────────────
+
+    #[test]
+    fn priority_order_is_foreground_flush_copy_warmup() {
+        assert!(IoClass::ForegroundRead.priority() > IoClass::Flush.priority());
+        assert!(IoClass::Flush.priority() > IoClass::Copy.priority());
+        assert!(IoClass::Copy.priority() > IoClass::Warmup.priority());
+        // Lowest is strictly the warm-up class.
+        for c in [IoClass::ForegroundRead, IoClass::Flush, IoClass::Copy] {
+            assert!(c.priority() > IoClass::Warmup.priority());
+        }
+    }
+
+    #[test]
+    fn build_limiter_is_none_when_unlimited() {
+        assert!(build_limiter(0).is_none(), "0 bps must mean unlimited");
+    }
+
+    #[test]
+    fn build_limiter_max_is_at_least_one_max_page() {
+        // A sub-page-rate limit still admits a full max-page request in one
+        // round (max is floored at MAX_PAGE_REQUEST_BYTES) so it never deadlocks.
+        let small = build_limiter(10 * 1024).expect("some");
+        assert_eq!(small.max() as u64, MAX_PAGE_REQUEST_BYTES);
+        // A rate above the page size raises max to the rate itself.
+        let big = build_limiter(8 * MAX_PAGE_REQUEST_BYTES).expect("some");
+        assert_eq!(big.max() as u64, 8 * MAX_PAGE_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn env_helpers_parse_and_filter() {
+        // Unique per-test var names so this never races other tests' env.
+        let uvar = "UBLK_TEST_ENV_USIZE_8131";
+        let u64var = "UBLK_TEST_ENV_U64_8131";
+
+        std::env::remove_var(uvar);
+        assert_eq!(env_usize(uvar), None, "unset → None");
+        std::env::set_var(uvar, "0");
+        assert_eq!(env_usize(uvar), None, "0 is treated as unset");
+        std::env::set_var(uvar, "not-a-number");
+        assert_eq!(env_usize(uvar), None, "garbage → None");
+        std::env::set_var(uvar, "128");
+        assert_eq!(env_usize(uvar), Some(128));
+        std::env::remove_var(uvar);
+
+        std::env::remove_var(u64var);
+        assert_eq!(env_u64(u64var), None);
+        // 0 is a *valid* u64 here (unlimited bandwidth), unlike env_usize.
+        std::env::set_var(u64var, "0");
+        assert_eq!(env_u64(u64var), Some(0));
+        std::env::set_var(u64var, "1048576");
+        assert_eq!(env_u64(u64var), Some(1048576));
+        std::env::remove_var(u64var);
+    }
+
+    // ── task-local class propagation ───────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_class_sets_inherits_but_does_not_cross_spawn() {
+        // No scope ⇒ no class (an on-demand block read).
+        assert_eq!(current_class(), None);
+
+        with_class(IoClass::Flush, async {
+            assert_eq!(current_class(), Some(IoClass::Flush));
+            // Inherited by a child future polled on the *same* task.
+            let inner = async { current_class() }.await;
+            assert_eq!(inner, Some(IoClass::Flush));
+
+            // A nested scope overrides, then restores on exit.
+            with_class(IoClass::Warmup, async {
+                assert_eq!(current_class(), Some(IoClass::Warmup));
+            })
+            .await;
+            assert_eq!(current_class(), Some(IoClass::Flush));
+
+            // NOT inherited across tokio::spawn (a fresh task has no scope).
+            let spawned = tokio::spawn(async { current_class() }).await.unwrap();
+            assert_eq!(spawned, None, "class must not leak across spawn");
+        })
+        .await;
+
+        assert_eq!(current_class(), None, "class is cleared after the scope");
+    }
+
+    // ── per-direction concurrency ceiling ──────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_direction_ceiling_caps_one_direction_below_shared_budget() {
+        // Shared budget is 8, but downloads are limited to 2: even flooding 8
+        // download jobs, at most 2 run at once (the per-direction worker pool,
+        // not the shared semaphore, is the binding limit here).
+        let gw = Arc::new(AzureIoGateway::new(cfg_total(8, 2, 8, 0, 0)));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let gw = gw.clone();
+            let inflight = inflight.clone();
+            let max_seen = max_seen.clone();
+            tasks.push(tokio::spawn(async move {
+                gw.download(IoClass::ForegroundRead, 0, async move {
+                    let n = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(n, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            2,
+            "download_concurrency must cap downloads below the shared budget"
+        );
+    }
+
+    // ── download-side priority (complement to the upload-side test) ─────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn download_foreground_read_preempts_queued_warmup() {
+        let gw = Arc::new(AzureIoGateway::new(cfg(1, 1, 0, 0)));
+        let order = Arc::new(tokio::sync::Mutex::new(Vec::<&'static str>::new()));
+
+        // Occupy the single download worker.
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let blocker = {
+            let gw = gw.clone();
+            tokio::spawn(async move {
+                gw.download(IoClass::ForegroundRead, 0, async move {
+                    let _ = release_rx.await;
+                })
+                .await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Queue several low-priority warm-up reads behind the blocker.
+        let mut lows = Vec::new();
+        for _ in 0..4 {
+            let gw = gw.clone();
+            let order = order.clone();
+            lows.push(tokio::spawn(async move {
+                gw.download(IoClass::Warmup, 0, async move {
+                    order.lock().await.push("warmup");
+                })
+                .await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // A foreground read enters the non-empty queue last but must run first.
+        let high = {
+            let gw = gw.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                gw.download(IoClass::ForegroundRead, 0, async move {
+                    order.lock().await.push("foreground");
+                })
+                .await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        high.await.unwrap();
+        for l in lows {
+            l.await.unwrap();
+        }
+
+        let order = order.lock().await;
+        assert_eq!(
+            order[0], "foreground",
+            "foreground read must precede queued warm-ups: {order:?}"
+        );
+    }
+
+    // ── bandwidth: unlimited & cross-direction independence ─────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unlimited_bandwidth_does_not_pace() {
+        // bps == 0 ⇒ no limiter; a large transfer completes promptly.
+        let gw = AzureIoGateway::new(cfg(4, 4, 0, 0));
+        let start = Instant::now();
+        gw.upload(IoClass::Flush, 64 * MAX_PAGE_REQUEST_BYTES, async {})
+            .await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "unlimited bandwidth must not pace, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn download_bandwidth_limit_does_not_throttle_uploads() {
+        // Only the download direction is rate-limited; an upload of the same
+        // (large) size must not be paced by the download limiter.
+        let bps = 8 * 1024; // tiny download ceiling
+        let gw = AzureIoGateway::new(cfg(2, 2, bps, 0));
+        let start = Instant::now();
+        gw.upload(IoClass::Flush, 16 * MAX_PAGE_REQUEST_BYTES, async {})
+            .await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "upload must be unaffected by the download bandwidth limit, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    // ── config auto-sizing from the environment ────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_uses_cpu_count_and_honours_env_overrides() {
+        // Defaults (vars unset): shared budget == cpu_count, per-direction
+        // ceilings default to it, bandwidth unlimited.
+        for v in [
+            "UBLK_IO_CONCURRENCY",
+            "UBLK_DOWNLOAD_CONCURRENCY",
+            "UBLK_UPLOAD_CONCURRENCY",
+            "UBLK_DOWNLOAD_BANDWIDTH",
+            "UBLK_UPLOAD_BANDWIDTH",
+        ] {
+            std::env::remove_var(v);
+        }
+        let d = IoGatewayConfig::auto();
+        assert_eq!(d.concurrency, cpu_count().max(1));
+        assert_eq!(d.download_concurrency, d.concurrency);
+        assert_eq!(d.upload_concurrency, d.concurrency);
+        assert_eq!(d.download_bandwidth_bps, 0);
+        assert_eq!(d.upload_bandwidth_bps, 0);
+
+        // Explicit overrides are honoured; a 0 concurrency is treated as unset.
+        std::env::set_var("UBLK_IO_CONCURRENCY", "64");
+        std::env::set_var("UBLK_DOWNLOAD_CONCURRENCY", "0"); // unset → falls back
+        std::env::set_var("UBLK_UPLOAD_CONCURRENCY", "16");
+        std::env::set_var("UBLK_DOWNLOAD_BANDWIDTH", "1048576");
+        let o = IoGatewayConfig::auto();
+        assert_eq!(o.concurrency, 64);
+        assert_eq!(o.download_concurrency, 64, "0 falls back to shared budget");
+        assert_eq!(o.upload_concurrency, 16);
+        assert_eq!(o.download_bandwidth_bps, 1048576);
+        assert_eq!(o.upload_bandwidth_bps, 0);
+        for v in [
+            "UBLK_IO_CONCURRENCY",
+            "UBLK_DOWNLOAD_CONCURRENCY",
+            "UBLK_UPLOAD_CONCURRENCY",
+            "UBLK_DOWNLOAD_BANDWIDTH",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
+
+    // ── end-to-end mixed workload ──────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn e2e_mixed_workload_respects_shared_budget_and_completes() {
+        // Flood both directions with all four I/O classes at once against a
+        // shared budget of 3, with the upload direction additionally rate
+        // limited. Invariants checked end-to-end:
+        //   * combined download+upload in-flight never exceeds the shared budget,
+        //   * every submitted job runs exactly once and returns its own value.
+        let gw = Arc::new(AzureIoGateway::new(cfg_total(3, 3, 3, 0, 64 * 1024)));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let classes = [
+            IoClass::ForegroundRead,
+            IoClass::Flush,
+            IoClass::Copy,
+            IoClass::Warmup,
+        ];
+        let mut tasks = Vec::new();
+        for i in 0..40u32 {
+            let gw = gw.clone();
+            let inflight = inflight.clone();
+            let max_seen = max_seen.clone();
+            let completed = completed.clone();
+            let class = classes[(i as usize) % classes.len()];
+            tasks.push(tokio::spawn(async move {
+                let body = {
+                    let inflight = inflight.clone();
+                    let max_seen = max_seen.clone();
+                    let completed = completed.clone();
+                    async move {
+                        let n = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(n, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        inflight.fetch_sub(1, Ordering::SeqCst);
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        i
+                    }
+                };
+                // Alternate directions; uploads carry a byte cost (rate limited).
+                if i % 2 == 0 {
+                    gw.download(class, 256, body).await
+                } else {
+                    gw.upload(class, 256, body).await
+                }
+            }));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for t in tasks {
+            seen.insert(t.await.unwrap());
+        }
+        assert_eq!(seen.len(), 40, "every job must run exactly once");
+        assert_eq!(completed.load(Ordering::SeqCst), 40);
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 3,
+            "combined in-flight must never exceed the shared budget, saw {}",
+            max_seen.load(Ordering::SeqCst)
+        );
+    }
 }
