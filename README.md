@@ -242,6 +242,53 @@ in NBD mode. The local-disk / write-back cache options behave identically.
 
 ---
 
+## Building an image from a folder or Docker image
+
+To **pre-seed** a blob with data (instead of writing to it live through the
+device), build an `ext4` filesystem image locally and upload it to the page
+blob. The image then mounts read/write through `run` / NBD like any other blob.
+
+Build the image with [`virt-make-fs`](https://libguestfs.org/virt-make-fs.1.html)
+(from `libguestfs-tools`). It takes a directory **or a tar stream**, sizes the
+filesystem automatically (`--size=+N` adds headroom), and needs **no root and no
+loop mount**:
+
+```bash
+# From an existing folder
+virt-make-fs --type=ext4 --format=raw --size=+1G ./mydir image.raw
+
+# From a Docker image's root filesystem (stream its export straight in)
+cid=$(docker create registry.example.com/org/myimage:tag)
+docker export "$cid" | virt-make-fs --type=ext4 --format=raw --size=+2G - image.raw
+docker rm "$cid"
+```
+
+Then upload `image.raw` as a **page blob**. Because each page write is a separate
+PutPage round-trip, a parallel uploader such as
+[`azcopy`](https://learn.microsoft.com/azure/storage/common/storage-use-azcopy-v10)
+is dramatically faster than streaming through the device — it also skips the
+all-zero ranges of a sparse image:
+
+```bash
+azcopy copy image.raw \
+  "https://<account>.blob.core.windows.net/<container>/<blob>" \
+  --blob-type PageBlob --overwrite=true
+```
+
+Serve it afterwards with a normal `run` (or NBD) against the same `<blob>`.
+
+> **Tips**
+> - The page blob size must be a multiple of 512 bytes; `virt-make-fs` raw
+>   images already satisfy this.
+> - Run `virt-make-fs` as **root** (or via `sudo`) if you need the source
+>   files' original ownership/permissions preserved in the image (e.g. a
+>   container root filesystem).
+> - Lighter alternative without libguestfs: `mkfs.ext4 -d <dir> image.raw
+>   <size>` (from `e2fsprogs`) populates an ext4 image from a directory at
+>   creation time, but you must specify the size yourself.
+
+---
+
 ## Environment variables
 
 Common CLI flags have environment-variable equivalents:
