@@ -1,0 +1,55 @@
+# ublk-azblob quick-start: mount an Azure Page Blob as a local disk.
+#
+#   docker compose up --build
+#
+# Brings up:
+#   * azurite     — a local stand-in for Azure Blob Storage (the "remote").
+#   * ublk-azblob — provisions a page blob in Azurite, exposes it as a block
+#                   device (ublk preferred, NBD fallback) and mounts it.
+#
+# Requirements on the HOST: Linux with `ublk_drv` (preferred) or `nbd` loaded:
+#   sudo modprobe ublk_drv   # or: sudo modprobe nbd
+#
+# To point at REAL Azure instead of Azurite, set UBLK_BLOB_URL to your blob and
+# provide credentials (AZURE_STORAGE_SAS or AZURE_STORAGE_KEY) in the
+# environment, then `docker compose up ublk-azblob` (skip the azurite service).
+name: ublk-azblob-quickstart
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000", "--loose", "--skipApiVersionCheck"]
+    ports:
+      - "10000:10000"
+    # "mount a dir to azurite": persist the emulator's blobs to ./azurite-data
+    # so the page blob survives `docker compose down` and restarts.
+    volumes:
+      - ./azurite-data:/data
+    working_dir: /data
+
+  ublk-azblob:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    image: ghcr.io/tg123/ublk-azblob:latest
+    # Start after Azurite's container is up; mount-demo.sh then waits for the
+    # blob endpoint to actually accept connections before provisioning.
+    depends_on:
+      - azurite
+    # ublk/NBD create kernel block devices on the host, so the container needs
+    # privileged access to /dev and the host's loaded kernel modules.
+    privileged: true
+    volumes:
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+      - ./mount-demo.sh:/quickstart/mount-demo.sh:ro
+      # The disk is mounted *inside* the container at /mnt/azblob. Browse it with:
+      #   docker compose exec ublk-azblob ls -la /mnt/azblob
+    environment:
+      # Azurite's well-known development account + endpoint (subdomain-less form).
+      UBLK_BLOB_URL: "http://azurite:10000/devstoreaccount1/demo/disk.img"
+      AZURE_STORAGE_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+      DISK_SIZE: "268435456" # 256 MiB
+    entrypoint: ["/bin/bash", "/quickstart/mount-demo.sh"]
+    # Keep the container attached to the host's device namespace lifetime.
+    restart: "no"
