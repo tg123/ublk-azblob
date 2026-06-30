@@ -26,6 +26,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up QEMU
+        # Only the small runtime stage (`apt-get install` of mkfs/mount tools)
+        # runs emulated for the foreign arch. The expensive Rust compile is
+        # cross-compiled on the native amd64 builder via cargo-zigbuild
+        # (deploy/Dockerfile pins the builder to $BUILDPLATFORM), so it is not
+        # emulated.
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
