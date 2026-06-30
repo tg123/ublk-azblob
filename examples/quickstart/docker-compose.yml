@@ -46,10 +46,15 @@ services:
       # The disk is mounted *inside* the container at /mnt/azblob. Browse it with:
       #   docker compose exec ublk-azblob ls -la /mnt/azblob
     environment:
-      # Azurite's well-known development account + endpoint (subdomain-less form).
-      UBLK_BLOB_URL: "http://azurite:10000/devstoreaccount1/demo/disk.img"
-      AZURE_STORAGE_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-      DISK_SIZE: "268435456" # 256 MiB
+      # Defaults target Azurite (well-known dev account). Export any of these in
+      # your shell to override — e.g. point UBLK_BLOB_URL at a real Azure blob.
+      - "UBLK_BLOB_URL=${UBLK_BLOB_URL:-http://azurite:10000/devstoreaccount1/demo/disk.img}"
+      - "AZURE_STORAGE_KEY=${AZURE_STORAGE_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}"
+      - "DISK_SIZE=${DISK_SIZE:-268435456}" # 256 MiB
+      # Pass a SAS token through from the host ONLY when it is set; a bare key
+      # leaves the var unset (not empty) so the default SharedKey demo still works.
+      # A set SAS takes priority over the account key (see auth order).
+      - "AZURE_STORAGE_SAS"
     entrypoint: ["/bin/bash", "/quickstart/mount-demo.sh"]
     # Keep the container attached to the host's device namespace lifetime.
     restart: "no"

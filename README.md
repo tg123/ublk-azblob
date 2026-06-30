@@ -384,8 +384,9 @@ For performance the I/O stack normally runs a **write-back buffer**
 in memory, are coalesced per page, and are flushed to the inner backend
 asynchronously — on an idle timer, when the dirty set exceeds a bound, or on an
 explicit `flush()` (driven by the device's FLUSH/FUA path and by teardown). The
-buffer doubles as a read cache with LRU eviction of clean pages. Pass
-`--no-default-features` / disable buffering to fall back to pure write-through.
+buffer doubles as a read cache with LRU eviction of clean pages. Set
+`--page-size 0` (env `UBLK_PAGE_SIZE=0`) to disable buffering and fall back to
+pure write-through at runtime.
 
 Durability across a crash is preserved by the persistent local-disk cache, not
 the in-memory buffer: dirty pages are recorded in the on-disk `dirty` bitmap

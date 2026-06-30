@@ -37,7 +37,14 @@ trap cleanup INT TERM EXIT
 # ── 1. Wait for the blob endpoint (Azurite) to accept connections ─────────────
 endpoint_host="$(printf '%s' "$BLOB_URL" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')"
 endpoint_port="$(printf '%s' "$BLOB_URL" | sed -nE 's#^[a-z]+://[^/:]+:([0-9]+).*#\1#p')"
-endpoint_port="${endpoint_port:-10000}"
+if [ -z "$endpoint_port" ]; then
+  # No explicit port: default by scheme (real Azure is https:443) so we don't
+  # spin for 60s probing Azurite's 10000 against a real account.
+  case "$BLOB_URL" in
+    https://*) endpoint_port=443 ;;
+    *)         endpoint_port=80 ;;
+  esac
+fi
 log "waiting for blob endpoint ${endpoint_host}:${endpoint_port} ..."
 for _ in $(seq 1 60); do
   if (exec 3<>"/dev/tcp/${endpoint_host}/${endpoint_port}") 2>/dev/null; then
