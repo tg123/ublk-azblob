@@ -1223,7 +1223,8 @@ impl BlobBackend for FileCacheBackend {
 
     async fn flush(&self) -> anyhow::Result<()> {
         // Snapshot the set of dirty pages under a brief lock, then upload them to
-        // the inner backend *concurrently* (bounded by CACHE_FLUSH_CONCURRENCY).
+        // the inner backend *concurrently*, fanned out to
+        // `cpu_count().max(CACHE_FLUSH_MIN_CONCURRENCY)` in-flight uploads.
         // Each upload reads its page bytes under a short lock, performs the slow
         // Azure round-trip with the lock released, then re-acquires the lock to
         // clear the dirty bit — but only if the page was not re-written in the
@@ -1802,6 +1803,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_write_during_flush_keeps_page_dirty() {
+        // Regression test for the `dirty_gen` race that this backend's concurrent
+        // flush relies on: a write that lands while a page's upload is in flight
+        // must keep the page dirty so the newer value is re-flushed later, never
+        // silently dropped when the in-flight upload clears the dirty bit.
+        let dir = tmp_dir("flushrace");
+        let mem = Arc::new(MemBackend::new(512).unwrap());
+        let blk = BlockingBackend::new(mem.clone());
+        let (b, _) = open(blk.clone(), &dir, 512, 512);
+
+        // First write → page 0 dirty (generation 1).
+        b.write(0, Bytes::from(vec![0x01; 512])).await.unwrap();
+        assert_eq!(b.dirty_count().await, 1);
+
+        // Flush concurrently with a write injected *while the upload of the old
+        // value is paused mid-flight* (BlockingBackend pauses the first upload).
+        let flush = b.flush();
+        let inject = async {
+            blk.started.notified().await; // upload is now in flight (paused)
+            b.write(0, Bytes::from(vec![0x02; 512])).await.unwrap(); // re-dirty (gen 2)
+            blk.unblock_future_writes(); // the re-flush must complete normally
+            blk.release(); // let the paused upload of the OLD value finish
+        };
+        let (flush_res, ()) = tokio::join!(flush, inject);
+        flush_res.unwrap();
+
+        // The page was re-written during the upload, so it must remain dirty.
+        assert_eq!(
+            b.dirty_count().await,
+            1,
+            "page re-dirtied mid-flush must stay dirty"
+        );
+
+        // A second flush (no concurrent write) drains the latest value.
+        b.flush().await.unwrap();
+        assert_eq!(b.dirty_count().await, 0);
+        assert_eq!(
+            mem.read(0, 512).await.unwrap(),
+            Bytes::from(vec![0x02; 512]),
+            "the newest value must reach the inner backend"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn write_to_last_short_page() {
         // dev_size (2560) is not a multiple of page_size (1024): the last page
         // is a short 512-byte page.  Writing it must flush only its valid bytes.
@@ -2338,6 +2384,67 @@ mod tests {
             self.inner.read(offset, len).await
         }
         async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+    }
+
+    /// A `BlobBackend` decorator whose `write` can be paused mid-flush. While
+    /// `blocking` is set, the first upload signals `started` and then waits on
+    /// `gate` until the test releases it, so a concurrent cache write can be
+    /// injected while the upload is in flight — exercising the `dirty_gen` race
+    /// in [`FileCacheBackend::flush`]. Reads and other ops are delegated as-is.
+    struct BlockingBackend {
+        inner: Arc<dyn BlobBackend>,
+        started: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
+        blocking: std::sync::atomic::AtomicBool,
+    }
+
+    impl BlockingBackend {
+        fn new(inner: Arc<dyn BlobBackend>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                started: tokio::sync::Notify::new(),
+                gate: tokio::sync::Semaphore::new(0),
+                blocking: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+        /// Stop pausing subsequent writes (so the re-flush completes normally).
+        fn unblock_future_writes(&self) {
+            self.blocking
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Let the currently-paused in-flight upload proceed.
+        fn release(&self) {
+            self.gate.add_permits(1);
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for BlockingBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            if self.blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                self.started.notify_one();
+                self.gate.acquire().await.unwrap().forget();
+            }
             self.inner.write(offset, data).await
         }
         async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {

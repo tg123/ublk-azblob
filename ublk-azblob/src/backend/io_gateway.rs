@@ -226,28 +226,38 @@ impl IoGatewayConfig {
     /// matching the CLI flags — which take precedence over these defaults when
     /// explicitly provided (see `main.rs`).
     pub fn auto() -> Self {
+        Self::from_env(|name| std::env::var(name).ok())
+    }
+
+    /// Build the config from an arbitrary environment lookup. `auto` wires this
+    /// to the process environment; tests pass an in-memory map so they never
+    /// mutate the process-global environment (`set_var`/`remove_var` are not
+    /// thread-safe with respect to concurrent env reads under parallel
+    /// `cargo test`).
+    fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
         let cpu = cpu_count().max(1);
-        let concurrency = env_usize("UBLK_IO_CONCURRENCY").unwrap_or(cpu);
+        let concurrency = parse_pos_usize(get("UBLK_IO_CONCURRENCY")).unwrap_or(cpu);
         Self {
             concurrency,
-            download_concurrency: env_usize("UBLK_DOWNLOAD_CONCURRENCY").unwrap_or(concurrency),
-            upload_concurrency: env_usize("UBLK_UPLOAD_CONCURRENCY").unwrap_or(concurrency),
-            download_bandwidth_bps: env_u64("UBLK_DOWNLOAD_BANDWIDTH").unwrap_or(0),
-            upload_bandwidth_bps: env_u64("UBLK_UPLOAD_BANDWIDTH").unwrap_or(0),
+            download_concurrency: parse_pos_usize(get("UBLK_DOWNLOAD_CONCURRENCY"))
+                .unwrap_or(concurrency),
+            upload_concurrency: parse_pos_usize(get("UBLK_UPLOAD_CONCURRENCY"))
+                .unwrap_or(concurrency),
+            download_bandwidth_bps: parse_u64(get("UBLK_DOWNLOAD_BANDWIDTH")).unwrap_or(0),
+            upload_bandwidth_bps: parse_u64(get("UBLK_UPLOAD_BANDWIDTH")).unwrap_or(0),
         }
     }
 }
 
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()?
-        .parse::<usize>()
-        .ok()
-        .filter(|&n| n > 0)
+/// Parse a positive `usize` from an optional env value; `0`, empty, and
+/// unparsable values are treated as unset (`None`).
+fn parse_pos_usize(val: Option<String>) -> Option<usize> {
+    val?.parse::<usize>().ok().filter(|&n| n > 0)
 }
 
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.parse::<u64>().ok()
+/// Parse a `u64` from an optional env value; `0` is a valid value (unlimited).
+fn parse_u64(val: Option<String>) -> Option<u64> {
+    val?.parse::<u64>().ok()
 }
 
 /// Process-wide Azure I/O gateway. Cheap to clone (`Arc` internally via the
@@ -704,28 +714,20 @@ mod tests {
 
     #[test]
     fn env_helpers_parse_and_filter() {
-        // Unique per-test var names so this never races other tests' env.
-        let uvar = "UBLK_TEST_ENV_USIZE_8131";
-        let u64var = "UBLK_TEST_ENV_U64_8131";
+        // Pure parsers — no process-global env mutation, so this can't race.
+        assert_eq!(parse_pos_usize(None), None, "unset → None");
+        assert_eq!(
+            parse_pos_usize(Some("0".into())),
+            None,
+            "0 is treated as unset"
+        );
+        assert_eq!(parse_pos_usize(Some("nope".into())), None, "garbage → None");
+        assert_eq!(parse_pos_usize(Some("128".into())), Some(128));
 
-        std::env::remove_var(uvar);
-        assert_eq!(env_usize(uvar), None, "unset → None");
-        std::env::set_var(uvar, "0");
-        assert_eq!(env_usize(uvar), None, "0 is treated as unset");
-        std::env::set_var(uvar, "not-a-number");
-        assert_eq!(env_usize(uvar), None, "garbage → None");
-        std::env::set_var(uvar, "128");
-        assert_eq!(env_usize(uvar), Some(128));
-        std::env::remove_var(uvar);
-
-        std::env::remove_var(u64var);
-        assert_eq!(env_u64(u64var), None);
-        // 0 is a *valid* u64 here (unlimited bandwidth), unlike env_usize.
-        std::env::set_var(u64var, "0");
-        assert_eq!(env_u64(u64var), Some(0));
-        std::env::set_var(u64var, "1048576");
-        assert_eq!(env_u64(u64var), Some(1048576));
-        std::env::remove_var(u64var);
+        assert_eq!(parse_u64(None), None);
+        // 0 is a *valid* u64 here (unlimited bandwidth), unlike parse_pos_usize.
+        assert_eq!(parse_u64(Some("0".into())), Some(0));
+        assert_eq!(parse_u64(Some("1048576".into())), Some(1048576));
     }
 
     // ── task-local class propagation ───────────────────────────────────────
@@ -887,20 +889,12 @@ mod tests {
 
     // ── config auto-sizing from the environment ────────────────────────────
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn auto_uses_cpu_count_and_honours_env_overrides() {
-        // Defaults (vars unset): shared budget == cpu_count, per-direction
-        // ceilings default to it, bandwidth unlimited.
-        for v in [
-            "UBLK_IO_CONCURRENCY",
-            "UBLK_DOWNLOAD_CONCURRENCY",
-            "UBLK_UPLOAD_CONCURRENCY",
-            "UBLK_DOWNLOAD_BANDWIDTH",
-            "UBLK_UPLOAD_BANDWIDTH",
-        ] {
-            std::env::remove_var(v);
-        }
-        let d = IoGatewayConfig::auto();
+    #[test]
+    fn auto_uses_cpu_count_and_honours_env_overrides() {
+        // Defaults (nothing set): shared budget == cpu_count, per-direction
+        // ceilings default to it, bandwidth unlimited. Using `from_env` with an
+        // empty lookup keeps this deterministic and never touches process env.
+        let d = IoGatewayConfig::from_env(|_| None);
         assert_eq!(d.concurrency, cpu_count().max(1));
         assert_eq!(d.download_concurrency, d.concurrency);
         assert_eq!(d.upload_concurrency, d.concurrency);
@@ -908,24 +902,18 @@ mod tests {
         assert_eq!(d.upload_bandwidth_bps, 0);
 
         // Explicit overrides are honoured; a 0 concurrency is treated as unset.
-        std::env::set_var("UBLK_IO_CONCURRENCY", "64");
-        std::env::set_var("UBLK_DOWNLOAD_CONCURRENCY", "0"); // unset → falls back
-        std::env::set_var("UBLK_UPLOAD_CONCURRENCY", "16");
-        std::env::set_var("UBLK_DOWNLOAD_BANDWIDTH", "1048576");
-        let o = IoGatewayConfig::auto();
+        let overrides = std::collections::HashMap::from([
+            ("UBLK_IO_CONCURRENCY", "64"),
+            ("UBLK_DOWNLOAD_CONCURRENCY", "0"), // unset → falls back
+            ("UBLK_UPLOAD_CONCURRENCY", "16"),
+            ("UBLK_DOWNLOAD_BANDWIDTH", "1048576"),
+        ]);
+        let o = IoGatewayConfig::from_env(|name| overrides.get(name).map(|s| s.to_string()));
         assert_eq!(o.concurrency, 64);
         assert_eq!(o.download_concurrency, 64, "0 falls back to shared budget");
         assert_eq!(o.upload_concurrency, 16);
         assert_eq!(o.download_bandwidth_bps, 1048576);
         assert_eq!(o.upload_bandwidth_bps, 0);
-        for v in [
-            "UBLK_IO_CONCURRENCY",
-            "UBLK_DOWNLOAD_CONCURRENCY",
-            "UBLK_UPLOAD_CONCURRENCY",
-            "UBLK_DOWNLOAD_BANDWIDTH",
-        ] {
-            std::env::remove_var(v);
-        }
     }
 
     // ── end-to-end mixed workload ──────────────────────────────────────────
