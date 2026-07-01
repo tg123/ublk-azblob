@@ -1,0 +1,123 @@
+name: release
+
+# Builds fully-static (musl) `ublk-azblob` binaries for linux/amd64 and
+# linux/arm64 and publishes them as downloadable assets on the GitHub Release.
+#
+# The binaries come straight out of `deploy/Dockerfile` (its `binary` stage), so
+# the exact same fully-static musl build that ships in the container image is
+# reused here — no separate build recipe to keep in sync.
+#
+# Triggered automatically when a `v*` tag is pushed, or manually via
+# workflow_dispatch (handy for testing — assets are then attached to a
+# pre-release named after the chosen tag, or just built as artifacts).
+#
+# The binaries are statically linked against musl libc (no glibc, no shared
+# objects), so they run on any modern x86-64 / aarch64 Linux host without
+# installing a runtime. Verify with `ldd ublk-azblob` -> "not a dynamic
+# executable".
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build static ${{ matrix.target }}
+    # Both targets build on an amd64 runner and cross-compile via
+    # deploy/Dockerfile's `binary` stage (zig/cargo-zigbuild — no emulated
+    # compile). Building both arches the *same way* the multi-arch image is
+    # built (cross-from-amd64 in docker.yml) guarantees each release tarball is
+    # byte-for-byte identical to the binary shipped in the published image.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Registers binfmt so buildx accepts the linux/arm64 platform. The actual
+      # Rust compile is cross-compiled on the native amd64 builder (the builder
+      # stage is pinned to $BUILDPLATFORM) and the `binary` stage is `scratch`
+      # with no foreign-arch RUN, so nothing is emulated here.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build fully-static binary via Dockerfile
+        run: |
+          # Reuse the exact fully-static (musl) build from deploy/Dockerfile via
+          # its `binary` stage, exporting just the binary to ./dist-bin.  The
+          # cross-compile runs on the native amd64 builder (no QEMU compile).
+          docker buildx build \
+            --file deploy/Dockerfile \
+            --target binary \
+            --platform ${{ matrix.platform }} \
+            --output type=local,dest=dist-bin \
+            .
+
+      - name: Package
+        id: package
+        run: |
+          bin=dist-bin/ublk-azblob
+          # Confirm it really is a fully-static binary; fail otherwise. Use
+          # `file` (reads the ELF header) rather than `ldd` — the arm64 artifact
+          # is cross-built on this amd64 runner, so `ldd` cannot load it.
+          file "$bin"
+          file "$bin" | grep -qiE "static-pie linked|statically linked" || \
+            { echo "::error::binary is not statically linked"; exit 1; }
+          file "$bin" | grep -qi "interpreter" && \
+            { echo "::error::binary has an ELF interpreter (not static)"; exit 1; } || true
+          # NOTE: do not strip here — the release profile already strips at build
+          # time, so this binary is byte-for-byte identical to the one the
+          # published Docker image ships (both come from the same `binary` stage).
+
+          name="ublk-azblob-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "$bin" "dist/$name/ublk-azblob"
+          cp README.md LICENSE.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
+          echo "asset=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ublk-azblob-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  release:
+    name: publish to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
