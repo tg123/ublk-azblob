@@ -678,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
                         lease_namespace.clone(),
                         lease_name.clone(),
                         lease_holder.clone(),
+                        recover,
                     )
                     .await
                     .context("acquire blob lock")?,
@@ -1136,6 +1137,7 @@ async fn acquire_lock(
     lease_namespace: Option<String>,
     lease_name: Option<String>,
     lease_holder: Option<String>,
+    recover: bool,
 ) -> anyhow::Result<coordination::CoordinationGuard> {
     use coordination::{CoordinationConfig, Coordinator};
     use std::time::Duration;
@@ -1177,7 +1179,9 @@ async fn acquire_lock(
         None
     };
 
-    Coordinator::new(cluster, blob_lock, config).acquire().await
+    Coordinator::new(cluster, blob_lock, config)
+        .acquire(recover)
+        .await
 }
 
 /// Connect to the Kubernetes cluster lease used by `--coordination`.  Requires
