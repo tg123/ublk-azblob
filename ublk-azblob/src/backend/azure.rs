@@ -59,25 +59,21 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
-    fn from_env() -> Self {
+    fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
         let d = Self::default();
-        let attempts = std::env::var("UBLK_AZURE_RETRY_ATTEMPTS")
-            .ok()
+        let attempts = get("UBLK_AZURE_RETRY_ATTEMPTS")
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(d.attempts);
-        let base = std::env::var("UBLK_AZURE_RETRY_BASE_MS")
-            .ok()
+        let base = get("UBLK_AZURE_RETRY_BASE_MS")
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or(d.base);
-        let max = std::env::var("UBLK_AZURE_RETRY_MAX_MS")
-            .ok()
+        let max = get("UBLK_AZURE_RETRY_MAX_MS")
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or(d.max);
-        let codes = std::env::var("UBLK_AZURE_RETRY_CODES")
-            .ok()
+        let codes = get("UBLK_AZURE_RETRY_CODES")
             .map(|v| {
                 v.split(',')
                     .map(|s| s.trim().to_string())
@@ -98,7 +94,7 @@ impl RetryConfig {
 /// Process-wide retry config, resolved from the environment on first use.
 fn retry_config() -> &'static RetryConfig {
     static CFG: OnceLock<RetryConfig> = OnceLock::new();
-    CFG.get_or_init(RetryConfig::from_env)
+    CFG.get_or_init(|| RetryConfig::from_env(|name| std::env::var(name).ok()))
 }
 
 /// Whether an HTTP status `code` matches a configured pattern: an exact code
@@ -1059,37 +1055,26 @@ mod tests {
 
     #[test]
     fn retry_config_from_env_defaults_and_overrides() {
-        // Defaults when unset.
-        for k in [
-            "UBLK_AZURE_RETRY_ATTEMPTS",
-            "UBLK_AZURE_RETRY_BASE_MS",
-            "UBLK_AZURE_RETRY_MAX_MS",
-            "UBLK_AZURE_RETRY_CODES",
-        ] {
-            std::env::remove_var(k);
-        }
-        let d = RetryConfig::from_env();
+        // Defaults when the getter returns nothing (no process-env mutation).
+        let d = RetryConfig::from_env(|_| None);
         assert_eq!(d.attempts, 20, "default max attempts is 20");
         assert_eq!(d.base, std::time::Duration::from_millis(200));
         assert_eq!(d.codes, vec!["408", "429", "5*"]);
 
-        std::env::set_var("UBLK_AZURE_RETRY_ATTEMPTS", "7");
-        std::env::set_var("UBLK_AZURE_RETRY_BASE_MS", "50");
-        std::env::set_var("UBLK_AZURE_RETRY_MAX_MS", "1000");
-        std::env::set_var("UBLK_AZURE_RETRY_CODES", "500, 5* , 40*");
-        let o = RetryConfig::from_env();
+        // Overrides supplied through an in-memory map.
+        let m: std::collections::HashMap<&str, &str> = [
+            ("UBLK_AZURE_RETRY_ATTEMPTS", "7"),
+            ("UBLK_AZURE_RETRY_BASE_MS", "50"),
+            ("UBLK_AZURE_RETRY_MAX_MS", "1000"),
+            ("UBLK_AZURE_RETRY_CODES", "500, 5* , 40*"),
+        ]
+        .into_iter()
+        .collect();
+        let o = RetryConfig::from_env(|n| m.get(n).map(|s| s.to_string()));
         assert_eq!(o.attempts, 7);
         assert_eq!(o.base, std::time::Duration::from_millis(50));
         assert_eq!(o.max, std::time::Duration::from_millis(1000));
         assert_eq!(o.codes, vec!["500", "5*", "40*"]);
-        for k in [
-            "UBLK_AZURE_RETRY_ATTEMPTS",
-            "UBLK_AZURE_RETRY_BASE_MS",
-            "UBLK_AZURE_RETRY_MAX_MS",
-            "UBLK_AZURE_RETRY_CODES",
-        ] {
-            std::env::remove_var(k);
-        }
     }
 
     #[test]
