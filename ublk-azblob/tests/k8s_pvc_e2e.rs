@@ -12,13 +12,15 @@
 //!   4. run a reader Job that mounts the *same* PVC on a fresh device over
 //!      the existing page blob and verifies the SHA-256 still matches
 //!
-//! It then layers on four further checks: pod migration between nodes, two
+//! It then layers on further checks: pod migration between nodes, two
 //! disks co-located on one node, that — with the persistent local-disk cache
 //! enabled — the host-path cache survives a node-plugin pod restart and is
-//! revalidated (via the blob ETag) and reused rather than re-fetched, and that
+//! revalidated (via the blob ETag) and reused rather than re-fetched, that
 //! an ephemeral overlay steered onto a configured `overlayScratchDir` reads its
 //! immutable snapshot, writes pod-local files into that scratch base, and prunes
-//! the per-volume scratch on unpublish.
+//! the per-volume scratch on unpublish, and that a long-running pod keeps its
+//! existing mount working across a node-plugin restart (node-local restart
+//! safety) without the pod being recreated or the volume republished.
 //!
 //! This is the Kubernetes counterpart of `mount_e2e.rs` and proves the data
 //! survives provision → write → unmount → remount through the page blob.
@@ -355,6 +357,9 @@ stringData:
 
     // ── Test 5: ephemeral overlay with a configured `overlayScratchDir` ────────
     test_overlay_scratch_dir(&here);
+
+    // ── Test 6: a running pod keeps its mount across a node-plugin restart ──────
+    test_node_plugin_restart_keeps_mount();
 
     log("k8s PVC e2e PASSED ✓");
 }
@@ -912,6 +917,28 @@ fn pod_node(app: &str) -> Option<String> {
     s.split_whitespace().next().map(|n| n.to_string())
 }
 
+/// UID (`metadata.uid`) of the first pod carrying `app=<app>`, if any. Used to
+/// prove a pod is the *same* instance (not recreated) across an operation.
+fn pod_uid(app: &str) -> Option<String> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "pods",
+            "-l",
+            &format!("app={app}"),
+            "-o",
+            "jsonpath={.items[0].metadata.uid}",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Poll until no pods match `app=<app>` (or the timeout elapses, returning
 /// `false`).  Used to confirm a Job's pod is fully reaped — kubelet only removes
 /// a pod from the API after its volumes are unmounted (CSI `NodeUnpublishVolume`
@@ -1377,6 +1404,291 @@ spec:
     run(
         "kubectl",
         &["delete", "pvc", "azblob-pvc-cache", "--wait=true"],
+    );
+}
+
+/// Node-local restart safety: a pod that already has a volume mounted must keep
+/// using that mount across a node-plugin restart (crash, OOM kill, or DaemonSet
+/// upgrade) **without** the pod being recreated or the volume republished.
+///
+/// Unlike `test_local_cache_reload` (which restarts the plugin *between* two
+/// short-lived Jobs that each republish the PVC), this test keeps a single
+/// long-running consumer pod alive the whole time. The pod's mount points at a
+/// device (`/dev/ublkbN` for ublk, `/dev/nbdN` for NBD) whose userspace server
+/// is a child of the node-plugin pod. When that pod is deleted its container
+/// cgroup is SIGKILLed, so the server child dies abruptly:
+///
+/// * ublk — the kernel keeps `/dev/ublkbN` (it was created with
+///   `UBLK_F_USER_RECOVERY`), transitioning it to QUIESCED until the fresh
+///   node pod's `recover()` re-attaches via `run --recover --id N`.
+/// * NBD  — the fresh node pod re-spawns the server and `nbd-client`s it back
+///   onto the same `/dev/nbdN`.
+///
+/// Either way the mount's `major:minor` is unchanged, so the still-running pod's
+/// in-flight `/data` mount resumes once recovery completes. We prove this by
+/// `kubectl exec`-ing into the *same* pod after the restart and (a) re-reading a
+/// payload written before the restart and (b) writing a fresh payload — both
+/// must succeed against the recovered device.
+fn test_node_plugin_restart_keeps_mount() {
+    log("TEST 6: a running pod keeps its mount across a node-plugin restart (restart safety)");
+
+    // Pin the consumer to a node that is actually running the node-plugin
+    // DaemonSet: that node is schedulable (not a tainted control-plane node,
+    // which would leave the PVC unbound) and is exactly the plugin we bounce.
+    let nodes_out = Command::new("kubectl")
+        .args([
+            "get",
+            "pods",
+            "-n",
+            NS,
+            "-l",
+            "app=csi-ublk-azblob-node",
+            "-o",
+            "jsonpath={.items[*].spec.nodeName}",
+        ])
+        .output()
+        .expect("get node-plugin pods");
+    let nodes_str = String::from_utf8_lossy(&nodes_out.stdout);
+    let node = match nodes_str.split_whitespace().next() {
+        Some(n) => n.to_string(),
+        None => panic!("restart-safety test: no node-plugin (DaemonSet) pods found"),
+    };
+    log(&format!(
+        "pinning restart-safety consumer to node {node} (runs the node plugin)"
+    ));
+
+    // Dedicated PVC → dedicated device, so this never races the other sub-tests.
+    let pvc = r#"apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azblob-pvc-restart
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: azblob-ublk
+  resources:
+    requests:
+      storage: 256Mi
+"#;
+    log("creating PVC azblob-pvc-restart");
+    kubectl_apply_stdin(pvc);
+
+    // A long-running consumer pinned to `node`. It writes a payload + checksum
+    // once at startup, then `sleep`s forever keeping the mount open. The
+    // readiness gate (the `/data/payload.sha256` file) lets `kubectl wait
+    // --for=condition=ready` block until the initial write has flushed.
+    let app_yaml = format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azblob-restart-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: azblob-restart-app
+  template:
+    metadata:
+      labels:
+        app: azblob-restart-app
+    spec:
+      # Pin with nodeSelector, NOT spec.nodeName: the azblob-ublk StorageClass is
+      # WaitForFirstConsumer, so the scheduler must process this pod to stamp the
+      # PVC's selected-node annotation that triggers provisioning/binding.
+      # spec.nodeName bypasses the scheduler, so the PVC would stay unbound.
+      nodeSelector:
+        kubernetes.io/hostname: {node}
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ ! -f /data/payload.sha256 ]; then
+                echo "writing initial payload to /data"
+                dd if=/dev/urandom of=/data/payload bs=1M count=4
+                sha256sum /data/payload > /data/payload.sha256
+                sync
+              fi
+              echo "consumer ready; holding the mount open"
+              exec sleep 100000
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /data/payload.sha256"]
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: azblob-pvc-restart
+"#
+    );
+    log("deploying long-running consumer azblob-restart-app");
+    kubectl_apply_stdin(&app_yaml);
+    if !try_run(
+        "kubectl",
+        &[
+            "rollout",
+            "status",
+            "deployment/azblob-restart-app",
+            "--timeout=240s",
+        ],
+    ) {
+        dump_diagnostics("azblob-restart-app");
+        panic!("restart-safety consumer did not become ready");
+    }
+
+    // The pod actually scheduled where we pinned it (sanity + the node whose
+    // plugin we must bounce).
+    let app_node = pod_node("azblob-restart-app").unwrap_or_else(|| {
+        dump_diagnostics("azblob-restart-app");
+        panic!("could not determine the node the restart-safety consumer ran on");
+    });
+    log(&format!(
+        "restart-safety consumer is running on node {app_node}"
+    ));
+
+    // Capture the consumer pod's identity so we can prove the node-plugin restart
+    // does NOT recreate it — that is what distinguishes "the mount survived" from
+    // "the volume was re-published to a fresh pod".
+    let app_pod_uid = pod_uid("azblob-restart-app").unwrap_or_else(|| {
+        dump_diagnostics("azblob-restart-app");
+        panic!("could not read the restart-safety consumer pod uid")
+    });
+
+    // ── Restart ONLY the node-plugin pod on the consumer's node. The consumer
+    //    pod itself is untouched and keeps `/data` mounted the whole time. The
+    //    old server child is SIGKILLed with the node-pod cgroup → abrupt death →
+    //    recoverable device. ────────────────────────────────────────────────
+    let old_pod = node_plugin_pod_on(&app_node).unwrap_or_else(|| {
+        dump_diagnostics("azblob-restart-app");
+        panic!("no node-plugin pod found on {app_node}; cannot restart it")
+    });
+    log(&format!(
+        "restarting node plugin on {app_node} (pod {old_pod}) while the consumer keeps its mount"
+    ));
+    run(
+        "kubectl",
+        &["-n", NS, "delete", "pod", &old_pod, "--wait=true"],
+    );
+    // Wait for a fresh, Ready node pod — its `recover()` runs before the gRPC
+    // server (and thus the registrar) comes up, so a Ready rollout implies the
+    // device was re-attached.
+    if !try_run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "rollout",
+            "status",
+            "daemonset/csi-ublk-azblob-node",
+            "--timeout=180s",
+        ],
+    ) {
+        dump_diagnostics("azblob-restart-app");
+        panic!("node plugin DaemonSet did not roll a fresh Ready pod back after the restart");
+    }
+
+    // The consumer pod must be the SAME instance — if it were recreated, the test
+    // would only prove remount/re-publish, not that the live mount survived.
+    let app_pod_uid_after = pod_uid("azblob-restart-app").unwrap_or_else(|| {
+        dump_diagnostics("azblob-restart-app");
+        panic!("could not read the restart-safety consumer pod uid after the restart")
+    });
+    assert_eq!(
+        app_pod_uid, app_pod_uid_after,
+        "restart-safety consumer pod was recreated ({app_pod_uid} -> {app_pod_uid_after}); \
+         the test must validate the SAME running pod keeping its mount, not a republish"
+    );
+
+    // ── Verify the SAME still-running pod can still use its mount. We never
+    //    recreated the pod or republished the volume, so success here proves the
+    //    device + mount survived the node-plugin restart (recovery re-attached
+    //    it underneath the live mount). ───────────────────────────────────────
+    // (a) re-read the pre-restart payload through the recovered device.
+    log("verifying the pre-restart payload still reads back through the recovered device");
+    if !try_run(
+        "kubectl",
+        &[
+            "exec",
+            "deploy/azblob-restart-app",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cd /data && sha256sum -c payload.sha256",
+        ],
+    ) {
+        dump_diagnostics("azblob-restart-app");
+        let _ = try_run(
+            "kubectl",
+            &[
+                "-n",
+                NS,
+                "logs",
+                "-l",
+                "app=csi-ublk-azblob-node",
+                "--tail=80",
+            ],
+        );
+        panic!(
+            "the running pod could not re-read its volume after the node-plugin restart — \
+             the device/mount did not survive recovery"
+        );
+    }
+    // (b) write a fresh payload (write + sync + record checksum in one exec),
+    //     then read it back in a *separate* exec so the verification can't be
+    //     served from page cache of the same command chain — it must round-trip
+    //     through the recovered device.
+    log("verifying the recovered device accepts new durable writes from the running pod");
+    if !try_run(
+        "kubectl",
+        &[
+            "exec",
+            "deploy/azblob-restart-app",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cd /data && dd if=/dev/urandom of=after bs=1M count=1 && \
+             sha256sum after > after.sha256 && sync",
+        ],
+    ) {
+        dump_diagnostics("azblob-restart-app");
+        panic!(
+            "the running pod could not write to its volume after the node-plugin restart — \
+             the recovered device is not read-write"
+        );
+    }
+    if !try_run(
+        "kubectl",
+        &[
+            "exec",
+            "deploy/azblob-restart-app",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cd /data && sha256sum -c after.sha256",
+        ],
+    ) {
+        dump_diagnostics("azblob-restart-app");
+        panic!(
+            "the post-restart write did not round-trip through the recovered device — \
+             the recovered device is not durably read-write"
+        );
+    }
+    log("✓ Restart-safety test PASSED: the running pod kept its mount across the node-plugin restart");
+
+    // Cleanup
+    run(
+        "kubectl",
+        &["delete", "deployment", "azblob-restart-app", "--wait=true"],
+    );
+    run(
+        "kubectl",
+        &["delete", "pvc", "azblob-pvc-restart", "--wait=true"],
     );
 }
 

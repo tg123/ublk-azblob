@@ -424,6 +424,19 @@ enum Command {
         /// (`--nr-queues`, `--queue-depth`, `--id`) are ignored in this mode.
         #[arg(long, env = "NBD_LISTEN")]
         nbd: Option<String>,
+
+        /// Resume a volume after a node-local restart of this server (crash or
+        /// DaemonSet upgrade) without disrupting the kubelet's mount. Used by the
+        /// CSI node plugin.
+        ///
+        /// For **ublk** it re-attaches to the existing, quiesced device at `--id`
+        /// (user-recovery) instead of creating a new one (requires a concrete
+        /// `--id` >= 0). For **both ublk and NBD** it also authorises breaking and
+        /// taking over the stale blob lease the dead predecessor still holds (its
+        /// Azure lease outlives the process by up to 60s) — otherwise a fresh
+        /// process could not re-acquire the lock in single-process mode.
+        #[arg(long, env = "UBLK_RECOVER")]
+        recover: bool,
     },
 
     /// Just test the BlobBackend connection (write → read → clear → verify).
@@ -620,6 +633,7 @@ async fn main() -> anyhow::Result<()> {
             flush_io_timeout_secs,
             flush_concurrency,
             ref nbd,
+            recover,
         } => {
             let loc = cli.location()?;
             let auth = build_auth(&cli, &loc.account, loc.sas.as_deref())?;
@@ -669,6 +683,7 @@ async fn main() -> anyhow::Result<()> {
                         lease_namespace.clone(),
                         lease_name.clone(),
                         lease_holder.clone(),
+                        recover,
                     )
                     .await
                     .context("acquire blob lock")?,
@@ -839,6 +854,7 @@ async fn main() -> anyhow::Result<()> {
                 queue_depth,
                 id,
                 read_only,
+                recover,
             };
             let result = if let Some(addr) = nbd {
                 info!(addr = %addr, "starting NBD compatibility server");
@@ -1126,6 +1142,7 @@ async fn acquire_lock(
     lease_namespace: Option<String>,
     lease_name: Option<String>,
     lease_holder: Option<String>,
+    recover: bool,
 ) -> anyhow::Result<coordination::CoordinationGuard> {
     use coordination::{CoordinationConfig, Coordinator};
     use std::time::Duration;
@@ -1167,7 +1184,9 @@ async fn acquire_lock(
         None
     };
 
-    Coordinator::new(cluster, blob_lock, config).acquire().await
+    Coordinator::new(cluster, blob_lock, config)
+        .acquire(recover)
+        .await
 }
 
 /// Connect to the Kubernetes cluster lease used by `--coordination`.  Requires

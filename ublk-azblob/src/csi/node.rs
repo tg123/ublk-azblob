@@ -6,7 +6,7 @@
 //! `/dev/ublkbN` device alive.  The child is tracked in an in-memory registry
 //! and signalled (`SIGINT`) to shut down cleanly on unpublish.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,6 +24,7 @@ use super::proto::{
     NodeStageVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
     NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
 };
+use super::state;
 use super::DriverConfig;
 
 /// Default filesystem created on a freshly-provisioned volume.
@@ -59,57 +60,6 @@ struct Published {
     overlay: Option<mount::OverlayDirs>,
 }
 
-/// Rebuild `volumes` by re-adopting each live driver mount `target` from its
-/// persisted recovery metadata. Returns the count newly re-adopted. Entries
-/// already present (or targets without a valid metadata sidecar) are skipped, so
-/// this is idempotent. Split out from [`NodeService::recover`] so the re-adoption
-/// logic can be exercised without a full node service / device.
-fn readopt_targets(volumes: &mut HashMap<String, Published>, targets: Vec<String>) -> usize {
-    let mut adopted = 0usize;
-    for target in targets {
-        let Some(meta) = mount::read_volume_meta(&target) else {
-            warn!(
-                %target,
-                "live driver mount without recoverable metadata; \
-                 unpublish may not fully tear it down"
-            );
-            continue;
-        };
-        if volumes.contains_key(&meta.volume_id) {
-            continue;
-        }
-        // Teardown SIGINTs this pid to shut the volume's `ublk-azblob` process
-        // down cleanly (flush + blob-lease release); `meta.pid` is that
-        // server/child pid, recorded at publish. Re-adoption only happens for a
-        // still-live mount, and the detached child keeps running with the same
-        // pid across a plugin restart, so `meta.pid` is valid here.
-        //
-        // For NBD, do NOT re-derive from `/sys/block/<dev>/pid`: that is the
-        // nbd-client blocked in `NBD_DO_IT`, not our server — signalling it would
-        // leave the server (and its held lease) running.
-        let pid = meta.pid;
-        info!(
-            volume_id = %meta.volume_id,
-            device = %meta.device,
-            pid,
-            %target,
-            "re-adopted volume after node-plugin restart"
-        );
-        volumes.insert(
-            meta.volume_id.clone(),
-            Published {
-                child: None,
-                pid,
-                device: meta.device,
-                target,
-                overlay: meta.overlay,
-            },
-        );
-        adopted += 1;
-    }
-    adopted
-}
-
 /// Node service implementation.
 pub struct NodeService {
     node_id: String,
@@ -129,32 +79,6 @@ impl NodeService {
             config,
             volumes: Arc::new(Mutex::new(HashMap::new())),
             publish_lock: Arc::new(Mutex::new(())),
-        }
-    }
-
-    /// Re-adopt volumes whose device survived a node-plugin restart.
-    ///
-    /// The live volume table is in-memory only, so a plugin restart empties it
-    /// while the detached device children keep serving their mounts (so active
-    /// pods are not disrupted by a plugin upgrade). Without re-adoption, a later
-    /// `NodeUnpublishVolume` for such a volume finds no record and skips teardown
-    /// — leaking the device, its child and (for overlay volumes) the read-only
-    /// lower mount; the kubelet volume reconciler then keeps probing the orphaned
-    /// device (`Buffer I/O error … async page read`).
-    ///
-    /// Recovery scans this driver's live mounts in `/proc/self/mountinfo` and,
-    /// for each, reloads the per-volume metadata sidecar written at publish time
-    /// to rebuild the `volume_id → device/child` association. Idempotent; safe to
-    /// call once at startup before serving.
-    pub fn recover(&self) {
-        let targets = mount::scan_our_targets();
-        if targets.is_empty() {
-            return;
-        }
-        let mut volumes = self.volumes.lock().unwrap();
-        let adopted = readopt_targets(&mut volumes, targets);
-        if adopted > 0 {
-            info!(adopted, "re-adopted volumes after node-plugin restart");
         }
     }
 
@@ -274,6 +198,234 @@ impl NodeService {
             env.push(("UBLK_CACHE_INSTANCE".to_string(), volume_id.to_string()));
         }
         Ok(env)
+    }
+
+    /// Re-attach to every volume this node previously published, using the
+    /// persisted state records, so a node-local restart of the plugin (crash,
+    /// OOM, or a DaemonSet upgrade) is transparent to running pods.
+    ///
+    /// For ublk volumes the kernel kept `/dev/ublkbN` quiesced while the old
+    /// server was gone (user-recovery); we spawn a fresh `run --recover` child
+    /// bound to the same device id. For NBD volumes we re-spawn the server and
+    /// reconnect `nbd-client` to the same device node. In both cases the existing
+    /// filesystem mount (same `major:minor`) stays valid; if the mount was
+    /// somehow lost we re-mount it. Records that can't be recovered (e.g. after a
+    /// full node reboot that destroyed the devices) are pruned so the kubelet can
+    /// re-publish from scratch.
+    ///
+    /// If the previous `run` child is *still alive* (its cgroup outlived the
+    /// plugin, e.g. an in-container binary restart rather than a full pod
+    /// replacement) the device is not quiesced and must not be re-spawned; the
+    /// volume is instead re-adopted in place from its recorded pid so a later
+    /// `NodeUnpublishVolume` can still tear it down.
+    pub async fn recover(&self) {
+        let records = state::load_all();
+        if !records.is_empty() {
+            info!(
+                count = records.len(),
+                "recovering previously-published volumes"
+            );
+        }
+        for record in records {
+            let volume_id = record.volume_id.clone();
+            let volumes = self.volumes.clone();
+            let publish_lock = self.publish_lock.clone();
+            let nbd_port_start = self.config.nbd_port_start;
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let _guard = publish_lock.lock().unwrap();
+
+                // The device path is fixed by the record and can be derived
+                // without spawning anything.
+                let device = match &record.device_mode {
+                    state::DeviceMode::Ublk { dev_id } => format!("/dev/ublkb{dev_id}"),
+                    state::DeviceMode::Nbd { device, .. } => device.clone(),
+                };
+
+                // Fast path: the previous `run` child is still alive (its cgroup
+                // outlived the plugin) and its mount is intact. The device is not
+                // quiesced, so re-spawning `run --recover` would collide with the
+                // live server — re-adopt it in place from the recorded pid so
+                // unpublish can still tear it down.
+                if record.pid != 0
+                    && mount::pid_alive(record.pid)
+                    && mount::is_mounted(&record.target)
+                {
+                    info!(
+                        volume_id = %record.volume_id,
+                        device = %device,
+                        pid = record.pid,
+                        "re-adopted still-live volume after node-plugin restart"
+                    );
+                    volumes.lock().unwrap().insert(
+                        record.volume_id.clone(),
+                        Published {
+                            child: None,
+                            pid: record.pid,
+                            device,
+                            target: record.target.clone(),
+                            overlay: record.overlay.clone(),
+                        },
+                    );
+                    return Ok(());
+                }
+
+                let (mut child, device) = match &record.device_mode {
+                    state::DeviceMode::Ublk { dev_id } => {
+                        let device = format!("/dev/ublkb{dev_id}");
+                        info!(volume_id = %record.volume_id, device = %device, "recovering ublk device");
+                        let mut child = mount::spawn_device(
+                            record.size,
+                            &record.env,
+                            None,
+                            Some(*dev_id),
+                            true,
+                        )?;
+                        if let Err(e) =
+                            mount::wait_for_existing_device(&device, &mut child, DEVICE_TIMEOUT)
+                        {
+                            mount::signal_pid(child.id(), libc::SIGINT);
+                            let _ = child.wait();
+                            return Err(e);
+                        }
+                        (child, device)
+                    }
+                    state::DeviceMode::Nbd { device, listen } => {
+                        // NBD has no kernel quiesce; re-serve on a fresh free port
+                        // and reconnect the client to the same /dev/nbdN. The
+                        // persisted `listen` was always built as `host:port`, so a
+                        // missing or empty host is a corrupt record — fail recovery
+                        // (and prune the record) rather than guessing a wrong host.
+                        let host = listen
+                            .split_once(':')
+                            .map(|(h, _)| h)
+                            .filter(|h| !h.is_empty())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "corrupt NBD listen address {listen:?} (no host:port)"
+                                )
+                            })?;
+                        let port = mount::find_free_port(host, nbd_port_start, 1024)?;
+                        let new_listen = format!("{host}:{port}");
+                        info!(volume_id = %record.volume_id, device = %device, listen = %new_listen, "recovering NBD device");
+                        let mut child = mount::spawn_device(
+                            record.size,
+                            &record.env,
+                            Some(new_listen.clone()),
+                            None,
+                            // Recovery mode: lets coordination break the stale blob
+                            // lease the dead predecessor still holds (NBD has no
+                            // kernel quiesce, but the lease take-over is required).
+                            true,
+                        )?;
+                        if let Err(e) =
+                            mount::reconnect_nbd(&new_listen, device, &mut child, DEVICE_TIMEOUT)
+                        {
+                            mount::signal_pid(child.id(), libc::SIGINT);
+                            let _ = child.wait();
+                            return Err(e);
+                        }
+                        (child, device.clone())
+                    }
+                };
+
+                // The mount normally survives the plugin restart; re-establish it
+                // only if it was lost.
+                if !mount::is_mounted(&record.target) {
+                    warn!(target = %record.target, "mount lost across restart; re-mounting");
+                    let outcome = match &record.overlay {
+                        Some(dirs) => mount::mount_overlay(
+                            &device,
+                            &record.target,
+                            &record.fs_type,
+                            &record.mount_flags,
+                            dirs,
+                        ),
+                        None => mount::mount(
+                            &device,
+                            &record.target,
+                            &record.fs_type,
+                            &record.mount_flags,
+                            record.readonly,
+                        ),
+                    };
+                    if let Err(e) = outcome {
+                        mount::signal_pid(child.id(), libc::SIGINT);
+                        let _ = child.wait();
+                        return Err(e);
+                    }
+                }
+
+                mount::drain_child_output(&mut child);
+                let pid = child.id();
+                volumes.lock().unwrap().insert(
+                    record.volume_id.clone(),
+                    Published {
+                        child: Some(child),
+                        pid,
+                        device,
+                        target: record.target.clone(),
+                        overlay: record.overlay.clone(),
+                    },
+                );
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => info!(volume_id = %volume_id, "volume recovered"),
+                Ok(Err(e)) => {
+                    error!(volume_id = %volume_id, error = %format!("{e:#}"), "volume recovery failed; pruning state so the kubelet can re-publish");
+                    if let Err(e) = state::remove(&volume_id) {
+                        warn!(%volume_id, error = %format!("{e:#}"), "failed to prune unrecoverable state file");
+                    }
+                }
+                Err(e) => error!(volume_id = %volume_id, error = %e, "recovery task panicked"),
+            }
+        }
+
+        self.cleanup_orphan_mounts().await;
+    }
+
+    /// Safety net for dangling mounts. A device mount can survive with **no
+    /// recoverable state record** — the state dir was wiped, or a record was
+    /// pruned above as unrecoverable. Such an orphan is untracked, so
+    /// `NodeUnpublishVolume` would skip it and the kubelet would keep probing the
+    /// dead device forever (`Buffer I/O error … async page read`). Tear any
+    /// orphan down so the kubelet re-publishes a fresh volume.
+    ///
+    /// Only mounts **not** backing a recovered/live volume are touched. Overlay
+    /// lowers (`…/.ublk-overlay-lower`) are skipped: they belong to an overlay
+    /// volume managed via its merged target, so unmounting one would break a
+    /// healthy recovered overlay.
+    async fn cleanup_orphan_mounts(&self) {
+        let tracked: HashSet<String> = self
+            .volumes
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| p.target.trim_end_matches('/').to_string())
+            .collect();
+        let _ = tokio::task::spawn_blocking(move || {
+            for (source, target) in mount::scan_device_mounts() {
+                if target.ends_with("/.ublk-overlay-lower")
+                    || tracked.contains(target.trim_end_matches('/'))
+                {
+                    continue;
+                }
+                warn!(
+                    %source, %target,
+                    "orphaned driver mount with no recoverable state; tearing it \
+                     down so the kubelet re-publishes"
+                );
+                if let Err(e) = mount::umount(&target) {
+                    warn!(%target, error = %format!("{e:#}"), "failed to unmount orphan");
+                }
+                if source.starts_with("/dev/nbd") {
+                    mount::disconnect_nbd(&source);
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -493,7 +645,7 @@ impl Node for NodeService {
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             // Snapshot existing devices, spawn the child, and discover the new
             // node under a global lock so concurrent publishes don't collide.
-            let (mut child, device) = {
+            let (mut child, device, device_mode) = {
                 let _guard = publish_lock.lock().unwrap();
 
                 // Build NBD listen address if NBD mode is enabled
@@ -519,13 +671,19 @@ impl Node for NodeService {
                     Default::default()
                 };
 
-                let mut child = mount::spawn_device(size, &env, nbd_listen.clone())?;
+                let mut child = mount::spawn_device(size, &env, nbd_listen.clone(), None, false)?;
 
-                let device = if let Some(listen_addr) = nbd_listen {
+                let (device, device_mode) = if let Some(listen_addr) = nbd_listen {
                     // NBD mode: wait for server and connect with nbd-client
                     info!(listen_addr = %listen_addr, "Calling wait_and_connect_nbd");
                     match mount::wait_and_connect_nbd(&listen_addr, &mut child, DEVICE_TIMEOUT) {
-                        Ok(dev) => dev,
+                        Ok(dev) => {
+                            let mode = state::DeviceMode::Nbd {
+                                device: dev.clone(),
+                                listen: listen_addr.clone(),
+                            };
+                            (dev, mode)
+                        }
                         Err(e) => {
                             mount::signal_pid(child.id(), libc::SIGINT);
                             let _ = child.wait();
@@ -536,7 +694,12 @@ impl Node for NodeService {
                     // ublk mode: wait for /dev/ublkbN to appear
                     info!("Calling wait_for_new_device for ublk");
                     match mount::wait_for_new_device(&ublk_before, &mut child, DEVICE_TIMEOUT) {
-                        Ok(dev) => dev,
+                        Ok(dev) => {
+                            let dev_id = mount::dev_id_from_path(&dev).ok_or_else(|| {
+                                anyhow::anyhow!("could not parse ublk device id from {dev}")
+                            })?;
+                            (dev, state::DeviceMode::Ublk { dev_id })
+                        }
                         Err(e) => {
                             mount::signal_pid(child.id(), libc::SIGINT);
                             let _ = child.wait();
@@ -545,7 +708,7 @@ impl Node for NodeService {
                     }
                 };
 
-                (child, device)
+                (child, device, device_mode)
             };
 
             // Make a filesystem only on a blank device, then mount.
@@ -598,22 +761,31 @@ impl Node for NodeService {
             // Keep the long-lived child's pipes drained so it can't block.
             mount::drain_child_output(&mut child);
             let pid = child.id();
-            // Persist a recovery record beside the target so a future plugin
-            // restart can re-adopt this device (see NodeService::recover).
-            let meta = mount::VolumeMeta {
+
+            // Persist a recoverable record of this volume *before* publishing it
+            // to the in-memory registry, so a node-local restart of the plugin
+            // (crash / OOM / DaemonSet upgrade) can re-attach to the still-live
+            // device. The full child env (incl. credentials) is recorded;
+            // securing the node-local state dir is the operator's responsibility.
+            let record = state::VolumeState {
                 volume_id: volume_id.clone(),
-                device: device.clone(),
+                size,
+                target: target.clone(),
+                fs_type: fs_type.clone(),
+                mount_flags: mount_flags.clone(),
+                readonly,
+                device_mode,
                 pid,
-                nbd: device.starts_with("/dev/nbd"),
                 overlay: overlay_dirs.clone(),
+                env: env.clone(),
             };
-            if let Err(e) = mount::write_volume_meta(&target, &meta) {
-                warn!(
-                    error = %format!("{e:#}"),
-                    "failed to persist volume recovery metadata; \
-                     this volume will not be re-adoptable across a plugin restart"
-                );
+            if let Err(e) = state::save(&record) {
+                // A failed save means a restart couldn't recover this volume, but
+                // the volume itself is healthy — log and continue rather than
+                // failing the publish.
+                warn!(volume_id = %volume_id, error = %format!("{e:#}"), "failed to persist volume state for recovery");
             }
+
             volumes.lock().unwrap().insert(
                 volume_id,
                 Published {
@@ -655,6 +827,12 @@ impl Node for NodeService {
         let target = req.target_path.clone();
         let volume_id = req.volume_id.clone();
 
+        // Drop the recovery record first: this is a deliberate teardown, so a
+        // future restart must not try to re-attach to a device we are stopping.
+        if let Err(e) = state::remove(&volume_id) {
+            warn!(%volume_id, error = %format!("{e:#}"), "failed to remove volume state file");
+        }
+
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             // Always attempt to unmount the requested target (idempotent). For an
             // overlay volume `target` is the merged overlayfs; unmounting it here
@@ -694,8 +872,6 @@ impl Node for NodeService {
             } else {
                 warn!(%volume_id, "no tracked device for volume on unpublish");
             }
-            // Drop the recovery record; the volume is gone.
-            mount::remove_volume_meta(&target);
             Ok(())
         })
         .await
@@ -764,10 +940,8 @@ impl Node for NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::{child_blob_url, readopt_targets, split_opts, Published};
+    use super::{child_blob_url, split_opts};
     use crate::bloburl::parse_blob_url;
-    use crate::csi::mount;
-    use std::collections::HashMap;
 
     #[test]
     fn split_opts_parses_mixed_separators() {
@@ -867,61 +1041,5 @@ mod tests {
         assert_eq!(r.account, "devstoreaccount1");
         assert_eq!(r.container, "ublk-azblob-volumes");
         assert_eq!(r.blob, "default/volumes/pvc-abc");
-    }
-
-    /// End-to-end re-adoption: emulate publishing an overlay volume (which writes
-    /// a metadata sidecar next to the target), then a node-plugin restart (a fresh
-    /// empty volume table), then recovery driven by the scanned target. The volume
-    /// must be re-adopted with no owned child, the correct device/target/overlay,
-    /// and the persisted pid (the fake device has no `/sys/block/*/pid`). This is
-    /// exactly the flow that previously leaked the overlay lower + child.
-    #[test]
-    fn recovery_readopts_overlay_volume_after_restart() {
-        let base = std::env::temp_dir().join(format!("ublk-recover-{}", std::process::id()));
-        let target = base.join("mount");
-        std::fs::create_dir_all(&target).unwrap();
-        let target_s = target.to_string_lossy().into_owned();
-
-        // As NodePublishVolume would persist for an overlay volume.
-        let meta = mount::VolumeMeta {
-            volume_id: "vol-xyz#c#b".into(),
-            device: "/dev/nbd-nonexistent".into(),
-            pid: 4242,
-            nbd: true,
-            overlay: Some(mount::overlay_dirs(&target_s, None, "vol-xyz#c#b")),
-        };
-        mount::write_volume_meta(&target_s, &meta).unwrap();
-
-        // Fresh plugin instance: empty table, then recover from the live target.
-        let mut volumes: HashMap<String, Published> = HashMap::new();
-        assert_eq!(readopt_targets(&mut volumes, vec![target_s.clone()]), 1);
-
-        let p = volumes.get("vol-xyz#c#b").expect("volume re-adopted");
-        assert!(p.child.is_none(), "re-adopted entry owns no Child");
-        assert_eq!(
-            p.pid, 4242,
-            "falls back to persisted pid when /sys/block absent"
-        );
-        assert_eq!(p.device, "/dev/nbd-nonexistent");
-        assert_eq!(p.target, target_s);
-        assert_eq!(
-            p.overlay.as_ref().unwrap().lower,
-            base.join(".ublk-overlay-lower").to_string_lossy()
-        );
-
-        // Idempotent: a second recovery pass adopts nothing new.
-        assert_eq!(readopt_targets(&mut volumes, vec![target_s.clone()]), 0);
-
-        // A live driver mount with no metadata sidecar is skipped (not adopted).
-        let bare = base.join("bare/mount");
-        std::fs::create_dir_all(&bare).unwrap();
-        let mut empty: HashMap<String, Published> = HashMap::new();
-        assert_eq!(
-            readopt_targets(&mut empty, vec![bare.to_string_lossy().into_owned()]),
-            0
-        );
-
-        mount::remove_volume_meta(&target_s);
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

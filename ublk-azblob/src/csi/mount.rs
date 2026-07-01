@@ -105,11 +105,18 @@ pub fn list_available_nbd_devices() -> HashSet<String> {
 ///
 /// `env` carries the storage selectors and credentials (`AZURE_STORAGE_*`).
 /// `nbd_listen` optionally enables NBD mode with the given listen address (e.g. `127.0.0.1:10809`).
+/// `ublk_id` pins the ublk device id (ublk mode only); `None` lets the kernel
+/// auto-allocate. `recover` re-attaches to an existing quiesced device at
+/// `ublk_id` (user-recovery) instead of creating a fresh one — used to resume a
+/// device after a node-local restart of the node plugin without disrupting the
+/// kubelet's mount.
 /// The child keeps the device alive until it is signalled.
 pub fn spawn_device(
     size: u64,
     env: &[(String, String)],
     nbd_listen: Option<String>,
+    ublk_id: Option<i32>,
+    recover: bool,
 ) -> anyhow::Result<Child> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut cmd = Command::new(exe);
@@ -121,10 +128,23 @@ pub fn spawn_device(
         .stderr(Stdio::piped());
 
     if let Some(ref listen) = nbd_listen {
-        info!(listen = %listen, "spawning NBD server");
+        info!(listen = %listen, recover, "spawning NBD server");
         cmd.arg("--nbd").arg(listen);
     } else {
-        info!("spawning ublk device");
+        // ublk mode. Pin the device id when recovering (or otherwise requested)
+        // so the kernel re-attaches the new server to the exact quiesced device.
+        if let Some(id) = ublk_id {
+            cmd.arg("--id").arg(id.to_string());
+        }
+        info!(ublk_id = ?ublk_id, recover, "spawning ublk device");
+    }
+    // Recovery mode applies to *both* transports: it lets coordination break and
+    // take over the stale blob lease the dead predecessor still holds (its lease
+    // outlives the process by up to 60s). For ublk it additionally drives the
+    // kernel USER_RECOVERY re-attach; NBD has no kernel quiesce but still needs
+    // the lease take-over, so `--recover` must be passed regardless of mode.
+    if recover {
+        cmd.arg("--recover");
     }
 
     for (k, v) in env {
@@ -134,6 +154,7 @@ pub fn spawn_device(
     info!(
         pid = child.id(),
         nbd_mode = nbd_listen.is_some(),
+        recover = recover,
         "spawned device process"
     );
     Ok(child)
@@ -290,6 +311,201 @@ pub fn wait_and_connect_nbd(
         "NBD device {} did not report a non-zero size (last={last_size}) before timeout",
         nbd_dev
     );
+}
+
+/// Parse the numeric ublk device id from a `/dev/ublkbN` path (returns `N`).
+///
+/// The node plugin persists this id so a restart can re-attach to the same
+/// quiesced device via user-recovery.
+pub fn dev_id_from_path(dev: &str) -> Option<i32> {
+    dev.rsplit('/')
+        .next()
+        .and_then(|name| name.strip_prefix("ublkb"))
+        .and_then(|n| n.parse::<i32>().ok())
+}
+
+/// Wait until an *already-existing* block device reports a non-zero size and the
+/// owning `child` is still alive — used when recovering a ublk device (the
+/// `/dev/ublkbN` node persists while quiesced, so there is no "new device" to
+/// wait for; we only need to confirm the re-attached server brought it live).
+pub fn wait_for_existing_device(
+    dev: &str,
+    child: &mut Child,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_size: u64 = 0;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("ublk-azblob exited before recovering device {dev}: {status}");
+        }
+        if Path::new(dev).exists() {
+            if let Ok(output) = Command::new("blockdev")
+                .arg("--getsize64")
+                .arg(dev)
+                .output()
+            {
+                if output.status.success() {
+                    last_size = String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    if last_size > 0 {
+                        info!(device = %dev, size = last_size, "ublk device recovered");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    bail!("ublk device {dev} did not become ready (last size={last_size}) before timeout");
+}
+
+/// Re-attach an NBD client to an *existing* `/dev/nbdN` device after the backing
+/// server was restarted. NBD has no kernel-side quiesce/recovery, so on a
+/// restart we re-spawn the server (on a possibly new port) and reconnect
+/// `nbd-client` to the *same* device node, keeping the existing mount's
+/// `major:minor` valid. The stale connection is torn down first (`-d`).
+pub fn reconnect_nbd(
+    nbd_listen: &str,
+    device: &str,
+    child: &mut Child,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let (host, port) = nbd_listen
+        .split_once(':')
+        .with_context(|| format!("invalid NBD listen address: {nbd_listen}"))?;
+    let port_num: u16 = port
+        .parse()
+        .with_context(|| format!("invalid NBD port in listen address: {nbd_listen}"))?;
+    let addr = (host, port_num)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve NBD listen address: {nbd_listen}"))?
+        .next()
+        .with_context(|| format!("no address resolved for NBD listen address: {nbd_listen}"))?;
+
+    let deadline = Instant::now() + timeout;
+
+    // Wait for the freshly-spawned server to start listening (or exit).
+    loop {
+        if Instant::now() >= deadline {
+            bail!("NBD server {nbd_listen} did not start listening before timeout");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("ublk-azblob NBD server exited before reconnecting: {status}");
+        }
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+        {
+            drop(stream);
+            break;
+        }
+    }
+
+    // Drop any stale kernel-side connection on this device, then reconnect to
+    // the new server. The `-d` may fail harmlessly if nothing is connected.
+    let _ = Command::new("nbd-client").arg("-d").arg(device).output();
+
+    info!(device = %device, host = %host, port = %port_num, "reconnecting NBD client");
+    let output = Command::new("nbd-client")
+        .arg(host)
+        .arg(port_num.to_string())
+        .arg(device)
+        .arg("-L")
+        .output()
+        .context("failed to run nbd-client")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("nbd-client reconnect failed: {stderr}");
+    }
+
+    // Confirm the kernel published a non-zero size again before declaring success.
+    let mut last_size: u64 = 0;
+    while Instant::now() < deadline {
+        if Path::new(device).exists() {
+            if let Ok(output) = Command::new("blockdev")
+                .arg("--getsize64")
+                .arg(device)
+                .output()
+            {
+                if output.status.success() {
+                    last_size = String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    if last_size > 0 {
+                        info!(device = %device, size = last_size, "NBD device reconnected");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    bail!("NBD device {device} did not report a non-zero size (last={last_size}) after reconnect");
+}
+
+/// True if `target` is currently a mount point (checked against `/proc/mounts`).
+///
+/// Used on node-plugin startup to decide whether a recovered volume's filesystem
+/// is still mounted at the CSI target (it normally is — the kernel keeps the
+/// mount across a node-plugin restart) or needs to be re-mounted.
+pub fn is_mounted(target: &str) -> bool {
+    let target = target.trim_end_matches('/');
+    if let Ok(contents) = std::fs::read_to_string("/proc/mounts") {
+        for line in contents.lines() {
+            // Fields: <spec> <mountpoint> <fstype> <opts> ...; the mountpoint is
+            // the 2nd field, with octal-escaped spaces we don't need to decode
+            // for our plugin-controlled, space-free target paths.
+            if let Some(mp) = line.split_whitespace().nth(1) {
+                if mp.trim_end_matches('/') == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Disconnect an NBD device (`nbd-client -d`). Best-effort: fails harmlessly if
+/// nothing is connected.
+pub fn disconnect_nbd(device: &str) {
+    let _ = Command::new("nbd-client").arg("-d").arg(device).output();
+}
+
+/// Enumerate this driver's live *device* mounts from `/proc/mounts`: mountpoints
+/// backed by a `/dev/ublkb*` or `/dev/nbd*` source. Used by node recovery to
+/// find orphaned mounts that have no recoverable state record (e.g. the state
+/// dir was wiped, or a record was pruned as unrecoverable) so they can be torn
+/// down instead of dangling — a dangling device mount makes the kubelet probe a
+/// dead device forever (`Buffer I/O error … async page read`).
+///
+/// Returns `(source, mountpoint)` pairs.
+pub fn scan_device_mounts() -> Vec<(String, String)> {
+    match std::fs::read_to_string("/proc/mounts") {
+        Ok(contents) => parse_device_mounts(&contents),
+        Err(e) => {
+            warn!(error = %e, "could not read /proc/mounts for orphan-mount cleanup");
+            Vec::new()
+        }
+    }
+}
+
+/// Pure `/proc/mounts` parser behind [`scan_device_mounts`] (kept separate so it
+/// can be unit-tested without the real procfs).
+fn parse_device_mounts(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(source), Some(mountpoint)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if source.starts_with("/dev/ublkb") || source.starts_with("/dev/nbd") {
+            out.push((source.to_string(), mountpoint.to_string()));
+        }
+    }
+    out
 }
 
 /// True if `dev` already carries a recognised filesystem (via `blkid`).
@@ -511,7 +727,7 @@ pub fn mount(
 ///     under an operator-chosen base (`overlayScratchDir`), on that base's
 ///     filesystem — not on the target's — and are pruned explicitly via
 ///     `scratch_root` on teardown so nothing leaks.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OverlayDirs {
     /// Read-only mount point of the immutable lower filesystem.
     pub lower: String,
@@ -692,194 +908,6 @@ fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Persisted, node-local record of a published volume, written next to the CSI
-/// target on `NodePublishVolume` and reloaded on node-plugin startup.
-///
-/// The node service keeps its live volume table (`volume_id → device/child`)
-/// only in memory, so a plugin restart loses it while the detached device child
-/// keeps running (so active mounts survive the restart). Without a way to
-/// re-associate the surviving device with its `volume_id`, a later
-/// `NodeUnpublishVolume` cannot tear the device / overlay lower down and it
-/// leaks (the kubelet volume reconciler then keeps probing the orphaned device,
-/// logging `Buffer I/O error … async page read`). This record lets startup
-/// recovery rebuild that association from the still-present mount.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VolumeMeta {
-    pub volume_id: String,
-    /// Backing device node (`/dev/nbdN` or `/dev/ublkbN`).
-    pub device: String,
-    /// PID of the `ublk-azblob run` child serving the device.
-    pub pid: u32,
-    /// Whether the device is served over NBD (`/dev/nbdN`) vs ublk.
-    pub nbd: bool,
-    /// Overlay scratch dirs when the volume is published through an ephemeral
-    /// overlay; `None` for a plain (directly mounted) volume.
-    pub overlay: Option<OverlayDirs>,
-}
-
-/// File name of the per-volume metadata sidecar, written as a hidden sibling of
-/// the CSI target (same directory as `.ublk-overlay-lower`), so it lives on the
-/// per-volume kubelet directory and is naturally discarded with the volume.
-const VOLUME_META_NAME: &str = ".ublk-volume-meta";
-
-/// Path of the metadata sidecar for `target`.
-pub fn meta_path(target: &str) -> std::path::PathBuf {
-    Path::new(target)
-        .parent()
-        .unwrap_or_else(|| Path::new("/"))
-        .join(VOLUME_META_NAME)
-}
-
-impl VolumeMeta {
-    /// Serialize to a simple tab-separated `key\tvalue` line format (no external
-    /// serialization dependency; paths never contain tabs or newlines).
-    pub fn serialize(&self) -> String {
-        let mut s = String::new();
-        s.push_str(&format!("volume_id\t{}\n", self.volume_id));
-        s.push_str(&format!("device\t{}\n", self.device));
-        s.push_str(&format!("pid\t{}\n", self.pid));
-        s.push_str(&format!("nbd\t{}\n", self.nbd));
-        if let Some(o) = &self.overlay {
-            s.push_str("overlay\ttrue\n");
-            s.push_str(&format!("lower\t{}\n", o.lower));
-            s.push_str(&format!("upper\t{}\n", o.upper));
-            s.push_str(&format!("work\t{}\n", o.work));
-            if let Some(root) = &o.scratch_root {
-                s.push_str(&format!("scratch_root\t{root}\n"));
-            }
-        } else {
-            s.push_str("overlay\tfalse\n");
-        }
-        s
-    }
-
-    /// Parse the tab-separated format produced by [`serialize`](Self::serialize).
-    /// Returns `None` if a required field is missing or malformed.
-    pub fn parse(text: &str) -> Option<Self> {
-        let mut map = std::collections::HashMap::new();
-        for line in text.lines() {
-            if let Some((k, v)) = line.split_once('\t') {
-                map.insert(k.trim(), v.to_string());
-            }
-        }
-        let volume_id = map.get("volume_id")?.clone();
-        let device = map.get("device")?.clone();
-        let pid = map.get("pid")?.parse().ok()?;
-        let nbd = map.get("nbd").map(|v| v == "true").unwrap_or(false);
-        let overlay = if map.get("overlay").map(|v| v == "true").unwrap_or(false) {
-            Some(OverlayDirs {
-                lower: map.get("lower")?.clone(),
-                upper: map.get("upper")?.clone(),
-                work: map.get("work")?.clone(),
-                scratch_root: map.get("scratch_root").cloned(),
-            })
-        } else {
-            None
-        };
-        Some(VolumeMeta {
-            volume_id,
-            device,
-            pid,
-            nbd,
-            overlay,
-        })
-    }
-}
-
-/// Write the metadata sidecar for `target` atomically (temp file + rename) so a
-/// crash mid-write never leaves a torn record.
-pub fn write_volume_meta(target: &str, meta: &VolumeMeta) -> anyhow::Result<()> {
-    let path = meta_path(target);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, meta.serialize())
-        .with_context(|| format!("write volume meta {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("rename volume meta into place {}", path.display()))?;
-    Ok(())
-}
-
-/// Read and parse the metadata sidecar for `target`, if present and valid.
-pub fn read_volume_meta(target: &str) -> Option<VolumeMeta> {
-    let text = std::fs::read_to_string(meta_path(target)).ok()?;
-    VolumeMeta::parse(&text)
-}
-
-/// Remove the metadata sidecar for `target` (idempotent).
-pub fn remove_volume_meta(target: &str) {
-    let path = meta_path(target);
-    if let Err(e) = std::fs::remove_file(&path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(path = %path.display(), error = %e, "failed to remove volume meta");
-        }
-    }
-}
-
-/// One parsed line of `/proc/self/mountinfo`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MountEntry {
-    pub mountpoint: String,
-    pub fstype: String,
-    pub source: String,
-    pub super_opts: String,
-}
-
-/// Parse `/proc/self/mountinfo` content into entries. The mountinfo format has a
-/// variable number of optional tag fields terminated by a single `-`, followed
-/// by `<fstype> <source> <super_opts>`.
-pub fn parse_mountinfo(content: &str) -> Vec<MountEntry> {
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        // Need at least: id parent maj:min root mountpoint opts ... - fstype src opts
-        let Some(sep) = toks.iter().position(|&t| t == "-") else {
-            continue;
-        };
-        if toks.len() < 5 || sep + 3 >= toks.len() {
-            continue;
-        }
-        out.push(MountEntry {
-            // mountinfo octal-escapes spaces etc.; our paths don't contain them.
-            mountpoint: toks[4].to_string(),
-            fstype: toks[sep + 1].to_string(),
-            source: toks[sep + 2].to_string(),
-            super_opts: toks[sep + 3].to_string(),
-        });
-    }
-    out
-}
-
-/// From parsed mount entries, return the CSI *target* mountpoints this driver
-/// owns: overlay merged mounts whose `lowerdir` is one of our `.ublk-overlay-lower`
-/// mounts, plus plain volumes where a `/dev/nbdN`/`/dev/ublkbN` device is mounted
-/// directly at the target. The `.ublk-overlay-lower` mounts themselves are
-/// excluded (they are the lower, not a target).
-pub fn our_target_mounts(entries: &[MountEntry]) -> Vec<String> {
-    let mut targets = Vec::new();
-    for e in entries {
-        if e.mountpoint.ends_with("/.ublk-overlay-lower") {
-            continue; // the lower, reached via its overlay target instead
-        }
-        let is_overlay_ours =
-            e.fstype == "overlay" && e.super_opts.contains("/.ublk-overlay-lower");
-        let is_device_ours = e.source.starts_with("/dev/nbd") || e.source.starts_with("/dev/ublkb");
-        if is_overlay_ours || is_device_ours {
-            targets.push(e.mountpoint.clone());
-        }
-    }
-    targets
-}
-
-/// Read `/proc/self/mountinfo` and return this driver's live target mountpoints.
-pub fn scan_our_targets() -> Vec<String> {
-    match std::fs::read_to_string("/proc/self/mountinfo") {
-        Ok(content) => our_target_mounts(&parse_mountinfo(&content)),
-        Err(e) => {
-            warn!(error = %e, "could not read /proc/self/mountinfo for recovery");
-            Vec::new()
-        }
-    }
-}
-
 /// Whether process `pid` is currently alive (`kill(pid, 0)` succeeds).
 pub fn pid_alive(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 only probes for the process; no signal sent.
@@ -901,6 +929,38 @@ pub fn wait_pid_exit(pid: u32, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_device_mounts_selects_only_driver_devices() {
+        let procmounts = "\
+proc /proc proc rw,nosuid 0 0
+/dev/ublkb7 /var/lib/kubelet/pods/x/vol ext4 rw,relatime 0 0
+/dev/sda1 /boot ext4 rw 0 0
+/dev/nbd0 /var/lib/kubelet/pods/y/vol xfs rw 0 0
+overlay /var/lib/kubelet/pods/z/vol overlay rw,lowerdir=... 0 0
+/dev/ublkb9 /var/lib/kubelet/pods/z/.ublk-overlay-lower ext4 ro 0 0
+tmpfs /run tmpfs rw 0 0";
+        let got = parse_device_mounts(procmounts);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "/dev/ublkb7".to_string(),
+                    "/var/lib/kubelet/pods/x/vol".to_string()
+                ),
+                (
+                    "/dev/nbd0".to_string(),
+                    "/var/lib/kubelet/pods/y/vol".to_string()
+                ),
+                (
+                    "/dev/ublkb9".to_string(),
+                    "/var/lib/kubelet/pods/z/.ublk-overlay-lower".to_string()
+                ),
+            ],
+            "only /dev/ublkb* and /dev/nbd* sources are returned (overlay-lower \
+             filtering happens at the recovery caller, not here)"
+        );
+    }
 
     /// Filesystems whose built-in profile must be able to format a fresh blob.
     const FORMATTABLE: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs"];
@@ -1123,119 +1183,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    // ── recovery / metadata helpers ────────────────────────────────────────
-
-    fn sample_meta(overlay: bool) -> VolumeMeta {
-        VolumeMeta {
-            volume_id: "vol-123#container#blob".to_string(),
-            device: "/dev/nbd9".to_string(),
-            pid: 4242,
-            nbd: true,
-            overlay: overlay.then(|| OverlayDirs {
-                lower: "/kubelet/pods/u/volumes/x/.ublk-overlay-lower".to_string(),
-                upper: "/kubelet/pods/u/volumes/x/.ublk-overlay-upper".to_string(),
-                work: "/kubelet/pods/u/volumes/x/.ublk-overlay-work".to_string(),
-                scratch_root: None,
-            }),
-        }
-    }
-
-    #[test]
-    fn volume_meta_roundtrips_overlay_and_plain() {
-        for overlay in [false, true] {
-            let m = sample_meta(overlay);
-            let parsed = VolumeMeta::parse(&m.serialize()).expect("parse serialized meta");
-            assert_eq!(parsed, m, "roundtrip mismatch (overlay={overlay})");
-        }
-    }
-
-    #[test]
-    fn volume_meta_roundtrips_with_scratch_root() {
-        let mut m = sample_meta(true);
-        if let Some(o) = &mut m.overlay {
-            o.scratch_root = Some("/mnt/ssd/scratch/vol-123".to_string());
-        }
-        assert_eq!(VolumeMeta::parse(&m.serialize()).unwrap(), m);
-    }
-
-    #[test]
-    fn volume_meta_parse_rejects_incomplete_or_garbage() {
-        assert!(VolumeMeta::parse("volume_id\tv\ndevice\t/dev/nbd0\n").is_none()); // no pid
-        assert!(VolumeMeta::parse("device\t/dev/nbd0\npid\t1\n").is_none()); // no volume_id
-        assert!(VolumeMeta::parse("volume_id\tv\ndevice\t/dev/nbd0\npid\tNaN\n").is_none());
-        // overlay=true but missing lower/upper/work
-        assert!(VolumeMeta::parse("volume_id\tv\ndevice\td\npid\t1\noverlay\ttrue\n").is_none());
-    }
-
-    #[test]
-    fn meta_path_is_hidden_sibling_of_target() {
-        let p = meta_path("/kubelet/pods/u/volumes/kubernetes.io~csi/pvc-x/mount");
-        assert_eq!(
-            p.to_string_lossy(),
-            "/kubelet/pods/u/volumes/kubernetes.io~csi/pvc-x/.ublk-volume-meta"
-        );
-    }
-
-    #[test]
-    fn write_read_remove_volume_meta_on_disk() {
-        let tmp = std::env::temp_dir().join(format!("ublk-meta-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let target = tmp.join("mount");
-        let target = target.to_string_lossy().into_owned();
-
-        assert!(read_volume_meta(&target).is_none(), "absent → None");
-        let m = sample_meta(true);
-        write_volume_meta(&target, &m).expect("write meta");
-        assert_eq!(read_volume_meta(&target).unwrap(), m);
-        remove_volume_meta(&target);
-        assert!(read_volume_meta(&target).is_none(), "removed → None");
-        remove_volume_meta(&target); // idempotent
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn parse_mountinfo_extracts_mountpoint_fstype_source_opts() {
-        let content = "\
-790 42 43:9 / /kubelet/pods/u/volumes/x/.ublk-overlay-lower ro,relatime - ext4 /dev/nbd9 ro
-791 42 0:55 / /kubelet/pods/u/volumes/x/mount rw,relatime shared:1 - overlay overlay rw,lowerdir=/kubelet/pods/u/volumes/x/.ublk-overlay-lower,upperdir=/a,workdir=/b
-1 0 8:1 / / rw - ext4 /dev/sda1 rw";
-        let e = parse_mountinfo(content);
-        assert_eq!(e.len(), 3);
-        assert_eq!(
-            e[0].mountpoint,
-            "/kubelet/pods/u/volumes/x/.ublk-overlay-lower"
-        );
-        assert_eq!(e[0].fstype, "ext4");
-        assert_eq!(e[0].source, "/dev/nbd9");
-        // Optional field (shared:1) before the '-' must not shift parsing.
-        assert_eq!(e[1].fstype, "overlay");
-        assert!(e[1]
-            .super_opts
-            .contains("lowerdir=/kubelet/pods/u/volumes/x/.ublk-overlay-lower"));
-    }
-
-    #[test]
-    fn our_target_mounts_selects_overlay_and_device_but_not_lower() {
-        let content = "\
-790 42 43:9 / /kubelet/pods/u/volumes/x/.ublk-overlay-lower ro - ext4 /dev/nbd9 ro
-791 42 0:55 / /kubelet/pods/u/volumes/x/mount rw - overlay overlay rw,lowerdir=/kubelet/pods/u/volumes/x/.ublk-overlay-lower,upperdir=/a,workdir=/b
-792 42 43:5 / /kubelet/pods/v/volumes/y/mount rw - ext4 /dev/ublkb3 rw
-793 42 43:1 / /kubelet/pods/w/volumes/z/mount rw - ext4 /dev/nbd4 rw
-1 0 8:1 / / rw - ext4 /dev/sda1 rw
-2 0 0:99 / /var/log rw - overlay overlay rw,lowerdir=/some/other/dir";
-        let mut targets = our_target_mounts(&parse_mountinfo(content));
-        targets.sort();
-        assert_eq!(
-            targets,
-            vec![
-                "/kubelet/pods/u/volumes/x/mount".to_string(), // overlay w/ our lower
-                "/kubelet/pods/v/volumes/y/mount".to_string(), // /dev/ublkb3
-                "/kubelet/pods/w/volumes/z/mount".to_string(), // /dev/nbd4
-            ],
-            "must pick our overlay + device targets, exclude the lower, /, and unrelated overlays"
-        );
     }
 
     #[test]
