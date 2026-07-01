@@ -917,6 +917,28 @@ fn pod_node(app: &str) -> Option<String> {
     s.split_whitespace().next().map(|n| n.to_string())
 }
 
+/// UID (`metadata.uid`) of the first pod carrying `app=<app>`, if any. Used to
+/// prove a pod is the *same* instance (not recreated) across an operation.
+fn pod_uid(app: &str) -> Option<String> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "pods",
+            "-l",
+            &format!("app={app}"),
+            "-o",
+            "jsonpath={.items[0].metadata.uid}",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Poll until no pods match `app=<app>` (or the timeout elapses, returning
 /// `false`).  Used to confirm a Job's pod is fully reaped — kubelet only removes
 /// a pod from the API after its volumes are unmounted (CSI `NodeUnpublishVolume`
@@ -1410,18 +1432,30 @@ spec:
 fn test_node_plugin_restart_keeps_mount() {
     log("TEST 6: a running pod keeps its mount across a node-plugin restart (restart safety)");
 
-    // Pin the consumer to a single node so we know which node-plugin pod to
-    // bounce and can verify recovery is strictly node-local.
+    // Pin the consumer to a node that is actually running the node-plugin
+    // DaemonSet: that node is schedulable (not a tainted control-plane node,
+    // which would leave the PVC unbound) and is exactly the plugin we bounce.
     let nodes_out = Command::new("kubectl")
-        .args(["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"])
+        .args([
+            "get",
+            "pods",
+            "-n",
+            NS,
+            "-l",
+            "app=csi-ublk-azblob-node",
+            "-o",
+            "jsonpath={.items[*].spec.nodeName}",
+        ])
         .output()
-        .expect("get nodes");
+        .expect("get node-plugin pods");
     let nodes_str = String::from_utf8_lossy(&nodes_out.stdout);
     let node = match nodes_str.split_whitespace().next() {
         Some(n) => n.to_string(),
-        None => panic!("restart-safety test: no nodes found"),
+        None => panic!("restart-safety test: no node-plugin (DaemonSet) pods found"),
     };
-    log(&format!("pinning restart-safety consumer to node {node}"));
+    log(&format!(
+        "pinning restart-safety consumer to node {node} (runs the node plugin)"
+    ));
 
     // Dedicated PVC → dedicated device, so this never races the other sub-tests.
     let pvc = r#"apiVersion: v1
@@ -1518,6 +1552,14 @@ spec:
         "restart-safety consumer is running on node {app_node}"
     ));
 
+    // Capture the consumer pod's identity so we can prove the node-plugin restart
+    // does NOT recreate it — that is what distinguishes "the mount survived" from
+    // "the volume was re-published to a fresh pod".
+    let app_pod_uid = pod_uid("azblob-restart-app").unwrap_or_else(|| {
+        dump_diagnostics("azblob-restart-app");
+        panic!("could not read the restart-safety consumer pod uid")
+    });
+
     // ── Restart ONLY the node-plugin pod on the consumer's node. The consumer
     //    pod itself is untouched and keeps `/data` mounted the whole time. The
     //    old server child is SIGKILLed with the node-pod cgroup → abrupt death →
@@ -1550,6 +1592,18 @@ spec:
         dump_diagnostics("azblob-restart-app");
         panic!("node plugin DaemonSet did not roll a fresh Ready pod back after the restart");
     }
+
+    // The consumer pod must be the SAME instance — if it were recreated, the test
+    // would only prove remount/re-publish, not that the live mount survived.
+    let app_pod_uid_after = pod_uid("azblob-restart-app").unwrap_or_else(|| {
+        dump_diagnostics("azblob-restart-app");
+        panic!("could not read the restart-safety consumer pod uid after the restart")
+    });
+    assert_eq!(
+        app_pod_uid, app_pod_uid_after,
+        "restart-safety consumer pod was recreated ({app_pod_uid} -> {app_pod_uid_after}); \
+         the test must validate the SAME running pod keeping its mount, not a republish"
+    );
 
     // ── Verify the SAME still-running pod can still use its mount. We never
     //    recreated the pod or republished the volume, so success here proves the

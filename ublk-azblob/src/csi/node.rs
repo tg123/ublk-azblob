@@ -293,11 +293,17 @@ impl NodeService {
                         // NBD has no kernel quiesce; re-serve on a fresh free port
                         // and reconnect the client to the same /dev/nbdN. The
                         // persisted `listen` was always built as `host:port`, so a
-                        // missing host is a corrupt record — fail recovery (and
-                        // prune the record) rather than guessing a wrong host.
-                        let host = listen.split_once(':').map(|(h, _)| h).ok_or_else(|| {
-                            anyhow::anyhow!("corrupt NBD listen address {listen:?} (no host:port)")
-                        })?;
+                        // missing or empty host is a corrupt record — fail recovery
+                        // (and prune the record) rather than guessing a wrong host.
+                        let host = listen
+                            .split_once(':')
+                            .map(|(h, _)| h)
+                            .filter(|h| !h.is_empty())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "corrupt NBD listen address {listen:?} (no host:port)"
+                                )
+                            })?;
                         let port = mount::find_free_port(host, nbd_port_start, 1024)?;
                         let new_listen = format!("{host}:{port}");
                         info!(volume_id = %record.volume_id, device = %device, listen = %new_listen, "recovering NBD device");
@@ -306,7 +312,10 @@ impl NodeService {
                             &record.env,
                             Some(new_listen.clone()),
                             None,
-                            false,
+                            // Recovery mode: lets coordination break the stale blob
+                            // lease the dead predecessor still holds (NBD has no
+                            // kernel quiesce, but the lease take-over is required).
+                            true,
                         )?;
                         if let Err(e) =
                             mount::reconnect_nbd(&new_listen, device, &mut child, DEVICE_TIMEOUT)

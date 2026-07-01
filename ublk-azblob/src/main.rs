@@ -425,11 +425,16 @@ enum Command {
         #[arg(long, env = "NBD_LISTEN")]
         nbd: Option<String>,
 
-        /// Re-attach to an existing, quiesced ublk device (user-recovery) at
-        /// `--id` instead of creating a new one. Used by the CSI node plugin to
-        /// resume a device after a node-local restart of this server (crash or
-        /// DaemonSet upgrade) without disrupting the kubelet's mount. Requires a
-        /// concrete `--id` (>= 0); ignored in NBD mode.
+        /// Resume a volume after a node-local restart of this server (crash or
+        /// DaemonSet upgrade) without disrupting the kubelet's mount. Used by the
+        /// CSI node plugin.
+        ///
+        /// For **ublk** it re-attaches to the existing, quiesced device at `--id`
+        /// (user-recovery) instead of creating a new one (requires a concrete
+        /// `--id` >= 0). For **both ublk and NBD** it also authorises breaking and
+        /// taking over the stale blob lease the dead predecessor still holds (its
+        /// Azure lease outlives the process by up to 60s) — otherwise a fresh
+        /// process could not re-acquire the lock in single-process mode.
         #[arg(long, env = "UBLK_RECOVER")]
         recover: bool,
     },

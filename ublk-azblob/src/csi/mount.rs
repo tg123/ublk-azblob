@@ -128,7 +128,7 @@ pub fn spawn_device(
         .stderr(Stdio::piped());
 
     if let Some(ref listen) = nbd_listen {
-        info!(listen = %listen, "spawning NBD server");
+        info!(listen = %listen, recover, "spawning NBD server");
         cmd.arg("--nbd").arg(listen);
     } else {
         // ublk mode. Pin the device id when recovering (or otherwise requested)
@@ -136,12 +136,15 @@ pub fn spawn_device(
         if let Some(id) = ublk_id {
             cmd.arg("--id").arg(id.to_string());
         }
-        if recover {
-            cmd.arg("--recover");
-            info!(ublk_id = ?ublk_id, "spawning ublk device in recovery mode");
-        } else {
-            info!("spawning ublk device");
-        }
+        info!(ublk_id = ?ublk_id, recover, "spawning ublk device");
+    }
+    // Recovery mode applies to *both* transports: it lets coordination break and
+    // take over the stale blob lease the dead predecessor still holds (its lease
+    // outlives the process by up to 60s). For ublk it additionally drives the
+    // kernel USER_RECOVERY re-attach; NBD has no kernel quiesce but still needs
+    // the lease take-over, so `--recover` must be passed regardless of mode.
+    if recover {
+        cmd.arg("--recover");
     }
 
     for (k, v) in env {
