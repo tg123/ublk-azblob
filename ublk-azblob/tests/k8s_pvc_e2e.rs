@@ -1457,7 +1457,12 @@ spec:
       labels:
         app: azblob-restart-app
     spec:
-      nodeName: {node}
+      # Pin with nodeSelector, NOT spec.nodeName: the azblob-ublk StorageClass is
+      # WaitForFirstConsumer, so the scheduler must process this pod to stamp the
+      # PVC's selected-node annotation that triggers provisioning/binding.
+      # spec.nodeName bypasses the scheduler, so the PVC would stay unbound.
+      nodeSelector:
+        kubernetes.io/hostname: {node}
       terminationGracePeriodSeconds: 5
       containers:
         - name: app
