@@ -1509,7 +1509,9 @@ spec:
         dump_diagnostics("azblob-restart-app");
         panic!("could not determine the node the restart-safety consumer ran on");
     });
-    log(&format!("restart-safety consumer is running on node {app_node}"));
+    log(&format!(
+        "restart-safety consumer is running on node {app_node}"
+    ));
 
     // ── Restart ONLY the node-plugin pod on the consumer's node. The consumer
     //    pod itself is untouched and keeps `/data` mounted the whole time. The
@@ -1564,7 +1566,14 @@ spec:
         dump_diagnostics("azblob-restart-app");
         let _ = try_run(
             "kubectl",
-            &["-n", NS, "logs", "-l", "app=csi-ublk-azblob-node", "--tail=80"],
+            &[
+                "-n",
+                NS,
+                "logs",
+                "-l",
+                "app=csi-ublk-azblob-node",
+                "--tail=80",
+            ],
         );
         panic!(
             "the running pod could not re-read its volume after the node-plugin restart — \

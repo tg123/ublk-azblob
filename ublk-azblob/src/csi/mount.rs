@@ -337,7 +337,11 @@ pub fn wait_for_existing_device(
             bail!("ublk-azblob exited before recovering device {dev}: {status}");
         }
         if Path::new(dev).exists() {
-            if let Ok(output) = Command::new("blockdev").arg("--getsize64").arg(dev).output() {
+            if let Ok(output) = Command::new("blockdev")
+                .arg("--getsize64")
+                .arg(dev)
+                .output()
+            {
                 if output.status.success() {
                     last_size = String::from_utf8_lossy(&output.stdout)
                         .trim()
@@ -389,7 +393,8 @@ pub fn reconnect_nbd(
         if let Ok(Some(status)) = child.try_wait() {
             bail!("ublk-azblob NBD server exited before reconnecting: {status}");
         }
-        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+        {
             drop(stream);
             break;
         }
@@ -397,10 +402,7 @@ pub fn reconnect_nbd(
 
     // Drop any stale kernel-side connection on this device, then reconnect to
     // the new server. The `-d` may fail harmlessly if nothing is connected.
-    let _ = Command::new("nbd-client")
-        .arg("-d")
-        .arg(device)
-        .output();
+    let _ = Command::new("nbd-client").arg("-d").arg(device).output();
 
     info!(device = %device, host = %host, port = %port_num, "reconnecting NBD client");
     let output = Command::new("nbd-client")
@@ -461,6 +463,46 @@ pub fn is_mounted(target: &str) -> bool {
         }
     }
     false
+}
+
+/// Disconnect an NBD device (`nbd-client -d`). Best-effort: fails harmlessly if
+/// nothing is connected.
+pub fn disconnect_nbd(device: &str) {
+    let _ = Command::new("nbd-client").arg("-d").arg(device).output();
+}
+
+/// Enumerate this driver's live *device* mounts from `/proc/mounts`: mountpoints
+/// backed by a `/dev/ublkb*` or `/dev/nbd*` source. Used by node recovery to
+/// find orphaned mounts that have no recoverable state record (e.g. the state
+/// dir was wiped, or a record was pruned as unrecoverable) so they can be torn
+/// down instead of dangling — a dangling device mount makes the kubelet probe a
+/// dead device forever (`Buffer I/O error … async page read`).
+///
+/// Returns `(source, mountpoint)` pairs.
+pub fn scan_device_mounts() -> Vec<(String, String)> {
+    match std::fs::read_to_string("/proc/mounts") {
+        Ok(contents) => parse_device_mounts(&contents),
+        Err(e) => {
+            warn!(error = %e, "could not read /proc/mounts for orphan-mount cleanup");
+            Vec::new()
+        }
+    }
+}
+
+/// Pure `/proc/mounts` parser behind [`scan_device_mounts`] (kept separate so it
+/// can be unit-tested without the real procfs).
+fn parse_device_mounts(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(source), Some(mountpoint)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if source.starts_with("/dev/ublkb") || source.starts_with("/dev/nbd") {
+            out.push((source.to_string(), mountpoint.to_string()));
+        }
+    }
+    out
 }
 
 /// True if `dev` already carries a recognised filesystem (via `blkid`).
@@ -884,6 +926,38 @@ pub fn wait_pid_exit(pid: u32, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_device_mounts_selects_only_driver_devices() {
+        let procmounts = "\
+proc /proc proc rw,nosuid 0 0
+/dev/ublkb7 /var/lib/kubelet/pods/x/vol ext4 rw,relatime 0 0
+/dev/sda1 /boot ext4 rw 0 0
+/dev/nbd0 /var/lib/kubelet/pods/y/vol xfs rw 0 0
+overlay /var/lib/kubelet/pods/z/vol overlay rw,lowerdir=... 0 0
+/dev/ublkb9 /var/lib/kubelet/pods/z/.ublk-overlay-lower ext4 ro 0 0
+tmpfs /run tmpfs rw 0 0";
+        let got = parse_device_mounts(procmounts);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "/dev/ublkb7".to_string(),
+                    "/var/lib/kubelet/pods/x/vol".to_string()
+                ),
+                (
+                    "/dev/nbd0".to_string(),
+                    "/var/lib/kubelet/pods/y/vol".to_string()
+                ),
+                (
+                    "/dev/ublkb9".to_string(),
+                    "/var/lib/kubelet/pods/z/.ublk-overlay-lower".to_string()
+                ),
+            ],
+            "only /dev/ublkb* and /dev/nbd* sources are returned (overlay-lower \
+             filtering happens at the recovery caller, not here)"
+        );
+    }
 
     /// Filesystems whose built-in profile must be able to format a fresh blob.
     const FORMATTABLE: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs"];

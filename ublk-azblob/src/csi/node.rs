@@ -6,7 +6,7 @@
 //! `/dev/ublkbN` device alive.  The child is tracked in an in-memory registry
 //! and signalled (`SIGINT`) to shut down cleanly on unpublish.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +16,6 @@ use tracing::{error, info, instrument, warn};
 
 use super::mount;
 use super::proto::node_server::Node;
-use super::state;
 use super::proto::{
     volume_capability::AccessType, NodeExpandVolumeRequest, NodeExpandVolumeResponse,
     NodeGetCapabilitiesRequest, NodeGetCapabilitiesResponse, NodeGetInfoRequest,
@@ -25,6 +24,7 @@ use super::proto::{
     NodeStageVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
     NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
 };
+use super::state;
 use super::DriverConfig;
 
 /// Default filesystem created on a freshly-provisioned volume.
@@ -220,10 +220,12 @@ impl NodeService {
     /// `NodeUnpublishVolume` can still tear it down.
     pub async fn recover(&self) {
         let records = state::load_all();
-        if records.is_empty() {
-            return;
+        if !records.is_empty() {
+            info!(
+                count = records.len(),
+                "recovering previously-published volumes"
+            );
         }
-        info!(count = records.len(), "recovering previously-published volumes");
         for record in records {
             let volume_id = record.volume_id.clone();
             let volumes = self.volumes.clone();
@@ -371,6 +373,50 @@ impl NodeService {
                 Err(e) => error!(volume_id = %volume_id, error = %e, "recovery task panicked"),
             }
         }
+
+        self.cleanup_orphan_mounts().await;
+    }
+
+    /// Safety net for dangling mounts. A device mount can survive with **no
+    /// recoverable state record** — the state dir was wiped, or a record was
+    /// pruned above as unrecoverable. Such an orphan is untracked, so
+    /// `NodeUnpublishVolume` would skip it and the kubelet would keep probing the
+    /// dead device forever (`Buffer I/O error … async page read`). Tear any
+    /// orphan down so the kubelet re-publishes a fresh volume.
+    ///
+    /// Only mounts **not** backing a recovered/live volume are touched. Overlay
+    /// lowers (`…/.ublk-overlay-lower`) are skipped: they belong to an overlay
+    /// volume managed via its merged target, so unmounting one would break a
+    /// healthy recovered overlay.
+    async fn cleanup_orphan_mounts(&self) {
+        let tracked: HashSet<String> = self
+            .volumes
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| p.target.trim_end_matches('/').to_string())
+            .collect();
+        let _ = tokio::task::spawn_blocking(move || {
+            for (source, target) in mount::scan_device_mounts() {
+                if target.ends_with("/.ublk-overlay-lower")
+                    || tracked.contains(target.trim_end_matches('/'))
+                {
+                    continue;
+                }
+                warn!(
+                    %source, %target,
+                    "orphaned driver mount with no recoverable state; tearing it \
+                     down so the kubelet re-publishes"
+                );
+                if let Err(e) = mount::umount(&target) {
+                    warn!(%target, error = %format!("{e:#}"), "failed to unmount orphan");
+                }
+                if source.starts_with("/dev/nbd") {
+                    mount::disconnect_nbd(&source);
+                }
+            }
+        })
+        .await;
     }
 }
 

@@ -123,8 +123,7 @@ fn state_file(dir: &Path, volume_id: &str) -> PathBuf {
 pub fn save(state: &VolumeState) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let dir = state_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create state dir {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create state dir {}", dir.display()))?;
     let path = state_file(&dir, &state.volume_id);
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(state).context("serialize volume state")?;
@@ -159,8 +158,12 @@ pub fn load_all() -> Vec<VolumeState> {
         }
         match std::fs::read(&path).map(|b| serde_json::from_slice::<VolumeState>(&b)) {
             Ok(Ok(state)) => out.push(state),
-            Ok(Err(e)) => tracing::warn!(path = %path.display(), error = %e, "skipping malformed state file"),
-            Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping unreadable state file"),
+            Ok(Err(e)) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping malformed state file")
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping unreadable state file")
+            }
         }
     }
     out
