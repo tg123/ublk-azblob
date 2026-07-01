@@ -24,30 +24,108 @@ use azure_storage_blob::{
 use bytes::Bytes;
 use futures::stream::{StreamExt as _, TryStreamExt as _};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Duration;
 use tracing::{error, info, instrument, trace, warn};
 
-/// Maximum attempts (initial try + retries) for a single Azure page-blob
-/// operation before the error is surfaced to the block layer.
-const AZURE_OP_ATTEMPTS: u32 = 5;
-/// Backoff before the first retry; doubles each attempt up to [`AZURE_RETRY_MAX`].
-const AZURE_RETRY_BASE: Duration = Duration::from_millis(200);
-/// Upper bound on a single backoff sleep.
-const AZURE_RETRY_MAX: Duration = Duration::from_secs(5);
+/// Tunables for the transient-failure retry wrapper, resolved once from the
+/// environment. All are optional overrides of the defaults below.
+///
+/// * `UBLK_AZURE_RETRY_ATTEMPTS` — max attempts (initial try + retries); default 20.
+/// * `UBLK_AZURE_RETRY_BASE_MS`  — first backoff in ms (doubles each retry); default 200.
+/// * `UBLK_AZURE_RETRY_MAX_MS`   — cap on a single backoff in ms; default 5000.
+/// * `UBLK_AZURE_RETRY_CODES`    — comma-separated HTTP status patterns treated as
+///   retryable, each an exact code (`503`) or a wildcard prefix (`5*`, `40*`, `*`);
+///   default `408,429,5*`. Non-HTTP (transport/timeout/reset) errors are always
+///   retried regardless of this list.
+#[derive(Debug, Clone)]
+struct RetryConfig {
+    attempts: u32,
+    base: Duration,
+    max: Duration,
+    codes: Vec<String>,
+}
 
-/// Whether an Azure SDK error is worth retrying. Throttling and transient server
-/// failures — HTTP 408 (Request Timeout), 429 (Too Many Requests) and any 5xx —
-/// plus non-HTTP errors (transport timeouts, connection resets, DNS) are
-/// retryable. Deterministic client errors (auth failures, 404, 416 invalid
-/// range, precondition) are not: retrying them only delays the inevitable.
-fn is_retryable(err: &azure_core::Error) -> bool {
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            attempts: 20,
+            base: Duration::from_millis(200),
+            max: Duration::from_secs(5),
+            codes: vec!["408".into(), "429".into(), "5*".into()],
+        }
+    }
+}
+
+impl RetryConfig {
+    fn from_env() -> Self {
+        let d = Self::default();
+        let attempts = std::env::var("UBLK_AZURE_RETRY_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(d.attempts);
+        let base = std::env::var("UBLK_AZURE_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(d.base);
+        let max = std::env::var("UBLK_AZURE_RETRY_MAX_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(d.max);
+        let codes = std::env::var("UBLK_AZURE_RETRY_CODES")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or(d.codes);
+        Self {
+            attempts,
+            base,
+            max,
+            codes,
+        }
+    }
+}
+
+/// Process-wide retry config, resolved from the environment on first use.
+fn retry_config() -> &'static RetryConfig {
+    static CFG: OnceLock<RetryConfig> = OnceLock::new();
+    CFG.get_or_init(RetryConfig::from_env)
+}
+
+/// Whether an HTTP status `code` matches a configured pattern: an exact code
+/// (`"503"`), a wildcard prefix (`"5*"`, `"40*"`), or `"*"` (any).
+fn code_matches(code: u16, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let code = code.to_string();
+    match pattern.strip_suffix('*') {
+        Some(prefix) => code.starts_with(prefix),
+        None => code == pattern,
+    }
+}
+
+/// Whether an Azure SDK error is worth retrying under `cfg`. Non-HTTP errors
+/// (transport timeouts, connection resets, DNS) are always retried — the request
+/// either never reached the service or was interrupted mid-stream, and the ops we
+/// wrap are idempotent. HTTP responses are retried only when their status matches
+/// `cfg.codes` (default throttling/5xx: `408,429,5*`); deterministic client
+/// errors (auth, 404, 416 invalid range, precondition) are not.
+fn is_retryable(cfg: &RetryConfig, err: &azure_core::Error) -> bool {
     match err.kind() {
         azure_core::error::ErrorKind::HttpResponse { status, .. } => {
             let code = u16::from(*status);
-            code == 408 || code == 429 || (500..=599).contains(&code)
+            cfg.codes.iter().any(|p| code_matches(code, p))
         }
-        // No HTTP status ⇒ a transport/IO/timeout error — worth retrying.
         _ => true,
     }
 }
@@ -60,19 +138,29 @@ fn is_retryable(err: &azure_core::Error) -> bool {
 /// timeout, or mid-stream connection reset propagates straight to the ublk/NBD
 /// block device as an `Input/output error`, which corrupts an in-flight read
 /// (e.g. git's streaming pack read → "invalid index-pack / unresolved deltas").
-async fn with_retry<T, F, Fut>(op: &str, blob: &str, mut f: F) -> azure_core::Result<T>
+///
+/// `f` must submit **one attempt** (typically through the I/O gateway); the
+/// backoff sleep happens *between* calls to `f`, i.e. **outside** any gateway
+/// submission, so a sleeping retry does not pin a shared concurrency permit and
+/// block foreground work.
+async fn with_retry<T, F, Fut>(
+    cfg: &RetryConfig,
+    op: &str,
+    blob: &str,
+    mut f: F,
+) -> azure_core::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = azure_core::Result<T>>,
 {
-    let mut delay = AZURE_RETRY_BASE;
+    let mut delay = cfg.base;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         match f().await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if attempt >= AZURE_OP_ATTEMPTS || !is_retryable(&e) {
+                if attempt >= cfg.attempts || !is_retryable(cfg, &e) {
                     return Err(e);
                 }
                 // Cheap jitter (no `rand` dependency): 0–127 ms off the clock, to
@@ -95,7 +183,7 @@ where
                     "retryable Azure error; backing off"
                 );
                 tokio::time::sleep(backoff).await;
-                delay = (delay * 2).min(AZURE_RETRY_MAX);
+                delay = (delay * 2).min(cfg.max);
             }
         }
     }
@@ -579,25 +667,30 @@ impl BlobBackend for AzurePageBlobBackend {
         let blob_client = Arc::new(self.blob_client()?);
         let blob_name = self.blob_name.clone();
         let class = current_class().unwrap_or(IoClass::ForegroundRead);
+        let gateway = self.gateway.clone();
         trace!(offset, len, "downloading range");
-        self.gateway
-            .download(class, len, async move {
-                with_retry("download", &blob_name, || {
-                    let blob_client = blob_client.clone();
-                    async move {
+        // Retry wraps the *gateway submission*, so the backoff sleep happens
+        // between submissions — the shared concurrency permit is released while a
+        // failed attempt backs off, never pinned by a sleeping retry.
+        with_retry(retry_config(), "download", &blob_name, || {
+            let blob_client = blob_client.clone();
+            let gateway = gateway.clone();
+            async move {
+                gateway
+                    .download(class, len, async move {
                         let opts = BlobClientDownloadOptions {
                             range: Some(HttpRange::new(offset, len)),
                             ..Default::default()
                         };
                         let result = blob_client.download(Some(opts)).await?;
                         let data = result.body.collect().await?;
-                        Ok(data)
-                    }
-                })
-                .await
-                .with_context(|| format!("download blob '{blob_name}' offset={offset} len={len}"))
-            })
-            .await
+                        Ok::<_, azure_core::Error>(data)
+                    })
+                    .await
+            }
+        })
+        .await
+        .with_context(|| format!("download blob '{blob_name}' offset={offset} len={len}"))
     }
 
     #[instrument(skip(self, data), fields(blob = %self.blob_name, offset, len = data.len()))]
@@ -617,31 +710,32 @@ impl BlobBackend for AzurePageBlobBackend {
         let blob_name = self.blob_name.clone();
         let class = current_class().unwrap_or(IoClass::Flush);
         let lease_id = self.lease_id();
+        let gateway = self.gateway.clone();
         trace!(offset, len, "uploading pages");
-        let etag = self
-            .gateway
-            .upload(class, len, async move {
-                with_retry("upload_pages", &blob_name, || {
-                    let page_client = page_client.clone();
-                    let content = azure_core::http::RequestContent::from(data.to_vec());
-                    let range = HttpRange::new(offset, len);
-                    let opts = PageBlobClientUploadPagesOptions {
-                        lease_id: lease_id.clone(),
-                        ..Default::default()
-                    };
-                    async move {
+        let etag = with_retry(retry_config(), "upload_pages", &blob_name, || {
+            let page_client = page_client.clone();
+            let gateway = gateway.clone();
+            let content = azure_core::http::RequestContent::from(data.to_vec());
+            let opts = PageBlobClientUploadPagesOptions {
+                lease_id: lease_id.clone(),
+                ..Default::default()
+            };
+            async move {
+                gateway
+                    .upload(class, len, async move {
+                        let range = HttpRange::new(offset, len);
                         let resp = page_client
                             .upload_pages(content, len, range, Some(opts))
                             .await?;
-                        Ok(resp.etag().ok().flatten().map(|e| e.to_string()))
-                    }
-                })
-                .await
-                .with_context(|| {
-                    format!("upload_pages blob '{blob_name}' offset={offset} len={len}")
-                })
-            })
-            .await?;
+                        Ok::<_, azure_core::Error>(
+                            resp.etag().ok().flatten().map(|e| e.to_string()),
+                        )
+                    })
+                    .await
+            }
+        })
+        .await
+        .with_context(|| format!("upload_pages blob '{blob_name}' offset={offset} len={len}"))?;
         // The Put Page response already carries the blob's new ETag; cache it so
         // a follow-up flush can read the validity token without an extra
         // get_properties round-trip.
@@ -665,28 +759,29 @@ impl BlobBackend for AzurePageBlobBackend {
         let blob_name = self.blob_name.clone();
         let class = current_class().unwrap_or(IoClass::Flush);
         let lease_id = self.lease_id();
+        let gateway = self.gateway.clone();
         trace!(offset, len, "clearing pages");
-        let etag = self
-            .gateway
-            .upload(class, 0, async move {
-                with_retry("clear_pages", &blob_name, || {
-                    let page_client = page_client.clone();
-                    let range = HttpRange::new(offset, len);
-                    let opts = PageBlobClientClearPagesOptions {
-                        lease_id: lease_id.clone(),
-                        ..Default::default()
-                    };
-                    async move {
+        let etag = with_retry(retry_config(), "clear_pages", &blob_name, || {
+            let page_client = page_client.clone();
+            let gateway = gateway.clone();
+            let opts = PageBlobClientClearPagesOptions {
+                lease_id: lease_id.clone(),
+                ..Default::default()
+            };
+            async move {
+                gateway
+                    .upload(class, 0, async move {
+                        let range = HttpRange::new(offset, len);
                         let resp = page_client.clear_pages(range, Some(opts)).await?;
-                        Ok(resp.etag().ok().flatten().map(|e| e.to_string()))
-                    }
-                })
-                .await
-                .with_context(|| {
-                    format!("clear_pages blob '{blob_name}' offset={offset} len={len}")
-                })
-            })
-            .await?;
+                        Ok::<_, azure_core::Error>(
+                            resp.etag().ok().flatten().map(|e| e.to_string()),
+                        )
+                    })
+                    .await
+            }
+        })
+        .await
+        .with_context(|| format!("clear_pages blob '{blob_name}' offset={offset} len={len}"))?;
         // Clear Pages also mutates the blob and returns the new ETag; keep the
         // cached validity token current.
         self.record_etag(etag);
@@ -923,7 +1018,7 @@ mod tests {
 
     // ── retry classification + backoff behaviour ───────────────────────────
 
-    use super::{is_retryable, with_retry, AZURE_OP_ATTEMPTS};
+    use super::{code_matches, is_retryable, with_retry, RetryConfig};
     use azure_core::error::{Error, ErrorKind};
     use azure_core::http::StatusCode;
 
@@ -938,8 +1033,68 @@ mod tests {
         )
     }
 
+    /// Fast, deterministic config for the timing tests (3 attempts, tiny backoff).
+    fn test_cfg() -> RetryConfig {
+        RetryConfig {
+            attempts: 3,
+            base: std::time::Duration::from_millis(200),
+            max: std::time::Duration::from_secs(5),
+            codes: vec!["408".into(), "429".into(), "5*".into()],
+        }
+    }
+
+    #[test]
+    fn code_matches_exact_prefix_and_any() {
+        assert!(code_matches(503, "503"));
+        assert!(!code_matches(500, "503"));
+        assert!(code_matches(503, "5*"));
+        assert!(code_matches(500, "5*"));
+        assert!(!code_matches(429, "5*"));
+        assert!(code_matches(404, "40*"));
+        assert!(code_matches(408, "40*"));
+        assert!(!code_matches(410, "40*"));
+        assert!(code_matches(200, "*"));
+        assert!(code_matches(503, "*"));
+    }
+
+    #[test]
+    fn retry_config_from_env_defaults_and_overrides() {
+        // Defaults when unset.
+        for k in [
+            "UBLK_AZURE_RETRY_ATTEMPTS",
+            "UBLK_AZURE_RETRY_BASE_MS",
+            "UBLK_AZURE_RETRY_MAX_MS",
+            "UBLK_AZURE_RETRY_CODES",
+        ] {
+            std::env::remove_var(k);
+        }
+        let d = RetryConfig::from_env();
+        assert_eq!(d.attempts, 20, "default max attempts is 20");
+        assert_eq!(d.base, std::time::Duration::from_millis(200));
+        assert_eq!(d.codes, vec!["408", "429", "5*"]);
+
+        std::env::set_var("UBLK_AZURE_RETRY_ATTEMPTS", "7");
+        std::env::set_var("UBLK_AZURE_RETRY_BASE_MS", "50");
+        std::env::set_var("UBLK_AZURE_RETRY_MAX_MS", "1000");
+        std::env::set_var("UBLK_AZURE_RETRY_CODES", "500, 5* , 40*");
+        let o = RetryConfig::from_env();
+        assert_eq!(o.attempts, 7);
+        assert_eq!(o.base, std::time::Duration::from_millis(50));
+        assert_eq!(o.max, std::time::Duration::from_millis(1000));
+        assert_eq!(o.codes, vec!["500", "5*", "40*"]);
+        for k in [
+            "UBLK_AZURE_RETRY_ATTEMPTS",
+            "UBLK_AZURE_RETRY_BASE_MS",
+            "UBLK_AZURE_RETRY_MAX_MS",
+            "UBLK_AZURE_RETRY_CODES",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
     #[test]
     fn retryable_covers_throttling_5xx_and_transport_only() {
+        let cfg = test_cfg();
         for s in [
             StatusCode::RequestTimeout,      // 408
             StatusCode::TooManyRequests,     // 429
@@ -948,7 +1103,7 @@ mod tests {
             StatusCode::ServiceUnavailable,  // 503
             StatusCode::GatewayTimeout,      // 504
         ] {
-            assert!(is_retryable(&http_err(s)), "{s:?} must be retryable");
+            assert!(is_retryable(&cfg, &http_err(s)), "{s:?} must be retryable");
         }
         for s in [
             StatusCode::Ok,                           // 200
@@ -958,20 +1113,47 @@ mod tests {
             StatusCode::PreconditionFailed,           // 412
             StatusCode::RequestedRangeNotSatisfiable, // 416
         ] {
-            assert!(!is_retryable(&http_err(s)), "{s:?} must NOT be retryable");
+            assert!(
+                !is_retryable(&cfg, &http_err(s)),
+                "{s:?} must NOT be retryable"
+            );
         }
-        // No HTTP status ⇒ transport/IO error ⇒ retryable.
-        assert!(is_retryable(&Error::with_message(
-            ErrorKind::Connection,
-            "reset"
-        )));
-        assert!(is_retryable(&Error::with_message(ErrorKind::Io, "timeout")));
+        // No HTTP status ⇒ transport/IO error ⇒ always retryable.
+        assert!(is_retryable(
+            &cfg,
+            &Error::with_message(ErrorKind::Connection, "reset")
+        ));
+        assert!(is_retryable(
+            &cfg,
+            &Error::with_message(ErrorKind::Io, "timeout")
+        ));
     }
 
-    #[tokio::test]
+    #[test]
+    fn retryable_honours_custom_code_patterns() {
+        // `40*` makes 404 retryable; `5*` not present, so 503 is not.
+        let cfg = RetryConfig {
+            codes: vec!["40*".into()],
+            ..test_cfg()
+        };
+        assert!(is_retryable(&cfg, &http_err(StatusCode::NotFound)));
+        assert!(!is_retryable(
+            &cfg,
+            &http_err(StatusCode::ServiceUnavailable)
+        ));
+        // `*` retries everything.
+        let any = RetryConfig {
+            codes: vec!["*".into()],
+            ..test_cfg()
+        };
+        assert!(is_retryable(&any, &http_err(StatusCode::Ok)));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn with_retry_returns_first_success() {
+        let cfg = test_cfg();
         let mut calls = 0u32;
-        let out: azure_core::Result<u32> = with_retry("op", "blob", || {
+        let out: azure_core::Result<u32> = with_retry(&cfg, "op", "blob", || {
             calls += 1;
             async { Ok(7u32) }
         })
@@ -980,10 +1162,11 @@ mod tests {
         assert_eq!(calls, 1, "success must not retry");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn with_retry_recovers_after_transient_failures() {
+        let cfg = test_cfg();
         let mut calls = 0u32;
-        let out: azure_core::Result<u32> = with_retry("op", "blob", || {
+        let out: azure_core::Result<u32> = with_retry(&cfg, "op", "blob", || {
             calls += 1;
             let n = calls;
             async move {
@@ -999,22 +1182,27 @@ mod tests {
         assert_eq!(calls, 3, "should succeed on the 3rd attempt");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn with_retry_gives_up_after_max_attempts() {
+        let cfg = test_cfg();
         let mut calls = 0u32;
-        let out: azure_core::Result<u32> = with_retry("op", "blob", || {
+        let out: azure_core::Result<u32> = with_retry(&cfg, "op", "blob", || {
             calls += 1;
             async { Err::<u32, _>(http_err(StatusCode::ServiceUnavailable)) }
         })
         .await;
         assert!(out.is_err());
-        assert_eq!(calls, AZURE_OP_ATTEMPTS, "must stop at the attempt cap");
+        assert_eq!(
+            calls, cfg.attempts,
+            "must stop at the configured attempt cap"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn with_retry_does_not_retry_client_errors() {
+        let cfg = test_cfg();
         let mut calls = 0u32;
-        let out: azure_core::Result<u32> = with_retry("op", "blob", || {
+        let out: azure_core::Result<u32> = with_retry(&cfg, "op", "blob", || {
             calls += 1;
             async { Err::<u32, _>(http_err(StatusCode::NotFound)) }
         })
