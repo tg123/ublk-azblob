@@ -78,13 +78,16 @@ fn readopt_targets(volumes: &mut HashMap<String, Published>, targets: Vec<String
         if volumes.contains_key(&meta.volume_id) {
             continue;
         }
-        // Prefer a currently-valid pid; for NBD re-derive from /sys/block in case
-        // the persisted pid became stale across the restart.
-        let pid = if meta.nbd {
-            mount::nbd_pid(&meta.device).unwrap_or(meta.pid)
-        } else {
-            meta.pid
-        };
+        // Teardown SIGINTs this pid to shut the volume's `ublk-azblob` process
+        // down cleanly (flush + blob-lease release); `meta.pid` is that
+        // server/child pid, recorded at publish. Re-adoption only happens for a
+        // still-live mount, and the detached child keeps running with the same
+        // pid across a plugin restart, so `meta.pid` is valid here.
+        //
+        // For NBD, do NOT re-derive from `/sys/block/<dev>/pid`: that is the
+        // nbd-client blocked in `NBD_DO_IT`, not our server — signalling it would
+        // leave the server (and its held lease) running.
+        let pid = meta.pid;
         info!(
             volume_id = %meta.volume_id,
             device = %meta.device,

@@ -861,9 +861,7 @@ pub fn our_target_mounts(entries: &[MountEntry]) -> Vec<String> {
         }
         let is_overlay_ours =
             e.fstype == "overlay" && e.super_opts.contains("/.ublk-overlay-lower");
-        let is_device_ours = (e.source.starts_with("/dev/nbd")
-            || e.source.starts_with("/dev/ublkb"))
-            && !e.mountpoint.ends_with("/.ublk-overlay-lower");
+        let is_device_ours = e.source.starts_with("/dev/nbd") || e.source.starts_with("/dev/ublkb");
         if is_overlay_ours || is_device_ours {
             targets.push(e.mountpoint.clone());
         }
@@ -880,14 +878,6 @@ pub fn scan_our_targets() -> Vec<String> {
             Vec::new()
         }
     }
-}
-
-/// PID of the NBD server/client backing `/dev/nbdN`, read from
-/// `/sys/block/nbdN/pid`; `None` if the device is not connected.
-pub fn nbd_pid(device: &str) -> Option<u32> {
-    let name = Path::new(device).file_name()?.to_str()?;
-    let text = std::fs::read_to_string(format!("/sys/block/{name}/pid")).ok()?;
-    text.trim().parse().ok()
 }
 
 /// Whether process `pid` is currently alive (`kill(pid, 0)` succeeds).
