@@ -149,6 +149,9 @@ pub async fn run_csi(
     if matches!(role, Role::Node | Role::All) {
         info!(node_id = %node_id, "enabling CSI node service");
         let node = node::NodeService::new(node_id, config);
+        // Re-adopt any volumes whose device survived a previous plugin instance,
+        // so their NodeUnpublishVolume still tears the device/overlay down.
+        node.recover();
         builder = builder.add_service(NodeServer::new(node));
     }
 
