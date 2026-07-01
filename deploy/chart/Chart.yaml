@@ -16,3 +16,29 @@ sources:
 maintainers:
   - name: tg123
     url: https://github.com/tg123
+annotations:
+  # Artifact Hub metadata: https://artifacthub.io/docs/topics/annotations/helm/
+  artifacthub.io/category: storage
+  artifacthub.io/license: MIT
+  artifacthub.io/operator: "false"
+  artifacthub.io/prerelease: "true"
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/tg123/ublk-azblob
+    - name: documentation
+      url: https://github.com/tg123/ublk-azblob/blob/main/deploy/chart/README.md
+    - name: design
+      url: https://github.com/tg123/ublk-azblob/blob/main/DESIGN.md
+  artifacthub.io/maintainers: |
+    - name: tg123
+      url: https://github.com/tg123
+  artifacthub.io/images: |
+    - name: ublk-azblob
+      image: docker.io/farmer1992/ublk-azblob:latest
+    - name: csi-provisioner
+      image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+    - name: csi-node-driver-registrar
+      image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial publication of the ublk-azblob CSI driver Helm chart
