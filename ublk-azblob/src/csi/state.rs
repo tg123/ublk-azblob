@@ -66,6 +66,13 @@ pub struct VolumeState {
     pub readonly: bool,
     /// Backing device mode (ublk vs NBD) and its recovery selectors.
     pub device_mode: DeviceMode,
+    /// PID of the `ublk-azblob run` child that was serving the device when the
+    /// record was written. On recovery it is used as a liveness probe: if the
+    /// process is still alive (its cgroup outlived the plugin) the device is
+    /// re-adopted in place; if it is gone the device is re-spawned via
+    /// `run --recover`.
+    #[serde(default)]
+    pub pid: u32,
     /// Ephemeral overlay scratch dirs, when the volume was published with an
     /// overlay (the writable upper is node-local and is *not* recovered across a
     /// full teardown, but the dirs are recorded so unpublish can clean up).
@@ -173,6 +180,7 @@ mod tests {
             mount_flags: vec!["noatime".to_string()],
             readonly: false,
             device_mode: DeviceMode::Ublk { dev_id: 7 },
+            pid: 4242,
             overlay: None,
             env: vec![("UBLK_BLOB_URL".to_string(), "http://x/c/b".to_string())],
         };
@@ -197,6 +205,7 @@ mod tests {
                 device: "/dev/nbd3".to_string(),
                 listen: "127.0.0.1:10809".to_string(),
             },
+            pid: 0,
             overlay: None,
             env: vec![],
         };

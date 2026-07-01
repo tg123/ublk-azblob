@@ -682,7 +682,7 @@ pub fn mount(
 ///     under an operator-chosen base (`overlayScratchDir`), on that base's
 ///     filesystem — not on the target's — and are pruned explicitly via
 ///     `scratch_root` on teardown so nothing leaks.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OverlayDirs {
     /// Read-only mount point of the immutable lower filesystem.
     pub lower: String,
@@ -861,6 +861,24 @@ fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether process `pid` is currently alive (`kill(pid, 0)` succeeds).
+pub fn pid_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 only probes for the process; no signal sent.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Poll until `pid` exits or `timeout` elapses. Returns `true` if it exited.
+pub fn wait_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !pid_alive(pid)
 }
 
 #[cfg(test)]
@@ -1088,5 +1106,19 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pid_alive_and_wait_pid_exit() {
+        // This process is alive; a reaped/never-used high pid is not.
+        assert!(pid_alive(std::process::id()));
+        // Spawn a short-lived child, wait for it, then confirm it's gone.
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(
+            wait_pid_exit(pid, Duration::from_secs(2)),
+            "reaped pid must read as exited"
+        );
     }
 }

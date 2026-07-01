@@ -44,7 +44,13 @@ fn split_opts(opts: &str) -> Vec<String> {
 
 /// A currently-published volume and the resources backing it.
 struct Published {
-    child: Child,
+    /// Owned child handle when *this* process spawned the device. `None` for a
+    /// volume re-adopted on startup ([`NodeService::recover`]): its child was
+    /// spawned by a prior plugin instance and survives the restart, so we only
+    /// hold its `pid`. Teardown signals `pid` in either case.
+    child: Option<Child>,
+    /// PID of the `ublk-azblob run` child serving the device.
+    pid: u32,
     device: String,
     target: String,
     /// When `Some`, the volume is published through an ephemeral overlay: the
@@ -206,6 +212,12 @@ impl NodeService {
     /// somehow lost we re-mount it. Records that can't be recovered (e.g. after a
     /// full node reboot that destroyed the devices) are pruned so the kubelet can
     /// re-publish from scratch.
+    ///
+    /// If the previous `run` child is *still alive* (its cgroup outlived the
+    /// plugin, e.g. an in-container binary restart rather than a full pod
+    /// replacement) the device is not quiesced and must not be re-spawned; the
+    /// volume is instead re-adopted in place from its recorded pid so a later
+    /// `NodeUnpublishVolume` can still tear it down.
     pub async fn recover(&self) {
         let records = state::load_all();
         if records.is_empty() {
@@ -219,6 +231,42 @@ impl NodeService {
             let nbd_port_start = self.config.nbd_port_start;
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let _guard = publish_lock.lock().unwrap();
+
+                // The device path is fixed by the record and can be derived
+                // without spawning anything.
+                let device = match &record.device_mode {
+                    state::DeviceMode::Ublk { dev_id } => format!("/dev/ublkb{dev_id}"),
+                    state::DeviceMode::Nbd { device, .. } => device.clone(),
+                };
+
+                // Fast path: the previous `run` child is still alive (its cgroup
+                // outlived the plugin) and its mount is intact. The device is not
+                // quiesced, so re-spawning `run --recover` would collide with the
+                // live server — re-adopt it in place from the recorded pid so
+                // unpublish can still tear it down.
+                if record.pid != 0
+                    && mount::pid_alive(record.pid)
+                    && mount::is_mounted(&record.target)
+                {
+                    info!(
+                        volume_id = %record.volume_id,
+                        device = %device,
+                        pid = record.pid,
+                        "re-adopted still-live volume after node-plugin restart"
+                    );
+                    volumes.lock().unwrap().insert(
+                        record.volume_id.clone(),
+                        Published {
+                            child: None,
+                            pid: record.pid,
+                            device,
+                            target: record.target.clone(),
+                            overlay: record.overlay.clone(),
+                        },
+                    );
+                    return Ok(());
+                }
+
                 let (mut child, device) = match &record.device_mode {
                     state::DeviceMode::Ublk { dev_id } => {
                         let device = format!("/dev/ublkb{dev_id}");
@@ -297,10 +345,12 @@ impl NodeService {
                 }
 
                 mount::drain_child_output(&mut child);
+                let pid = child.id();
                 volumes.lock().unwrap().insert(
                     record.volume_id.clone(),
                     Published {
-                        child,
+                        child: Some(child),
+                        pid,
                         device,
                         target: record.target.clone(),
                         overlay: record.overlay.clone(),
@@ -655,6 +705,7 @@ impl Node for NodeService {
 
             // Keep the long-lived child's pipes drained so it can't block.
             mount::drain_child_output(&mut child);
+            let pid = child.id();
 
             // Persist a recoverable record of this volume *before* publishing it
             // to the in-memory registry, so a node-local restart of the plugin
@@ -669,6 +720,7 @@ impl Node for NodeService {
                 mount_flags: mount_flags.clone(),
                 readonly,
                 device_mode,
+                pid,
                 overlay: overlay_dirs.clone(),
                 env: env.clone(),
             };
@@ -682,7 +734,8 @@ impl Node for NodeService {
             volumes.lock().unwrap().insert(
                 volume_id,
                 Published {
-                    child,
+                    child: Some(child),
+                    pid,
                     device,
                     target,
                     overlay: overlay_dirs,
@@ -739,15 +792,27 @@ impl Node for NodeService {
                         warn!(error = %format!("{e:#}"), "overlay teardown failed");
                     }
                 }
-                info!(device = %p.device, "stopping ublk device");
-                mount::signal_pid(p.child.id(), libc::SIGINT);
-                let mut child = p.child;
-                match child.wait() {
-                    Ok(status) if !status.success() => {
-                        warn!(%status, "ublk-azblob exited non-zero on shutdown");
+                info!(device = %p.device, pid = p.pid, "stopping ublk device");
+                mount::signal_pid(p.pid, libc::SIGINT);
+                match p.child {
+                    // Owned child: reap it directly.
+                    Some(mut child) => match child.wait() {
+                        Ok(status) if !status.success() => {
+                            warn!(%status, "ublk-azblob exited non-zero on shutdown");
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "wait on ublk-azblob child failed"),
+                    },
+                    // Re-adopted child (spawned by a prior plugin instance): we
+                    // can't `wait()` on a process we don't own, so poll for exit.
+                    None => {
+                        if !mount::wait_pid_exit(p.pid, Duration::from_secs(30)) {
+                            warn!(
+                                pid = p.pid,
+                                "re-adopted device child did not exit after SIGINT"
+                            );
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "wait on ublk-azblob child failed"),
                 }
             } else {
                 warn!(%volume_id, "no tracked device for volume on unpublish");
