@@ -25,7 +25,81 @@ use bytes::Bytes;
 use futures::stream::{StreamExt as _, TryStreamExt as _};
 use std::sync::Arc;
 use std::sync::RwLock;
-use tracing::{error, info, instrument, trace};
+use std::time::Duration;
+use tracing::{error, info, instrument, trace, warn};
+
+/// Maximum attempts (initial try + retries) for a single Azure page-blob
+/// operation before the error is surfaced to the block layer.
+const AZURE_OP_ATTEMPTS: u32 = 5;
+/// Backoff before the first retry; doubles each attempt up to [`AZURE_RETRY_MAX`].
+const AZURE_RETRY_BASE: Duration = Duration::from_millis(200);
+/// Upper bound on a single backoff sleep.
+const AZURE_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// Whether an Azure SDK error is worth retrying. Throttling and transient server
+/// failures — HTTP 408 (Request Timeout), 429 (Too Many Requests) and any 5xx —
+/// plus non-HTTP errors (transport timeouts, connection resets, DNS) are
+/// retryable. Deterministic client errors (auth failures, 404, 416 invalid
+/// range, precondition) are not: retrying them only delays the inevitable.
+fn is_retryable(err: &azure_core::Error) -> bool {
+    match err.kind() {
+        azure_core::error::ErrorKind::HttpResponse { status, .. } => {
+            let code = u16::from(*status);
+            code == 408 || code == 429 || (500..=599).contains(&code)
+        }
+        // No HTTP status ⇒ a transport/IO/timeout error — worth retrying.
+        _ => true,
+    }
+}
+
+/// Run an idempotent Azure page-blob operation with bounded exponential backoff
+/// (plus jitter) on transient failures.
+///
+/// Reads (`Get Blob`) and page writes (`Put Page` / `Clear Pages`) are
+/// idempotent, so retrying is safe. Without this, a single throttling (503),
+/// timeout, or mid-stream connection reset propagates straight to the ublk/NBD
+/// block device as an `Input/output error`, which corrupts an in-flight read
+/// (e.g. git's streaming pack read → "invalid index-pack / unresolved deltas").
+async fn with_retry<T, F, Fut>(op: &str, blob: &str, mut f: F) -> azure_core::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = azure_core::Result<T>>,
+{
+    let mut delay = AZURE_RETRY_BASE;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt >= AZURE_OP_ATTEMPTS || !is_retryable(&e) {
+                    return Err(e);
+                }
+                // Cheap jitter (no `rand` dependency): 0–127 ms off the clock, to
+                // desynchronise retries when many pages are throttled at once
+                // (e.g. during cache warm-up).
+                let jitter = Duration::from_millis(
+                    (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0)
+                        % 128) as u64,
+                );
+                let backoff = delay + jitter;
+                warn!(
+                    op,
+                    blob,
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %e,
+                    "retryable Azure error; backing off"
+                );
+                tokio::time::sleep(backoff).await;
+                delay = (delay * 2).min(AZURE_RETRY_MAX);
+            }
+        }
+    }
+}
 
 /// Azure Page Blob backend.
 ///
@@ -508,19 +582,20 @@ impl BlobBackend for AzurePageBlobBackend {
         trace!(offset, len, "downloading range");
         self.gateway
             .download(class, len, async move {
-                let opts = BlobClientDownloadOptions {
-                    range: Some(HttpRange::new(offset, len)),
-                    ..Default::default()
-                };
-                let result = blob_client.download(Some(opts)).await.with_context(|| {
-                    format!("download blob '{blob_name}' offset={offset} len={len}")
-                })?;
-                let data = result
-                    .body
-                    .collect()
-                    .await
-                    .with_context(|| format!("collect body for blob '{blob_name}'"))?;
-                Ok(data)
+                with_retry("download", &blob_name, || {
+                    let blob_client = blob_client.clone();
+                    async move {
+                        let opts = BlobClientDownloadOptions {
+                            range: Some(HttpRange::new(offset, len)),
+                            ..Default::default()
+                        };
+                        let result = blob_client.download(Some(opts)).await?;
+                        let data = result.body.collect().await?;
+                        Ok(data)
+                    }
+                })
+                .await
+                .with_context(|| format!("download blob '{blob_name}' offset={offset} len={len}"))
             })
             .await
     }
@@ -540,28 +615,31 @@ impl BlobBackend for AzurePageBlobBackend {
         let blob_client = self.container.blob_client(&self.blob_name);
         let page_client = Arc::new(blob_client.page_blob_client());
         let blob_name = self.blob_name.clone();
-        let range = HttpRange::new(offset, len);
         let class = current_class().unwrap_or(IoClass::Flush);
+        let lease_id = self.lease_id();
         trace!(offset, len, "uploading pages");
-        let opts = PageBlobClientUploadPagesOptions {
-            lease_id: self.lease_id(),
-            ..Default::default()
-        };
         let etag = self
             .gateway
             .upload(class, len, async move {
-                let resp = page_client
-                    .upload_pages(
-                        azure_core::http::RequestContent::from(data.to_vec()),
-                        len,
-                        range,
-                        Some(opts),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("upload_pages blob '{blob_name}' offset={offset} len={len}")
-                    })?;
-                Ok::<_, anyhow::Error>(resp.etag().ok().flatten().map(|e| e.to_string()))
+                with_retry("upload_pages", &blob_name, || {
+                    let page_client = page_client.clone();
+                    let content = azure_core::http::RequestContent::from(data.to_vec());
+                    let range = HttpRange::new(offset, len);
+                    let opts = PageBlobClientUploadPagesOptions {
+                        lease_id: lease_id.clone(),
+                        ..Default::default()
+                    };
+                    async move {
+                        let resp = page_client
+                            .upload_pages(content, len, range, Some(opts))
+                            .await?;
+                        Ok(resp.etag().ok().flatten().map(|e| e.to_string()))
+                    }
+                })
+                .await
+                .with_context(|| {
+                    format!("upload_pages blob '{blob_name}' offset={offset} len={len}")
+                })
             })
             .await?;
         // The Put Page response already carries the blob's new ETag; cache it so
@@ -585,23 +663,28 @@ impl BlobBackend for AzurePageBlobBackend {
         let blob_client = self.container.blob_client(&self.blob_name);
         let page_client = Arc::new(blob_client.page_blob_client());
         let blob_name = self.blob_name.clone();
-        let range = HttpRange::new(offset, len);
         let class = current_class().unwrap_or(IoClass::Flush);
+        let lease_id = self.lease_id();
         trace!(offset, len, "clearing pages");
-        let opts = PageBlobClientClearPagesOptions {
-            lease_id: self.lease_id(),
-            ..Default::default()
-        };
         let etag = self
             .gateway
             .upload(class, 0, async move {
-                let resp = page_client
-                    .clear_pages(range, Some(opts))
-                    .await
-                    .with_context(|| {
-                        format!("clear_pages blob '{blob_name}' offset={offset} len={len}")
-                    })?;
-                Ok::<_, anyhow::Error>(resp.etag().ok().flatten().map(|e| e.to_string()))
+                with_retry("clear_pages", &blob_name, || {
+                    let page_client = page_client.clone();
+                    let range = HttpRange::new(offset, len);
+                    let opts = PageBlobClientClearPagesOptions {
+                        lease_id: lease_id.clone(),
+                        ..Default::default()
+                    };
+                    async move {
+                        let resp = page_client.clear_pages(range, Some(opts)).await?;
+                        Ok(resp.etag().ok().flatten().map(|e| e.to_string()))
+                    }
+                })
+                .await
+                .with_context(|| {
+                    format!("clear_pages blob '{blob_name}' offset={offset} len={len}")
+                })
             })
             .await?;
         // Clear Pages also mutates the blob and returns the new ETag; keep the
@@ -836,5 +919,107 @@ mod tests {
     fn extract_tag_handles_whitespace() {
         assert_eq!(extract_tag_u64("<Start> 42 </Start>", "Start").unwrap(), 42);
         assert!(extract_tag_u64("<Start>42</Start>", "End").is_err());
+    }
+
+    // ── retry classification + backoff behaviour ───────────────────────────
+
+    use super::{is_retryable, with_retry, AZURE_OP_ATTEMPTS};
+    use azure_core::error::{Error, ErrorKind};
+    use azure_core::http::StatusCode;
+
+    fn http_err(status: StatusCode) -> Error {
+        Error::with_message(
+            ErrorKind::HttpResponse {
+                status,
+                error_code: None,
+                raw_response: None,
+            },
+            "synthetic",
+        )
+    }
+
+    #[test]
+    fn retryable_covers_throttling_5xx_and_transport_only() {
+        for s in [
+            StatusCode::RequestTimeout,      // 408
+            StatusCode::TooManyRequests,     // 429
+            StatusCode::InternalServerError, // 500
+            StatusCode::BadGateway,          // 502
+            StatusCode::ServiceUnavailable,  // 503
+            StatusCode::GatewayTimeout,      // 504
+        ] {
+            assert!(is_retryable(&http_err(s)), "{s:?} must be retryable");
+        }
+        for s in [
+            StatusCode::Ok,                           // 200
+            StatusCode::Unauthorized,                 // 401
+            StatusCode::Forbidden,                    // 403
+            StatusCode::NotFound,                     // 404
+            StatusCode::PreconditionFailed,           // 412
+            StatusCode::RequestedRangeNotSatisfiable, // 416
+        ] {
+            assert!(!is_retryable(&http_err(s)), "{s:?} must NOT be retryable");
+        }
+        // No HTTP status ⇒ transport/IO error ⇒ retryable.
+        assert!(is_retryable(&Error::with_message(
+            ErrorKind::Connection,
+            "reset"
+        )));
+        assert!(is_retryable(&Error::with_message(ErrorKind::Io, "timeout")));
+    }
+
+    #[tokio::test]
+    async fn with_retry_returns_first_success() {
+        let mut calls = 0u32;
+        let out: azure_core::Result<u32> = with_retry("op", "blob", || {
+            calls += 1;
+            async { Ok(7u32) }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(calls, 1, "success must not retry");
+    }
+
+    #[tokio::test]
+    async fn with_retry_recovers_after_transient_failures() {
+        let mut calls = 0u32;
+        let out: azure_core::Result<u32> = with_retry("op", "blob", || {
+            calls += 1;
+            let n = calls;
+            async move {
+                if n < 3 {
+                    Err(http_err(StatusCode::ServiceUnavailable))
+                } else {
+                    Ok(42u32)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 42);
+        assert_eq!(calls, 3, "should succeed on the 3rd attempt");
+    }
+
+    #[tokio::test]
+    async fn with_retry_gives_up_after_max_attempts() {
+        let mut calls = 0u32;
+        let out: azure_core::Result<u32> = with_retry("op", "blob", || {
+            calls += 1;
+            async { Err::<u32, _>(http_err(StatusCode::ServiceUnavailable)) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls, AZURE_OP_ATTEMPTS, "must stop at the attempt cap");
+    }
+
+    #[tokio::test]
+    async fn with_retry_does_not_retry_client_errors() {
+        let mut calls = 0u32;
+        let out: azure_core::Result<u32> = with_retry("op", "blob", || {
+            calls += 1;
+            async { Err::<u32, _>(http_err(StatusCode::NotFound)) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls, 1, "a 404 must fail fast without retrying");
     }
 }
