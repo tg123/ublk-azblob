@@ -511,7 +511,7 @@ pub fn mount(
 ///     under an operator-chosen base (`overlayScratchDir`), on that base's
 ///     filesystem — not on the target's — and are pruned explicitly via
 ///     `scratch_root` on teardown so nothing leaks.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverlayDirs {
     /// Read-only mount point of the immutable lower filesystem.
     pub lower: String,
@@ -690,6 +690,222 @@ fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Persisted, node-local record of a published volume, written next to the CSI
+/// target on `NodePublishVolume` and reloaded on node-plugin startup.
+///
+/// The node service keeps its live volume table (`volume_id → device/child`)
+/// only in memory, so a plugin restart loses it while the detached device child
+/// keeps running (so active mounts survive the restart). Without a way to
+/// re-associate the surviving device with its `volume_id`, a later
+/// `NodeUnpublishVolume` cannot tear the device / overlay lower down and it
+/// leaks (the kubelet volume reconciler then keeps probing the orphaned device,
+/// logging `Buffer I/O error … async page read`). This record lets startup
+/// recovery rebuild that association from the still-present mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeMeta {
+    pub volume_id: String,
+    /// Backing device node (`/dev/nbdN` or `/dev/ublkbN`).
+    pub device: String,
+    /// PID of the `ublk-azblob run` child serving the device.
+    pub pid: u32,
+    /// Whether the device is served over NBD (`/dev/nbdN`) vs ublk.
+    pub nbd: bool,
+    /// Overlay scratch dirs when the volume is published through an ephemeral
+    /// overlay; `None` for a plain (directly mounted) volume.
+    pub overlay: Option<OverlayDirs>,
+}
+
+/// File name of the per-volume metadata sidecar, written as a hidden sibling of
+/// the CSI target (same directory as `.ublk-overlay-lower`), so it lives on the
+/// per-volume kubelet directory and is naturally discarded with the volume.
+const VOLUME_META_NAME: &str = ".ublk-volume-meta";
+
+/// Path of the metadata sidecar for `target`.
+pub fn meta_path(target: &str) -> std::path::PathBuf {
+    Path::new(target)
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .join(VOLUME_META_NAME)
+}
+
+impl VolumeMeta {
+    /// Serialize to a simple tab-separated `key\tvalue` line format (no external
+    /// serialization dependency; paths never contain tabs or newlines).
+    pub fn serialize(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("volume_id\t{}\n", self.volume_id));
+        s.push_str(&format!("device\t{}\n", self.device));
+        s.push_str(&format!("pid\t{}\n", self.pid));
+        s.push_str(&format!("nbd\t{}\n", self.nbd));
+        if let Some(o) = &self.overlay {
+            s.push_str("overlay\ttrue\n");
+            s.push_str(&format!("lower\t{}\n", o.lower));
+            s.push_str(&format!("upper\t{}\n", o.upper));
+            s.push_str(&format!("work\t{}\n", o.work));
+            if let Some(root) = &o.scratch_root {
+                s.push_str(&format!("scratch_root\t{root}\n"));
+            }
+        } else {
+            s.push_str("overlay\tfalse\n");
+        }
+        s
+    }
+
+    /// Parse the tab-separated format produced by [`serialize`](Self::serialize).
+    /// Returns `None` if a required field is missing or malformed.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut map = std::collections::HashMap::new();
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('\t') {
+                map.insert(k.trim(), v.to_string());
+            }
+        }
+        let volume_id = map.get("volume_id")?.clone();
+        let device = map.get("device")?.clone();
+        let pid = map.get("pid")?.parse().ok()?;
+        let nbd = map.get("nbd").map(|v| v == "true").unwrap_or(false);
+        let overlay = if map.get("overlay").map(|v| v == "true").unwrap_or(false) {
+            Some(OverlayDirs {
+                lower: map.get("lower")?.clone(),
+                upper: map.get("upper")?.clone(),
+                work: map.get("work")?.clone(),
+                scratch_root: map.get("scratch_root").cloned(),
+            })
+        } else {
+            None
+        };
+        Some(VolumeMeta {
+            volume_id,
+            device,
+            pid,
+            nbd,
+            overlay,
+        })
+    }
+}
+
+/// Write the metadata sidecar for `target` atomically (temp file + rename) so a
+/// crash mid-write never leaves a torn record.
+pub fn write_volume_meta(target: &str, meta: &VolumeMeta) -> anyhow::Result<()> {
+    let path = meta_path(target);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, meta.serialize())
+        .with_context(|| format!("write volume meta {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename volume meta into place {}", path.display()))?;
+    Ok(())
+}
+
+/// Read and parse the metadata sidecar for `target`, if present and valid.
+pub fn read_volume_meta(target: &str) -> Option<VolumeMeta> {
+    let text = std::fs::read_to_string(meta_path(target)).ok()?;
+    VolumeMeta::parse(&text)
+}
+
+/// Remove the metadata sidecar for `target` (idempotent).
+pub fn remove_volume_meta(target: &str) {
+    let path = meta_path(target);
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %path.display(), error = %e, "failed to remove volume meta");
+        }
+    }
+}
+
+/// One parsed line of `/proc/self/mountinfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry {
+    pub mountpoint: String,
+    pub fstype: String,
+    pub source: String,
+    pub super_opts: String,
+}
+
+/// Parse `/proc/self/mountinfo` content into entries. The mountinfo format has a
+/// variable number of optional tag fields terminated by a single `-`, followed
+/// by `<fstype> <source> <super_opts>`.
+pub fn parse_mountinfo(content: &str) -> Vec<MountEntry> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        // Need at least: id parent maj:min root mountpoint opts ... - fstype src opts
+        let Some(sep) = toks.iter().position(|&t| t == "-") else {
+            continue;
+        };
+        if toks.len() < 5 || sep + 3 >= toks.len() {
+            continue;
+        }
+        out.push(MountEntry {
+            // mountinfo octal-escapes spaces etc.; our paths don't contain them.
+            mountpoint: toks[4].to_string(),
+            fstype: toks[sep + 1].to_string(),
+            source: toks[sep + 2].to_string(),
+            super_opts: toks[sep + 3].to_string(),
+        });
+    }
+    out
+}
+
+/// From parsed mount entries, return the CSI *target* mountpoints this driver
+/// owns: overlay merged mounts whose `lowerdir` is one of our `.ublk-overlay-lower`
+/// mounts, plus plain volumes where a `/dev/nbdN`/`/dev/ublkbN` device is mounted
+/// directly at the target. The `.ublk-overlay-lower` mounts themselves are
+/// excluded (they are the lower, not a target).
+pub fn our_target_mounts(entries: &[MountEntry]) -> Vec<String> {
+    let mut targets = Vec::new();
+    for e in entries {
+        if e.mountpoint.ends_with("/.ublk-overlay-lower") {
+            continue; // the lower, reached via its overlay target instead
+        }
+        let is_overlay_ours =
+            e.fstype == "overlay" && e.super_opts.contains("/.ublk-overlay-lower");
+        let is_device_ours = (e.source.starts_with("/dev/nbd")
+            || e.source.starts_with("/dev/ublkb"))
+            && !e.mountpoint.ends_with("/.ublk-overlay-lower");
+        if is_overlay_ours || is_device_ours {
+            targets.push(e.mountpoint.clone());
+        }
+    }
+    targets
+}
+
+/// Read `/proc/self/mountinfo` and return this driver's live target mountpoints.
+pub fn scan_our_targets() -> Vec<String> {
+    match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(content) => our_target_mounts(&parse_mountinfo(&content)),
+        Err(e) => {
+            warn!(error = %e, "could not read /proc/self/mountinfo for recovery");
+            Vec::new()
+        }
+    }
+}
+
+/// PID of the NBD server/client backing `/dev/nbdN`, read from
+/// `/sys/block/nbdN/pid`; `None` if the device is not connected.
+pub fn nbd_pid(device: &str) -> Option<u32> {
+    let name = Path::new(device).file_name()?.to_str()?;
+    let text = std::fs::read_to_string(format!("/sys/block/{name}/pid")).ok()?;
+    text.trim().parse().ok()
+}
+
+/// Whether process `pid` is currently alive (`kill(pid, 0)` succeeds).
+pub fn pid_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 only probes for the process; no signal sent.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Poll until `pid` exits or `timeout` elapses. Returns `true` if it exited.
+pub fn wait_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !pid_alive(pid)
 }
 
 #[cfg(test)]
@@ -917,5 +1133,132 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── recovery / metadata helpers ────────────────────────────────────────
+
+    fn sample_meta(overlay: bool) -> VolumeMeta {
+        VolumeMeta {
+            volume_id: "vol-123#container#blob".to_string(),
+            device: "/dev/nbd9".to_string(),
+            pid: 4242,
+            nbd: true,
+            overlay: overlay.then(|| OverlayDirs {
+                lower: "/kubelet/pods/u/volumes/x/.ublk-overlay-lower".to_string(),
+                upper: "/kubelet/pods/u/volumes/x/.ublk-overlay-upper".to_string(),
+                work: "/kubelet/pods/u/volumes/x/.ublk-overlay-work".to_string(),
+                scratch_root: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn volume_meta_roundtrips_overlay_and_plain() {
+        for overlay in [false, true] {
+            let m = sample_meta(overlay);
+            let parsed = VolumeMeta::parse(&m.serialize()).expect("parse serialized meta");
+            assert_eq!(parsed, m, "roundtrip mismatch (overlay={overlay})");
+        }
+    }
+
+    #[test]
+    fn volume_meta_roundtrips_with_scratch_root() {
+        let mut m = sample_meta(true);
+        if let Some(o) = &mut m.overlay {
+            o.scratch_root = Some("/mnt/ssd/scratch/vol-123".to_string());
+        }
+        assert_eq!(VolumeMeta::parse(&m.serialize()).unwrap(), m);
+    }
+
+    #[test]
+    fn volume_meta_parse_rejects_incomplete_or_garbage() {
+        assert!(VolumeMeta::parse("volume_id\tv\ndevice\t/dev/nbd0\n").is_none()); // no pid
+        assert!(VolumeMeta::parse("device\t/dev/nbd0\npid\t1\n").is_none()); // no volume_id
+        assert!(VolumeMeta::parse("volume_id\tv\ndevice\t/dev/nbd0\npid\tNaN\n").is_none());
+        // overlay=true but missing lower/upper/work
+        assert!(VolumeMeta::parse("volume_id\tv\ndevice\td\npid\t1\noverlay\ttrue\n").is_none());
+    }
+
+    #[test]
+    fn meta_path_is_hidden_sibling_of_target() {
+        let p = meta_path("/kubelet/pods/u/volumes/kubernetes.io~csi/pvc-x/mount");
+        assert_eq!(
+            p.to_string_lossy(),
+            "/kubelet/pods/u/volumes/kubernetes.io~csi/pvc-x/.ublk-volume-meta"
+        );
+    }
+
+    #[test]
+    fn write_read_remove_volume_meta_on_disk() {
+        let tmp = std::env::temp_dir().join(format!("ublk-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("mount");
+        let target = target.to_string_lossy().into_owned();
+
+        assert!(read_volume_meta(&target).is_none(), "absent → None");
+        let m = sample_meta(true);
+        write_volume_meta(&target, &m).expect("write meta");
+        assert_eq!(read_volume_meta(&target).unwrap(), m);
+        remove_volume_meta(&target);
+        assert!(read_volume_meta(&target).is_none(), "removed → None");
+        remove_volume_meta(&target); // idempotent
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_mountinfo_extracts_mountpoint_fstype_source_opts() {
+        let content = "\
+790 42 43:9 / /kubelet/pods/u/volumes/x/.ublk-overlay-lower ro,relatime - ext4 /dev/nbd9 ro
+791 42 0:55 / /kubelet/pods/u/volumes/x/mount rw,relatime shared:1 - overlay overlay rw,lowerdir=/kubelet/pods/u/volumes/x/.ublk-overlay-lower,upperdir=/a,workdir=/b
+1 0 8:1 / / rw - ext4 /dev/sda1 rw";
+        let e = parse_mountinfo(content);
+        assert_eq!(e.len(), 3);
+        assert_eq!(
+            e[0].mountpoint,
+            "/kubelet/pods/u/volumes/x/.ublk-overlay-lower"
+        );
+        assert_eq!(e[0].fstype, "ext4");
+        assert_eq!(e[0].source, "/dev/nbd9");
+        // Optional field (shared:1) before the '-' must not shift parsing.
+        assert_eq!(e[1].fstype, "overlay");
+        assert!(e[1]
+            .super_opts
+            .contains("lowerdir=/kubelet/pods/u/volumes/x/.ublk-overlay-lower"));
+    }
+
+    #[test]
+    fn our_target_mounts_selects_overlay_and_device_but_not_lower() {
+        let content = "\
+790 42 43:9 / /kubelet/pods/u/volumes/x/.ublk-overlay-lower ro - ext4 /dev/nbd9 ro
+791 42 0:55 / /kubelet/pods/u/volumes/x/mount rw - overlay overlay rw,lowerdir=/kubelet/pods/u/volumes/x/.ublk-overlay-lower,upperdir=/a,workdir=/b
+792 42 43:5 / /kubelet/pods/v/volumes/y/mount rw - ext4 /dev/ublkb3 rw
+793 42 43:1 / /kubelet/pods/w/volumes/z/mount rw - ext4 /dev/nbd4 rw
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 0 0:99 / /var/log rw - overlay overlay rw,lowerdir=/some/other/dir";
+        let mut targets = our_target_mounts(&parse_mountinfo(content));
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![
+                "/kubelet/pods/u/volumes/x/mount".to_string(), // overlay w/ our lower
+                "/kubelet/pods/v/volumes/y/mount".to_string(), // /dev/ublkb3
+                "/kubelet/pods/w/volumes/z/mount".to_string(), // /dev/nbd4
+            ],
+            "must pick our overlay + device targets, exclude the lower, /, and unrelated overlays"
+        );
+    }
+
+    #[test]
+    fn pid_alive_and_wait_pid_exit() {
+        // This process is alive; a reaped/never-used high pid is not.
+        assert!(pid_alive(std::process::id()));
+        // Spawn a short-lived child, wait for it, then confirm it's gone.
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(
+            wait_pid_exit(pid, Duration::from_secs(2)),
+            "reaped pid must read as exited"
+        );
     }
 }

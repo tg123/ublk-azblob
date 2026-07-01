@@ -43,7 +43,13 @@ fn split_opts(opts: &str) -> Vec<String> {
 
 /// A currently-published volume and the resources backing it.
 struct Published {
-    child: Child,
+    /// Owned child handle when *this* process spawned the device. `None` for a
+    /// volume re-adopted on startup ([`NodeService::recover`]): its child was
+    /// spawned by a prior plugin instance and survives the restart, so we only
+    /// hold its `pid`. Teardown signals `pid` in either case.
+    child: Option<Child>,
+    /// PID of the `ublk-azblob run` child serving the device.
+    pid: u32,
     device: String,
     target: String,
     /// When `Some`, the volume is published through an ephemeral overlay: the
@@ -51,6 +57,54 @@ struct Published {
     /// scratch dirs hold the writable upper/work. Unpublish must tear the
     /// overlay (and lower) down and discard the scratch.
     overlay: Option<mount::OverlayDirs>,
+}
+
+/// Rebuild `volumes` by re-adopting each live driver mount `target` from its
+/// persisted recovery metadata. Returns the count newly re-adopted. Entries
+/// already present (or targets without a valid metadata sidecar) are skipped, so
+/// this is idempotent. Split out from [`NodeService::recover`] so the re-adoption
+/// logic can be exercised without a full node service / device.
+fn readopt_targets(volumes: &mut HashMap<String, Published>, targets: Vec<String>) -> usize {
+    let mut adopted = 0usize;
+    for target in targets {
+        let Some(meta) = mount::read_volume_meta(&target) else {
+            warn!(
+                %target,
+                "live driver mount without recoverable metadata; \
+                 unpublish may not fully tear it down"
+            );
+            continue;
+        };
+        if volumes.contains_key(&meta.volume_id) {
+            continue;
+        }
+        // Prefer a currently-valid pid; for NBD re-derive from /sys/block in case
+        // the persisted pid became stale across the restart.
+        let pid = if meta.nbd {
+            mount::nbd_pid(&meta.device).unwrap_or(meta.pid)
+        } else {
+            meta.pid
+        };
+        info!(
+            volume_id = %meta.volume_id,
+            device = %meta.device,
+            pid,
+            %target,
+            "re-adopted volume after node-plugin restart"
+        );
+        volumes.insert(
+            meta.volume_id.clone(),
+            Published {
+                child: None,
+                pid,
+                device: meta.device,
+                target,
+                overlay: meta.overlay,
+            },
+        );
+        adopted += 1;
+    }
+    adopted
 }
 
 /// Node service implementation.
@@ -72,6 +126,32 @@ impl NodeService {
             config,
             volumes: Arc::new(Mutex::new(HashMap::new())),
             publish_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Re-adopt volumes whose device survived a node-plugin restart.
+    ///
+    /// The live volume table is in-memory only, so a plugin restart empties it
+    /// while the detached device children keep serving their mounts (so active
+    /// pods are not disrupted by a plugin upgrade). Without re-adoption, a later
+    /// `NodeUnpublishVolume` for such a volume finds no record and skips teardown
+    /// — leaking the device, its child and (for overlay volumes) the read-only
+    /// lower mount; the kubelet volume reconciler then keeps probing the orphaned
+    /// device (`Buffer I/O error … async page read`).
+    ///
+    /// Recovery scans this driver's live mounts in `/proc/self/mountinfo` and,
+    /// for each, reloads the per-volume metadata sidecar written at publish time
+    /// to rebuild the `volume_id → device/child` association. Idempotent; safe to
+    /// call once at startup before serving.
+    pub fn recover(&self) {
+        let targets = mount::scan_our_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let mut volumes = self.volumes.lock().unwrap();
+        let adopted = readopt_targets(&mut volumes, targets);
+        if adopted > 0 {
+            info!(adopted, "re-adopted volumes after node-plugin restart");
         }
     }
 
@@ -514,10 +594,28 @@ impl Node for NodeService {
 
             // Keep the long-lived child's pipes drained so it can't block.
             mount::drain_child_output(&mut child);
+            let pid = child.id();
+            // Persist a recovery record beside the target so a future plugin
+            // restart can re-adopt this device (see NodeService::recover).
+            let meta = mount::VolumeMeta {
+                volume_id: volume_id.clone(),
+                device: device.clone(),
+                pid,
+                nbd: device.starts_with("/dev/nbd"),
+                overlay: overlay_dirs.clone(),
+            };
+            if let Err(e) = mount::write_volume_meta(&target, &meta) {
+                warn!(
+                    error = %format!("{e:#}"),
+                    "failed to persist volume recovery metadata; \
+                     this volume will not be re-adoptable across a plugin restart"
+                );
+            }
             volumes.lock().unwrap().insert(
                 volume_id,
                 Published {
-                    child,
+                    child: Some(child),
+                    pid,
                     device,
                     target,
                     overlay: overlay_dirs,
@@ -568,19 +666,33 @@ impl Node for NodeService {
                         warn!(error = %format!("{e:#}"), "overlay teardown failed");
                     }
                 }
-                info!(device = %p.device, "stopping ublk device");
-                mount::signal_pid(p.child.id(), libc::SIGINT);
-                let mut child = p.child;
-                match child.wait() {
-                    Ok(status) if !status.success() => {
-                        warn!(%status, "ublk-azblob exited non-zero on shutdown");
+                info!(device = %p.device, pid = p.pid, "stopping ublk device");
+                mount::signal_pid(p.pid, libc::SIGINT);
+                match p.child {
+                    // Owned child: reap it directly.
+                    Some(mut child) => match child.wait() {
+                        Ok(status) if !status.success() => {
+                            warn!(%status, "ublk-azblob exited non-zero on shutdown");
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "wait on ublk-azblob child failed"),
+                    },
+                    // Re-adopted child (spawned by a prior plugin instance): we
+                    // can't `wait()` on a process we don't own, so poll for exit.
+                    None => {
+                        if !mount::wait_pid_exit(p.pid, Duration::from_secs(30)) {
+                            warn!(
+                                pid = p.pid,
+                                "re-adopted device child did not exit after SIGINT"
+                            );
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "wait on ublk-azblob child failed"),
                 }
             } else {
                 warn!(%volume_id, "no tracked device for volume on unpublish");
             }
+            // Drop the recovery record; the volume is gone.
+            mount::remove_volume_meta(&target);
             Ok(())
         })
         .await
@@ -649,8 +761,10 @@ impl Node for NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::{child_blob_url, split_opts};
+    use super::{child_blob_url, readopt_targets, split_opts, Published};
     use crate::bloburl::parse_blob_url;
+    use crate::csi::mount;
+    use std::collections::HashMap;
 
     #[test]
     fn split_opts_parses_mixed_separators() {
@@ -750,5 +864,61 @@ mod tests {
         assert_eq!(r.account, "devstoreaccount1");
         assert_eq!(r.container, "ublk-azblob-volumes");
         assert_eq!(r.blob, "default/volumes/pvc-abc");
+    }
+
+    /// End-to-end re-adoption: emulate publishing an overlay volume (which writes
+    /// a metadata sidecar next to the target), then a node-plugin restart (a fresh
+    /// empty volume table), then recovery driven by the scanned target. The volume
+    /// must be re-adopted with no owned child, the correct device/target/overlay,
+    /// and the persisted pid (the fake device has no `/sys/block/*/pid`). This is
+    /// exactly the flow that previously leaked the overlay lower + child.
+    #[test]
+    fn recovery_readopts_overlay_volume_after_restart() {
+        let base = std::env::temp_dir().join(format!("ublk-recover-{}", std::process::id()));
+        let target = base.join("mount");
+        std::fs::create_dir_all(&target).unwrap();
+        let target_s = target.to_string_lossy().into_owned();
+
+        // As NodePublishVolume would persist for an overlay volume.
+        let meta = mount::VolumeMeta {
+            volume_id: "vol-xyz#c#b".into(),
+            device: "/dev/nbd-nonexistent".into(),
+            pid: 4242,
+            nbd: true,
+            overlay: Some(mount::overlay_dirs(&target_s, None, "vol-xyz#c#b")),
+        };
+        mount::write_volume_meta(&target_s, &meta).unwrap();
+
+        // Fresh plugin instance: empty table, then recover from the live target.
+        let mut volumes: HashMap<String, Published> = HashMap::new();
+        assert_eq!(readopt_targets(&mut volumes, vec![target_s.clone()]), 1);
+
+        let p = volumes.get("vol-xyz#c#b").expect("volume re-adopted");
+        assert!(p.child.is_none(), "re-adopted entry owns no Child");
+        assert_eq!(
+            p.pid, 4242,
+            "falls back to persisted pid when /sys/block absent"
+        );
+        assert_eq!(p.device, "/dev/nbd-nonexistent");
+        assert_eq!(p.target, target_s);
+        assert_eq!(
+            p.overlay.as_ref().unwrap().lower,
+            base.join(".ublk-overlay-lower").to_string_lossy()
+        );
+
+        // Idempotent: a second recovery pass adopts nothing new.
+        assert_eq!(readopt_targets(&mut volumes, vec![target_s.clone()]), 0);
+
+        // A live driver mount with no metadata sidecar is skipped (not adopted).
+        let bare = base.join("bare/mount");
+        std::fs::create_dir_all(&bare).unwrap();
+        let mut empty: HashMap<String, Published> = HashMap::new();
+        assert_eq!(
+            readopt_targets(&mut empty, vec![bare.to_string_lossy().into_owned()]),
+            0
+        );
+
+        mount::remove_volume_meta(&target_s);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
