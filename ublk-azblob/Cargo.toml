@@ -81,6 +81,13 @@ prost = { version = "0.13.4", optional = true }
 prost-types = { version = "0.13.4", optional = true }
 tokio-stream = { version = "0.1.17", features = ["net"], optional = true }
 
+# Serialization for the CSI node plugin's on-disk volume state (used to make a
+# node-local restart of the node plugin non-disruptive). Both crates are already
+# in the dependency graph via kube/k8s-openapi; declaring them directly keeps the
+# state (de)serialization self-contained under the `csi` feature.
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
 # ── Cluster coordination (Kubernetes Lease) ─────────────────────────────────
 # Gated behind the `coordination` feature.  The Azure blob-lease half of the
 # coordinator uses the always-present azure_storage_blob SDK; the cluster-lease
@@ -119,7 +126,7 @@ coordination = ["dep:kube", "dep:k8s-openapi"]
 # implies both `coordination` and, via the default set, `ublk`) so the node
 # side can attach block devices and guard mounts with the cluster + blob locks.
 # Opt out with `--no-default-features`.
-csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "coordination"]
+csi = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio-stream", "dep:serde", "dep:serde_json", "coordination"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full", "test-util"] }

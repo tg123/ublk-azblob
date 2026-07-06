@@ -3286,6 +3286,8 @@ dependencies = [
  "libublk",
  "prost",
  "prost-types",
+ "serde",
+ "serde_json",
  "time",
  "tokio",
  "tokio-stream",

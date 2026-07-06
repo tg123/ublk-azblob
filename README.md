@@ -569,6 +569,22 @@ Key decisions:
    node-persistent mount — an ephemeral `DirectoryOrCreate` is lost to pod churn
    (this is exactly the e2e-only caveat that made the cache-reload test
    environment-sensitive).
+7. **Node-local restart safety.** A crash, OOM kill, or DaemonSet upgrade of the
+   node plugin **on the same node** no longer disrupts pods that already have a
+   volume mounted. Each published volume's `run` child is started with ublk
+   **user-recovery** (`UBLK_F_USER_RECOVERY`), so when the plugin (and its child
+   cgroup) dies abruptly the kernel keeps `/dev/ublkbN` alive but quiesced
+   instead of tearing it down. The plugin records a small per-volume state file
+   under `CSI_STATE_DIR` (default `/csi/state`, on the persistent kubelet plugin
+   hostPath); on startup it re-attaches a fresh `run --recover` child to the same
+   device id, resuming I/O while the existing mount (same `major:minor`) stays
+   valid. NBD volumes have no kernel-side recovery, so they are re-served by
+   re-spawning the NBD server and reconnecting `nbd-client` to the same device
+   node. Records that can't be recovered (e.g. after a full node reboot that
+   destroyed the devices) are pruned so the kubelet re-publishes from scratch.
+   The state file holds the child environment, including any credentials passed
+   as mount secrets, so securing the node-local state directory is the operator's
+   responsibility.
 
 The CSI protobuf is vendored at `ublk-azblob/proto/csi/csi.proto` and compiled
 by `build.rs` **only** when the `csi` feature is enabled, so the default build

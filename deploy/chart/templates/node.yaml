@@ -115,6 +115,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Per-volume recovery state dir (survives container restart /
+            # DaemonSet upgrade via the persistent socket-dir hostPath), used to
+            # re-attach to live devices after a node-local plugin restart.
+            - name: CSI_STATE_DIR
+              value: {{ .Values.node.stateDir | quote }}
             {{- include "ublk-azblob-csi.ioEnv" . | nindent 12 }}
             {{- if .Values.node.useNbd }}
             # NBD mode configuration
