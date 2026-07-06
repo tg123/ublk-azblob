@@ -362,90 +362,6 @@ pub fn wait_for_existing_device(
     bail!("ublk device {dev} did not become ready (last size={last_size}) before timeout");
 }
 
-/// Re-attach an NBD client to an *existing* `/dev/nbdN` device after the backing
-/// server was restarted. NBD has no kernel-side quiesce/recovery, so on a
-/// restart we re-spawn the server (on a possibly new port) and reconnect
-/// `nbd-client` to the *same* device node, keeping the existing mount's
-/// `major:minor` valid. The stale connection is torn down first (`-d`).
-pub fn reconnect_nbd(
-    nbd_listen: &str,
-    device: &str,
-    child: &mut Child,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    let (host, port) = nbd_listen
-        .split_once(':')
-        .with_context(|| format!("invalid NBD listen address: {nbd_listen}"))?;
-    let port_num: u16 = port
-        .parse()
-        .with_context(|| format!("invalid NBD port in listen address: {nbd_listen}"))?;
-    let addr = (host, port_num)
-        .to_socket_addrs()
-        .with_context(|| format!("resolve NBD listen address: {nbd_listen}"))?
-        .next()
-        .with_context(|| format!("no address resolved for NBD listen address: {nbd_listen}"))?;
-
-    let deadline = Instant::now() + timeout;
-
-    // Wait for the freshly-spawned server to start listening (or exit).
-    loop {
-        if Instant::now() >= deadline {
-            bail!("NBD server {nbd_listen} did not start listening before timeout");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        if let Ok(Some(status)) = child.try_wait() {
-            bail!("ublk-azblob NBD server exited before reconnecting: {status}");
-        }
-        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))
-        {
-            drop(stream);
-            break;
-        }
-    }
-
-    // Drop any stale kernel-side connection on this device, then reconnect to
-    // the new server. The `-d` may fail harmlessly if nothing is connected.
-    let _ = Command::new("nbd-client").arg("-d").arg(device).output();
-
-    info!(device = %device, host = %host, port = %port_num, "reconnecting NBD client");
-    let output = Command::new("nbd-client")
-        .arg(host)
-        .arg(port_num.to_string())
-        .arg(device)
-        .arg("-L")
-        .output()
-        .context("failed to run nbd-client")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("nbd-client reconnect failed: {stderr}");
-    }
-
-    // Confirm the kernel published a non-zero size again before declaring success.
-    let mut last_size: u64 = 0;
-    while Instant::now() < deadline {
-        if Path::new(device).exists() {
-            if let Ok(output) = Command::new("blockdev")
-                .arg("--getsize64")
-                .arg(device)
-                .output()
-            {
-                if output.status.success() {
-                    last_size = String::from_utf8_lossy(&output.stdout)
-                        .trim()
-                        .parse()
-                        .unwrap_or(0);
-                    if last_size > 0 {
-                        info!(device = %device, size = last_size, "NBD device reconnected");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    bail!("NBD device {device} did not report a non-zero size (last={last_size}) after reconnect");
-}
-
 /// True if `target` is currently a mount point (checked against `/proc/mounts`).
 ///
 /// Used on node-plugin startup to decide whether a recovered volume's filesystem
@@ -468,10 +384,21 @@ pub fn is_mounted(target: &str) -> bool {
     false
 }
 
-/// Disconnect an NBD device (`nbd-client -d`). Best-effort: fails harmlessly if
-/// nothing is connected.
+/// Disconnect an NBD device (`nbd-client -L -d`). Best-effort: fails harmlessly
+/// if nothing is connected.
+///
+/// `-L` forces the legacy ioctl interface. The default (netlink) path is absent
+/// on the kernels this driver targets — `nbd-client -d` fails there with
+/// "Couldn't resolve the nbd netlink family", leaving the device connected, so
+/// the orphaned mount this is meant to reap keeps spamming
+/// `Buffer I/O error … async page read`. `-L` matches the connect path and
+/// actually tears the connection down.
 pub fn disconnect_nbd(device: &str) {
-    let _ = Command::new("nbd-client").arg("-d").arg(device).output();
+    let _ = Command::new("nbd-client")
+        .arg("-L")
+        .arg("-d")
+        .arg(device)
+        .output();
 }
 
 /// Enumerate this driver's live *device* mounts from `/proc/mounts`: mountpoints

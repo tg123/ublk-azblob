@@ -2090,6 +2090,125 @@ spec:
     );
     log("✓ overlay write landed under the configured overlayScratchDir");
 
+    // ── 4a-bis. Restart-safety for an OVERLAY volume: bouncing the node plugin
+    //        must keep BOTH layers usable by the SAME still-running pod. Test 6
+    //        covers a plain volume; overlays add a second, immutable *lower* mount
+    //        (the snapshot device) beneath the writable upper, so recovery must
+    //        keep the lower readable too — not just remount the merged target.
+    //        Under ublk (CI) the device is quiesced across the restart via
+    //        `UBLK_F_USER_RECOVERY`, so the lower must survive; here we prove the
+    //        overlay *lower* still reads back, the *upper* (pod-local writes) is
+    //        preserved, and new writes still work.
+    let overlay_uid_before = pod_uid("azblob-overlay-app").unwrap_or_else(|| {
+        dump_diagnostics("azblob-overlay-app");
+        panic!("could not read the overlay consumer pod uid before the restart")
+    });
+    let old_node_pod = node_plugin_pod_on(&node).unwrap_or_else(|| {
+        dump_diagnostics("azblob-overlay-app");
+        panic!("no node-plugin pod found on {node}; cannot restart it")
+    });
+    log(&format!(
+        "restarting node plugin on {node} (pod {old_node_pod}) with the overlay consumer holding its mount"
+    ));
+    run(
+        "kubectl",
+        &["-n", NS, "delete", "pod", &old_node_pod, "--wait=true"],
+    );
+    if !try_run(
+        "kubectl",
+        &[
+            "-n",
+            NS,
+            "rollout",
+            "status",
+            "daemonset/csi-ublk-azblob-node",
+            "--timeout=180s",
+        ],
+    ) {
+        dump_diagnostics("azblob-overlay-app");
+        panic!(
+            "node plugin DaemonSet did not roll a fresh Ready pod back after the overlay restart"
+        );
+    }
+    // The consumer must be the SAME pod — otherwise we'd be proving republish, not
+    // that the live overlay mount survived recovery.
+    let overlay_uid_after = pod_uid("azblob-overlay-app").unwrap_or_else(|| {
+        dump_diagnostics("azblob-overlay-app");
+        panic!("could not read the overlay consumer pod uid after the restart")
+    });
+    assert_eq!(
+        overlay_uid_before, overlay_uid_after,
+        "overlay consumer pod was recreated ({overlay_uid_before} -> {overlay_uid_after}); \
+         the test must validate the SAME running pod keeping its overlay mount"
+    );
+    // (a) THE regression check: the immutable lower must still read back. Before
+    //     the remount fix this failed with `EXT4-fs error … reading directory`
+    //     (EIO) because the poisoned lower was never remounted after reconnect.
+    log("verifying the overlay immutable lower is still readable after the node-plugin restart");
+    if !try_run(
+        "kubectl",
+        &[
+            "exec",
+            "deploy/azblob-overlay-app",
+            "--",
+            "/bin/sh",
+            "-c",
+            "grep -q ublk-azblob-overlay-seed /data/seed.txt",
+        ],
+    ) {
+        dump_diagnostics("azblob-overlay-app");
+        let _ = try_run(
+            "kubectl",
+            &[
+                "-n",
+                NS,
+                "logs",
+                "-l",
+                "app=csi-ublk-azblob-node",
+                "--tail=80",
+            ],
+        );
+        panic!(
+            "the overlay immutable lower was unreadable after the node-plugin restart — \
+             recovery did not keep the lower's device/mount alive"
+        );
+    }
+    // (b) the pod-local upper write made before the restart must survive.
+    if !try_run(
+        "kubectl",
+        &[
+            "exec",
+            "deploy/azblob-overlay-app",
+            "--",
+            "/bin/sh",
+            "-c",
+            "grep -q pod-local-write /data/pod-local.txt",
+        ],
+    ) {
+        dump_diagnostics("azblob-overlay-app");
+        panic!(
+            "the pre-restart overlay upper write was lost after the node-plugin restart — \
+             recover() must preserve the overlay upper (pod-local writes)"
+        );
+    }
+    // (c) the recovered overlay must still accept new writes into the upper.
+    if !try_run(
+        "kubectl",
+        &[
+            "exec",
+            "deploy/azblob-overlay-app",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo post-restart-write > /data/after-restart.txt && \
+             grep -q post-restart-write /data/after-restart.txt",
+        ],
+    ) {
+        dump_diagnostics("azblob-overlay-app");
+        panic!("the recovered overlay did not accept a new write after the node-plugin restart");
+    }
+    log("✓ overlay restart-safety: lower readable, upper preserved, new writes work");
+
     // ── 4b. Tearing the pod down prunes the per-volume scratch root ────────────
     log("deleting overlay consumer (unpublish prunes the scratch root)");
     run(

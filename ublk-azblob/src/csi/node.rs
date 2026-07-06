@@ -230,7 +230,6 @@ impl NodeService {
             let volume_id = record.volume_id.clone();
             let volumes = self.volumes.clone();
             let publish_lock = self.publish_lock.clone();
-            let nbd_port_start = self.config.nbd_port_start;
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let _guard = publish_lock.lock().unwrap();
 
@@ -289,42 +288,52 @@ impl NodeService {
                         }
                         (child, device)
                     }
-                    state::DeviceMode::Nbd { device, listen } => {
-                        // NBD has no kernel quiesce; re-serve on a fresh free port
-                        // and reconnect the client to the same /dev/nbdN. The
-                        // persisted `listen` was always built as `host:port`, so a
-                        // missing or empty host is a corrupt record — fail recovery
-                        // (and prune the record) rather than guessing a wrong host.
-                        let host = listen
-                            .split_once(':')
-                            .map(|(h, _)| h)
-                            .filter(|h| !h.is_empty())
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "corrupt NBD listen address {listen:?} (no host:port)"
-                                )
-                            })?;
-                        let port = mount::find_free_port(host, nbd_port_start, 1024)?;
-                        let new_listen = format!("{host}:{port}");
-                        info!(volume_id = %record.volume_id, device = %device, listen = %new_listen, "recovering NBD device");
-                        let mut child = mount::spawn_device(
-                            record.size,
-                            &record.env,
-                            Some(new_listen.clone()),
-                            None,
-                            // Recovery mode: lets coordination break the stale blob
-                            // lease the dead predecessor still holds (NBD has no
-                            // kernel quiesce, but the lease take-over is required).
-                            true,
-                        )?;
-                        if let Err(e) =
-                            mount::reconnect_nbd(&new_listen, device, &mut child, DEVICE_TIMEOUT)
-                        {
-                            mount::signal_pid(child.id(), libc::SIGINT);
-                            let _ = child.wait();
-                            return Err(e);
+                    state::DeviceMode::Nbd { device, .. } => {
+                        // NBD has NO kernel-side quiesce. Once the server child
+                        // dies the socket closes, the kernel device errors (EIO)
+                        // and the mounted filesystem is poisoned. Reconnecting a
+                        // fresh server to the SAME /dev/nbdN does NOT restore it
+                        // (verified on Linux 5.15: only sector 0 reads back, the
+                        // rest return EIO), and a running consumer holds the old
+                        // bind-mount that cannot be swapped underneath it — so
+                        // re-serving would hand the pod a broken mount while
+                        // logging it as "recovered".
+                        //
+                        // So we do NOT re-serve NBD. Instead we mirror the
+                        // conservative behaviour of the prior re-adoption fix:
+                        // re-adopt a still-present mount purely so a later
+                        // NodeUnpublishVolume tears it down (device + lower mount
+                        // + scratch), preventing the orphaned-device leak that
+                        // otherwise makes the kubelet probe a dead device forever
+                        // (`Buffer I/O error … async page read`). If the mount is
+                        // already gone, prune the stale record so the kubelet
+                        // republishes a fresh volume. (ublk restart-safety is
+                        // unaffected — it uses USER_RECOVERY above, which keeps the
+                        // device and its mount alive across the restart.)
+                        if mount::is_mounted(&record.target) {
+                            info!(
+                                volume_id = %record.volume_id,
+                                device = %device,
+                                pid = record.pid,
+                                target = %record.target,
+                                "re-adopted NBD volume for teardown after node-plugin restart (no re-serve)"
+                            );
+                            volumes.lock().unwrap().insert(
+                                record.volume_id.clone(),
+                                Published {
+                                    child: None,
+                                    pid: record.pid,
+                                    device: device.clone(),
+                                    target: record.target.clone(),
+                                    overlay: record.overlay.clone(),
+                                },
+                            );
+                            return Ok(());
                         }
-                        (child, device.clone())
+                        anyhow::bail!(
+                            "NBD volume mount {} is gone after restart; pruning stale record",
+                            record.target
+                        );
                     }
                 };
 
