@@ -105,9 +105,11 @@ pub struct ControllerService {
     config: DriverConfig,
 }
 
-/// Copy each of `keys` present in `params` into `ctx` verbatim. Used to forward
-/// StorageClass parameters the node needs (e.g. cache tuning) through the volume
-/// context, since CSI only hands the node the controller-returned volume context.
+/// Copy each of `keys` present in `params` into `ctx` verbatim (including empty
+/// values). Used to forward StorageClass parameters the node needs (e.g. cache
+/// tuning) through the volume context, since CSI only hands the node the
+/// controller-returned volume context. Consumers that treat an empty value as
+/// "unset" (e.g. the node's `cache_env`) filter it out on their side.
 fn forward_params(
     params: &HashMap<String, String>,
     ctx: &mut HashMap<String, String>,
