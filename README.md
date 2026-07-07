@@ -568,7 +568,12 @@ Key decisions:
    clean cache actually survives depends on the host path being a real
    node-persistent mount — an ephemeral `DirectoryOrCreate` is lost to pod churn
    (this is exactly the e2e-only caveat that made the cache-reload test
-   environment-sensitive).
+   environment-sensitive). The node DaemonSet sets cache defaults, but a
+   `StorageClass` can override them per-volume — `cacheDir`, `cachePageSize`,
+   `cacheMaxBytes`, `cacheSharePages`, `cacheWarmup`, `cacheWarmupBytes` and
+   `cacheWarmupConcurrency` are forwarded through the volume context and turned
+   into the child's `UBLK_CACHE_*` env — so different classes can use different
+   cache paths and options.
 
 The CSI protobuf is vendored at `ublk-azblob/proto/csi/csi.proto` and compiled
 by `build.rs` **only** when the `csi` feature is enabled, so the default build

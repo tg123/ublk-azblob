@@ -158,6 +158,13 @@ to the logical CPU count.
 | `storageClass.parameters.overlay` | Ephemeral overlay over an immutable snapshot template: mount the snapshot read-only as the overlayfs lower and stack a writable node-local upper, so pod writes are kept local and discarded on unpublish (never reach/copy the golden image). Snapshot `templateBlobUrl` only; rejected on writable volumes; needs the `overlay` kernel filesystem | `""` |
 | `storageClass.parameters.overlayScratchDir` | Node-local filesystem backing the ephemeral overlay's writable scratch (overlayfs `upperdir`/`workdir`). Unset ⇒ scratch lives next to the CSI target (kubelet dir); set ⇒ steer pod-local writes onto a chosen mount, e.g. an SSD (large disk-backed scratch) or tmpfs (RAM-backed). Operator must pre-create/mount the path on every node; `upperdir`+`workdir` always live together in a per-volume subdir removed on unpublish. Only meaningful with `overlay` | `""` |
 | `storageClass.parameters.fsck` | Run `fsck` before mounting a writable, formatted volume: `"false"`/`"off"` (default, skip), `"true"`/`"preen"` (`fsck -a`), or `"force"` (`fsck -f -y`). Skipped for freshly-formatted and read-only volumes | `""` |
+| `storageClass.parameters.cacheDir` | Per-StorageClass local-disk cache directory (overrides node-wide `node.cache.hostPath`; must be mounted into the node plugin on every node) | `""` |
+| `storageClass.parameters.cachePageSize` | Per-StorageClass local-disk cache page size in bytes (overrides `node.cache.pageSize`) | `""` |
+| `storageClass.parameters.cacheMaxBytes` | Per-StorageClass max total cache bytes, `0` = unlimited (overrides `node.cache.maxBytes`) | `""` |
+| `storageClass.parameters.cacheSharePages` | Per-StorageClass cross-process clean-page sharing, `"true"`/`"false"` (overrides `node.cache.sharePages`) | `""` |
+| `storageClass.parameters.cacheWarmup` | Per-StorageClass background cache warm-up on start, `"true"`/`"false"` (overrides `node.cache.warmup`) | `""` |
+| `storageClass.parameters.cacheWarmupBytes` | Per-StorageClass warm-up cap in bytes, `0` = auto (overrides `node.cache.warmupBytes`) | `""` |
+| `storageClass.parameters.cacheWarmupConcurrency` | Per-StorageClass warm-up fetch concurrency, `0` = auto | `""` |
 | `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS; `?snapshot=` ⇒ mount the immutable snapshot directly read-only, no copy/lock/lease; non-snapshot ⇒ copy into the per-PVC blob read-write and skip format) | `""` |
 
 ### Global Secret Configuration (secretSearchMode: global)

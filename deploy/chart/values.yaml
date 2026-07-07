@@ -79,6 +79,10 @@ node:
   # When enabled, a host directory is mounted into the node plugin and each
   # volume's `run` child caches blob pages there. The byte budget is enforced
   # across all volumes sharing the directory (LRU eviction of clean pages).
+  # These are the node-wide *defaults*; a StorageClass can override any of them
+  # per-volume via its `cacheDir` / `cachePageSize` / `cacheMaxBytes` /
+  # `cacheSharePages` / `cacheWarmup` / `cacheWarmupBytes` /
+  # `cacheWarmupConcurrency` parameters (see storageClass.parameters).
   cache:
     # Enable the local-disk cache. When false, no cache directory is wired up
     # and volumes stream directly to/from the blob.
@@ -251,6 +255,29 @@ storageClass:
     # mount); upperdir and workdir always live together under it, in a per-volume
     # subdirectory that is removed on unpublish. Only meaningful with overlay.
     # overlayScratchDir: "/mnt/ssd/ublk-overlay"
+
+    # ── Per-StorageClass local-disk cache overrides ─────────────────────────────
+    # These override the node-wide `node.cache.*` defaults (below) for volumes
+    # provisioned by *this* StorageClass, so different classes can cache to
+    # different paths / with different options. Each is optional; when omitted the
+    # volume inherits the node DaemonSet default. They apply to both freshly
+    # provisioned and templateBlobUrl volumes.
+    #
+    # Host directory the volume's cache lives in (must be mounted into the node
+    # plugin — e.g. via node.cache.hostPath — on every node).
+    # cacheDir: "/var/lib/ublk-azblob/cache"
+    # Local-disk cache page size in bytes.
+    # cachePageSize: "1048576"
+    # Max total cache bytes for volumes of this class (0 = unlimited).
+    # cacheMaxBytes: "0"
+    # Cross-process clean-page sharing ("true"/"false").
+    # cacheSharePages: "false"
+    # Background warm-up: prefetch the blob into the cache on start ("true"/"false").
+    # cacheWarmup: "false"
+    # Cap in bytes for warm-up (0 = auto).
+    # cacheWarmupBytes: "0"
+    # Concurrency for warm-up fetches (0 = auto).
+    # cacheWarmupConcurrency: "0"
 
 # Secret configuration for global mode
 # Only used when secretSearchMode: global

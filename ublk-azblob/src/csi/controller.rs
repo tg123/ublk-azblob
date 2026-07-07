@@ -69,6 +69,22 @@ const PARAM_COORDINATION: &str = "coordination";
 const PARAM_LEASE_NAMESPACE: &str = "leaseNamespace";
 const PARAM_RECOVERY_TIMEOUT_SECS: &str = "recoveryTimeoutSecs";
 const PARAM_LEASE_DURATION_SECS: &str = "leaseDurationSecs";
+/// Per-StorageClass local-disk cache tuning (StorageClass `parameters`),
+/// forwarded verbatim into the volume context. The node's `child_env` turns
+/// each into the matching `UBLK_CACHE_*` environment for *that* volume's `run`
+/// child, overriding the node DaemonSet's inherited default — so different
+/// StorageClasses can use different cache paths and options. CSI hands the node
+/// only the volume context (never the raw StorageClass parameters), so the
+/// controller must copy these through.
+const CACHE_PARAMS: &[&str] = &[
+    "cacheDir",
+    "cachePageSize",
+    "cacheMaxBytes",
+    "cacheSharePages",
+    "cacheWarmup",
+    "cacheWarmupBytes",
+    "cacheWarmupConcurrency",
+];
 /// Volume-context key carrying a blob snapshot timestamp.
 ///
 /// This is **not** a StorageClass parameter — it is only populated from a
@@ -87,6 +103,21 @@ const DEFAULT_BLOB_PATH_TEMPLATE: &str = "ublk-azblob-disk/${pv.name}";
 /// Controller service implementation.
 pub struct ControllerService {
     config: DriverConfig,
+}
+
+/// Copy each of `keys` present in `params` into `ctx` verbatim. Used to forward
+/// StorageClass parameters the node needs (e.g. cache tuning) through the volume
+/// context, since CSI only hands the node the controller-returned volume context.
+fn forward_params(
+    params: &HashMap<String, String>,
+    ctx: &mut HashMap<String, String>,
+    keys: &[&str],
+) {
+    for &key in keys {
+        if let Some(v) = params.get(key) {
+            ctx.insert(key.to_string(), v.clone());
+        }
+    }
 }
 
 /// Expand variables in a template string
@@ -294,6 +325,9 @@ impl Controller for ControllerService {
                 if let Some(v) = req.parameters.get(PARAM_OVERLAY_SCRATCH_DIR) {
                     volume_context.insert(PARAM_OVERLAY_SCRATCH_DIR.to_string(), v.clone());
                 }
+                // Per-StorageClass local-disk cache tuning (e.g. warm-up of the
+                // immutable golden image) applies to read-only template mounts too.
+                forward_params(&req.parameters, &mut volume_context, CACHE_PARAMS);
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
                         capacity_bytes: source_size as i64,
@@ -384,16 +418,20 @@ impl Controller for ControllerService {
         // parameters into the volume context, since CSI only hands the node the
         // volume context the controller returns — not the StorageClass parameters.
         // The node's `child_env` reads these keys to enable the cluster/blob lease.
-        for key in [
-            PARAM_COORDINATION,
-            PARAM_LEASE_NAMESPACE,
-            PARAM_RECOVERY_TIMEOUT_SECS,
-            PARAM_LEASE_DURATION_SECS,
-        ] {
-            if let Some(v) = req.parameters.get(key) {
-                volume_context.insert(key.to_string(), v.clone());
-            }
-        }
+        forward_params(
+            &req.parameters,
+            &mut volume_context,
+            &[
+                PARAM_COORDINATION,
+                PARAM_LEASE_NAMESPACE,
+                PARAM_RECOVERY_TIMEOUT_SECS,
+                PARAM_LEASE_DURATION_SECS,
+            ],
+        );
+        // Per-StorageClass local-disk cache tuning (path, size, warm-up, …), so
+        // different StorageClasses can cache differently. The node's `child_env`
+        // turns these into per-volume `UBLK_CACHE_*` env.
+        forward_params(&req.parameters, &mut volume_context, CACHE_PARAMS);
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
