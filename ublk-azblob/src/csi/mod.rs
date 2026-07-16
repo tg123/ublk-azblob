@@ -80,6 +80,10 @@ pub const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// Cluster-coordination keys (`coordination`, `leaseNamespace`, …) are handled
 /// separately by `child_env` and are intentionally *not* listed here.
+///
+/// NOTE: the Helm chart mirrors this list in the `ublk-azblob-csi.tuningParameters`
+/// template (`deploy/chart/templates/_helpers.tpl`); keep the two in sync when
+/// adding or removing a key.
 pub(crate) const TUNING_PARAMS: &[(&str, &str)] = &[
     // Azure I/O concurrency & bandwidth caps.
     ("ioConcurrency", "UBLK_IO_CONCURRENCY"),
