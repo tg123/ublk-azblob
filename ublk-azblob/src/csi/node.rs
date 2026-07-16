@@ -41,24 +41,17 @@ fn split_opts(opts: &str) -> Vec<String> {
         .collect()
 }
 
-/// Map per-StorageClass cache tuning from the volume context (forwarded by the
-/// controller) to the `UBLK_CACHE_*` environment of the volume's `run` child.
+/// Map per-StorageClass tuning from the volume context (forwarded by the
+/// controller) to the `UBLK_*` environment of the volume's `run` child.
 ///
 /// Only non-empty keys are emitted, so each present key overrides the node
 /// DaemonSet's inherited default for *this* volume, while absent keys leave the
 /// inherited default untouched — letting different StorageClasses use different
-/// cache paths and options.
-fn cache_env(ctx: &HashMap<String, String>) -> Vec<(String, String)> {
-    const MAP: &[(&str, &str)] = &[
-        ("cacheDir", "UBLK_CACHE_DIR"),
-        ("cachePageSize", "UBLK_CACHE_PAGE_SIZE"),
-        ("cacheMaxBytes", "UBLK_CACHE_MAX_BYTES"),
-        ("cacheSharePages", "UBLK_CACHE_SHARE_PAGES"),
-        ("cacheWarmup", "UBLK_CACHE_WARMUP"),
-        ("cacheWarmupBytes", "UBLK_CACHE_WARMUP_BYTES"),
-        ("cacheWarmupConcurrency", "UBLK_CACHE_WARMUP_CONCURRENCY"),
-    ];
-    MAP.iter()
+/// I/O, buffering, flush and cache settings. The set of forwarded keys is the
+/// shared [`super::TUNING_PARAMS`] table.
+fn tuning_env(ctx: &HashMap<String, String>) -> Vec<(String, String)> {
+    super::TUNING_PARAMS
+        .iter()
         .filter_map(|(ctx_key, env_key)| {
             ctx.get(*ctx_key)
                 .filter(|s| !s.is_empty())
@@ -296,11 +289,11 @@ impl NodeService {
             env.push(("AZURE_STORAGE_SAS".to_string(), sas));
         }
 
-        // Per-StorageClass local-disk cache tuning: each key the controller
-        // forwarded into the volume context overrides the node DaemonSet's
-        // inherited `UBLK_CACHE_*` default for *this* volume's child, so
-        // different StorageClasses can use different cache paths and options.
-        env.extend(cache_env(ctx));
+        // Per-StorageClass tuning: each key the controller forwarded into the
+        // volume context overrides the node DaemonSet's inherited default
+        // (`UBLK_*`) for *this* volume's child, so different StorageClasses can
+        // use different I/O, buffering, flush and cache settings.
+        env.extend(tuning_env(ctx));
 
         // Cross-process page sharing: when the node enables a shared cache with
         // `UBLK_CACHE_SHARE_PAGES` (per-StorageClass `cacheSharePages`, else
@@ -806,14 +799,14 @@ impl Node for NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_env, cache_share_pages, child_blob_url, readopt_targets, split_opts, Published,
+        cache_share_pages, child_blob_url, readopt_targets, split_opts, tuning_env, Published,
     };
     use crate::bloburl::parse_blob_url;
     use crate::csi::mount;
     use std::collections::HashMap;
 
     #[test]
-    fn cache_env_maps_present_nonempty_keys() {
+    fn tuning_env_maps_present_nonempty_keys() {
         let ctx: HashMap<String, String> = [
             ("cacheDir", "/mnt/ssd/cache"),
             ("cachePageSize", "4194304"),
@@ -822,11 +815,15 @@ mod tests {
             ("cacheWarmup", "true"),
             ("cacheWarmupBytes", "0"),
             ("cacheWarmupConcurrency", "8"),
+            ("maxDirtyPages", "128"),
+            ("pageSize", "0"),
+            ("uploadBandwidth", "1048576"),
+            ("flushConcurrency", "4"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let env: HashMap<String, String> = cache_env(&ctx).into_iter().collect();
+        let env: HashMap<String, String> = tuning_env(&ctx).into_iter().collect();
         assert_eq!(env.get("UBLK_CACHE_DIR").unwrap(), "/mnt/ssd/cache");
         assert_eq!(env.get("UBLK_CACHE_PAGE_SIZE").unwrap(), "4194304");
         assert_eq!(env.get("UBLK_CACHE_MAX_BYTES").unwrap(), "1073741824");
@@ -834,18 +831,22 @@ mod tests {
         assert_eq!(env.get("UBLK_CACHE_WARMUP").unwrap(), "true");
         assert_eq!(env.get("UBLK_CACHE_WARMUP_BYTES").unwrap(), "0");
         assert_eq!(env.get("UBLK_CACHE_WARMUP_CONCURRENCY").unwrap(), "8");
+        assert_eq!(env.get("UBLK_MAX_DIRTY_PAGES").unwrap(), "128");
+        assert_eq!(env.get("UBLK_PAGE_SIZE").unwrap(), "0");
+        assert_eq!(env.get("UBLK_UPLOAD_BANDWIDTH").unwrap(), "1048576");
+        assert_eq!(env.get("UBLK_FLUSH_CONCURRENCY").unwrap(), "4");
     }
 
     #[test]
-    fn cache_env_skips_absent_and_empty_keys() {
-        // No cache keys at all → no env (inherit the node DaemonSet defaults).
-        assert!(cache_env(&HashMap::new()).is_empty());
+    fn tuning_env_skips_absent_and_empty_keys() {
+        // No tuning keys at all → no env (inherit the node DaemonSet defaults).
+        assert!(tuning_env(&HashMap::new()).is_empty());
         // An explicitly-empty value is skipped (does not clobber the inherited
         // default with an empty override).
         let ctx: HashMap<String, String> = [("cacheDir".to_string(), String::new())]
             .into_iter()
             .collect();
-        assert!(cache_env(&ctx).is_empty());
+        assert!(tuning_env(&ctx).is_empty());
     }
 
     #[test]

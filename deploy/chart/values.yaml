@@ -256,13 +256,43 @@ storageClass:
     # subdirectory that is removed on unpublish. Only meaningful with overlay.
     # overlayScratchDir: "/mnt/ssd/ublk-overlay"
 
-    # ── Per-StorageClass local-disk cache overrides ─────────────────────────────
-    # These override the node-wide `node.cache.*` defaults (above) for volumes
-    # provisioned by *this* StorageClass, so different classes can cache to
-    # different paths / with different options. Each is optional; when omitted the
-    # volume inherits the node DaemonSet default. They apply to both freshly
-    # provisioned and templateBlobUrl volumes.
+    # ── Per-StorageClass tuning overrides ───────────────────────────────────────
+    # These override the node-wide defaults (the `io.*` gateway settings and the
+    # `node.cache.*` local-disk cache defaults, both above) for volumes
+    # provisioned by *this* StorageClass, so different classes can tune
+    # independently. Each is optional; when omitted the volume inherits the node
+    # DaemonSet default (or the binary's built-in default). They apply to both
+    # freshly provisioned and templateBlobUrl volumes. All values are strings.
     #
+    # Azure I/O gateway (override the node-wide `io.*` defaults):
+    # Total in-flight Azure operations (0 = auto).
+    # ioConcurrency: "0"
+    # Download / upload split of the I/O budget (0 = auto).
+    # downloadConcurrency: "0"
+    # uploadConcurrency: "0"
+    # Download / upload bandwidth caps in bytes/sec (0 = unlimited).
+    # downloadBandwidth: "0"
+    # uploadBandwidth: "0"
+    #
+    # In-memory write-back buffer:
+    # Buffer page size in bytes; "0" disables buffering (write-through).
+    # pageSize: "4194304"
+    # Max dirty (unflushed) pages held in memory before back-pressure.
+    # maxDirtyPages: "64"
+    # Max total (clean + dirty) pages cached in memory.
+    # maxCachedPages: "256"
+    #
+    # Flush timing / concurrency:
+    # Flush after this many seconds idle.
+    # idleFlushSecs: "15"
+    # Force a flush at least this often (seconds).
+    # forceFlushTimeoutSecs: "600"
+    # Per-flush I/O timeout in seconds (0 = auto).
+    # flushIoTimeoutSecs: "0"
+    # Concurrency for flush uploads (0 = auto).
+    # flushConcurrency: "0"
+    #
+    # Local-disk cache (override the node-wide `node.cache.*` defaults):
     # Host directory the volume's cache lives in (must be mounted into the node
     # plugin — e.g. via node.cache.hostPath — on every node).
     # cacheDir: "/var/lib/ublk-azblob/cache"
@@ -274,6 +304,9 @@ storageClass:
     # Cross-process clean-page sharing ("true"/"false"). Sharing is currently
     # disabled, but "true" still selects a stable per-volume cache file name.
     # cacheSharePages: "false"
+    # Identity used to share clean pages between cache instances (defaults to the
+    # container/blob, so mounts of the same blob share pages).
+    # cacheBlobIdentity: ""
     # Background warm-up: prefetch the blob into the cache on start ("true"/"false").
     # cacheWarmup: "false"
     # Cap in bytes for warm-up (0 = auto).

@@ -54,26 +54,8 @@ parameters:
   {{- if .overlayScratchDir }}
   overlayScratchDir: {{ .overlayScratchDir | quote }}
   {{- end }}
-  {{- if .cacheDir }}
-  cacheDir: {{ .cacheDir | quote }}
-  {{- end }}
-  {{- if .cachePageSize }}
-  cachePageSize: {{ .cachePageSize | quote }}
-  {{- end }}
-  {{- if .cacheMaxBytes }}
-  cacheMaxBytes: {{ .cacheMaxBytes | quote }}
-  {{- end }}
-  {{- if .cacheSharePages }}
-  cacheSharePages: {{ .cacheSharePages | quote }}
-  {{- end }}
-  {{- if .cacheWarmup }}
-  cacheWarmup: {{ .cacheWarmup | quote }}
-  {{- end }}
-  {{- if .cacheWarmupBytes }}
-  cacheWarmupBytes: {{ .cacheWarmupBytes | quote }}
-  {{- end }}
-  {{- if .cacheWarmupConcurrency }}
-  cacheWarmupConcurrency: {{ .cacheWarmupConcurrency | quote }}
+  {{- with (include "ublk-azblob-csi.tuningParameters" .) }}
+  {{- . | nindent 2 }}
   {{- end }}
   {{- if .fsck }}
   fsck: {{ .fsck | quote }}
@@ -130,26 +112,8 @@ parameters:
   {{- if .overlayScratchDir }}
   overlayScratchDir: {{ .overlayScratchDir | quote }}
   {{- end }}
-  {{- if .cacheDir }}
-  cacheDir: {{ .cacheDir | quote }}
-  {{- end }}
-  {{- if .cachePageSize }}
-  cachePageSize: {{ .cachePageSize | quote }}
-  {{- end }}
-  {{- if .cacheMaxBytes }}
-  cacheMaxBytes: {{ .cacheMaxBytes | quote }}
-  {{- end }}
-  {{- if .cacheSharePages }}
-  cacheSharePages: {{ .cacheSharePages | quote }}
-  {{- end }}
-  {{- if .cacheWarmup }}
-  cacheWarmup: {{ .cacheWarmup | quote }}
-  {{- end }}
-  {{- if .cacheWarmupBytes }}
-  cacheWarmupBytes: {{ .cacheWarmupBytes | quote }}
-  {{- end }}
-  {{- if .cacheWarmupConcurrency }}
-  cacheWarmupConcurrency: {{ .cacheWarmupConcurrency | quote }}
+  {{- with (include "ublk-azblob-csi.tuningParameters" .) }}
+  {{- . | nindent 2 }}
   {{- end }}
   {{- if .fsck }}
   fsck: {{ .fsck | quote }}

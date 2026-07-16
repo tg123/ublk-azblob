@@ -69,22 +69,6 @@ const PARAM_COORDINATION: &str = "coordination";
 const PARAM_LEASE_NAMESPACE: &str = "leaseNamespace";
 const PARAM_RECOVERY_TIMEOUT_SECS: &str = "recoveryTimeoutSecs";
 const PARAM_LEASE_DURATION_SECS: &str = "leaseDurationSecs";
-/// Per-StorageClass local-disk cache tuning (StorageClass `parameters`),
-/// forwarded verbatim into the volume context. The node's `child_env` turns
-/// each into the matching `UBLK_CACHE_*` environment for *that* volume's `run`
-/// child, overriding the node DaemonSet's inherited default — so different
-/// StorageClasses can use different cache paths and options. CSI hands the node
-/// only the volume context (never the raw StorageClass parameters), so the
-/// controller must copy these through.
-const CACHE_PARAMS: &[&str] = &[
-    "cacheDir",
-    "cachePageSize",
-    "cacheMaxBytes",
-    "cacheSharePages",
-    "cacheWarmup",
-    "cacheWarmupBytes",
-    "cacheWarmupConcurrency",
-];
 /// Volume-context key carrying a blob snapshot timestamp.
 ///
 /// This is **not** a StorageClass parameter — it is only populated from a
@@ -106,10 +90,10 @@ pub struct ControllerService {
 }
 
 /// Copy each of `keys` present in `params` into `ctx` verbatim (including empty
-/// values). Used to forward StorageClass parameters the node needs (e.g. cache
-/// tuning) through the volume context, since CSI only hands the node the
-/// controller-returned volume context. Consumers that treat an empty value as
-/// "unset" (e.g. the node's `cache_env`) filter it out on their side.
+/// values). Used to forward StorageClass parameters the node needs (e.g. the
+/// coordination keys) through the volume context, since CSI only hands the node
+/// the controller-returned volume context. Consumers that treat an empty value
+/// as "unset" (e.g. the node's `tuning_env`) filter it out on their side.
 fn forward_params(
     params: &HashMap<String, String>,
     ctx: &mut HashMap<String, String>,
@@ -120,6 +104,19 @@ fn forward_params(
             ctx.insert(key.to_string(), v.clone());
         }
     }
+}
+
+/// Forward every per-volume tuning parameter (the shared
+/// [`super::TUNING_PARAMS`] table: Azure I/O concurrency / bandwidth, write-back
+/// buffer, flush timing and the local-disk cache) from the StorageClass
+/// parameters into the volume context, so the node's `child_env` can turn each
+/// into the matching `UBLK_*` environment for *this* volume's `run` child —
+/// letting different StorageClasses tune differently. CSI hands the node only
+/// the volume context (never the raw StorageClass parameters), so the controller
+/// must copy these through.
+fn forward_tuning(params: &HashMap<String, String>, ctx: &mut HashMap<String, String>) {
+    let keys: Vec<&str> = super::TUNING_PARAMS.iter().map(|(k, _)| *k).collect();
+    forward_params(params, ctx, &keys);
 }
 
 /// Expand variables in a template string
@@ -327,9 +324,9 @@ impl Controller for ControllerService {
                 if let Some(v) = req.parameters.get(PARAM_OVERLAY_SCRATCH_DIR) {
                     volume_context.insert(PARAM_OVERLAY_SCRATCH_DIR.to_string(), v.clone());
                 }
-                // Per-StorageClass local-disk cache tuning (e.g. warm-up of the
-                // immutable golden image) applies to read-only template mounts too.
-                forward_params(&req.parameters, &mut volume_context, CACHE_PARAMS);
+                // Per-StorageClass tuning (e.g. cache warm-up of the immutable
+                // golden image) applies to read-only template mounts too.
+                forward_tuning(&req.parameters, &mut volume_context);
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
                         capacity_bytes: source_size as i64,
@@ -430,10 +427,11 @@ impl Controller for ControllerService {
                 PARAM_LEASE_DURATION_SECS,
             ],
         );
-        // Per-StorageClass local-disk cache tuning (path, size, warm-up, …), so
-        // different StorageClasses can cache differently. The node's `child_env`
-        // turns these into per-volume `UBLK_CACHE_*` env.
-        forward_params(&req.parameters, &mut volume_context, CACHE_PARAMS);
+        // Per-StorageClass tuning (I/O concurrency / bandwidth, write-back
+        // buffer, flush timing, local-disk cache), so different StorageClasses
+        // can tune differently. The node's `child_env` turns these into the
+        // per-volume `UBLK_*` env.
+        forward_tuning(&req.parameters, &mut volume_context);
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {

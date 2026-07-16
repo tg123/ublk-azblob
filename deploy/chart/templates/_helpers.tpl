@@ -137,3 +137,32 @@ plugins. Only non-zero values are emitted; the binary auto-sizes the rest.
 {{- end }}
 {{- end }}
 {{- end -}}
+
+{{/*
+Render the per-StorageClass tuning parameters that the controller forwards into
+the volume context (and the node maps to `UBLK_*` env for that volume's child):
+Azure I/O concurrency / bandwidth, the in-memory write-back buffer, flush timing
+and the local-disk cache. Kept in sync with `TUNING_PARAMS` in src/csi/mod.rs.
+Call with the StorageClass `parameters` map as the context; the result is a
+newline-joined block of `key: "value"` lines (empty when no tuning key is set),
+so wrap it in `with` and `nindent`, e.g.:
+  {{- with (include "ublk-azblob-csi.tuningParameters" .) }}
+  {{- . | nindent 2 }}
+  {{- end }}
+*/}}
+{{- define "ublk-azblob-csi.tuningParameters" -}}
+{{- $params := . -}}
+{{- $out := list -}}
+{{- range $key := (list
+  "ioConcurrency" "downloadConcurrency" "uploadConcurrency"
+  "downloadBandwidth" "uploadBandwidth"
+  "pageSize" "maxDirtyPages" "maxCachedPages"
+  "idleFlushSecs" "forceFlushTimeoutSecs" "flushIoTimeoutSecs" "flushConcurrency"
+  "cacheDir" "cachePageSize" "cacheMaxBytes" "cacheSharePages" "cacheBlobIdentity"
+  "cacheWarmup" "cacheWarmupBytes" "cacheWarmupConcurrency") -}}
+{{- if hasKey $params $key -}}
+{{- $out = append $out (printf "%s: %s" $key (index $params $key | quote)) -}}
+{{- end -}}
+{{- end -}}
+{{- join "\n" $out -}}
+{{- end -}}
