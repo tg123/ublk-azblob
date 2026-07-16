@@ -257,7 +257,7 @@ storageClass:
     # overlayScratchDir: "/mnt/ssd/ublk-overlay"
 
     # ── Per-StorageClass local-disk cache overrides ─────────────────────────────
-    # These override the node-wide `node.cache.*` defaults (below) for volumes
+    # These override the node-wide `node.cache.*` defaults (above) for volumes
     # provisioned by *this* StorageClass, so different classes can cache to
     # different paths / with different options. Each is optional; when omitted the
     # volume inherits the node DaemonSet default. They apply to both freshly
@@ -271,8 +271,8 @@ storageClass:
     # Max total cache bytes for all cache processes using cacheDir (0 = unlimited).
     # Use a distinct cacheDir when classes need independent budgets.
     # cacheMaxBytes: "0"
-    # Cross-process clean-page sharing ("true"/"false"). Currently accepted but
-    # ignored by the shipped binary while sharing remains disabled.
+    # Cross-process clean-page sharing ("true"/"false"). Sharing is currently
+    # disabled, but "true" still selects a stable per-volume cache file name.
     # cacheSharePages: "false"
     # Background warm-up: prefetch the blob into the cache on start ("true"/"false").
     # cacheWarmup: "false"

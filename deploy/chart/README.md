@@ -161,7 +161,7 @@ to the logical CPU count.
 | `storageClass.parameters.cacheDir` | Per-StorageClass local-disk cache directory (overrides node-wide `node.cache.hostPath`; must be mounted into the node plugin on every node) | `""` |
 | `storageClass.parameters.cachePageSize` | Per-StorageClass local-disk cache page size in bytes (overrides `node.cache.pageSize`) | `""` |
 | `storageClass.parameters.cacheMaxBytes` | Max total cache bytes across all processes using the same `cacheDir`, `0` = unlimited (overrides `node.cache.maxBytes`). Use distinct directories for independent class budgets | `""` |
-| `storageClass.parameters.cacheSharePages` | Cross-process clean-page sharing override, `"true"`/`"false"` (overrides `node.cache.sharePages`). **Currently disabled / no-op** | `""` |
+| `storageClass.parameters.cacheSharePages` | Cross-process clean-page sharing override, `"true"`/`"false"` (overrides `node.cache.sharePages`). Sharing is currently disabled, but `"true"` still selects a stable per-volume cache file name | `""` |
 | `storageClass.parameters.cacheWarmup` | Per-StorageClass background cache warm-up on start, `"true"`/`"false"` (overrides `node.cache.warmup`) | `""` |
 | `storageClass.parameters.cacheWarmupBytes` | Per-StorageClass warm-up cap in bytes, `0` = auto (overrides `node.cache.warmupBytes`) | `""` |
 | `storageClass.parameters.cacheWarmupConcurrency` | Per-StorageClass warm-up fetch concurrency, `0` = auto | `""` |
