@@ -573,7 +573,10 @@ Key decisions:
    `cacheMaxBytes`, `cacheSharePages`, `cacheWarmup`, `cacheWarmupBytes` and
    `cacheWarmupConcurrency` are forwarded through the volume context and turned
    into the child's `UBLK_CACHE_*` env — so different classes can use different
-   cache paths and options.
+   cache paths and options. `cacheMaxBytes` applies to every process using the
+   same cache directory, so classes need distinct `cacheDir` values for
+   independent budgets. `cacheSharePages` is currently accepted but ignored by
+   the shipped binary while cross-process sharing remains disabled.
 
 The CSI protobuf is vendored at `ublk-azblob/proto/csi/csi.proto` and compiled
 by `build.rs` **only** when the `csi` feature is enabled, so the default build

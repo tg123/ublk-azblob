@@ -67,6 +67,15 @@ fn cache_env(ctx: &HashMap<String, String>) -> Vec<(String, String)> {
         .collect()
 }
 
+fn cache_share_pages(ctx: &HashMap<String, String>, inherited: Option<&str>) -> bool {
+    ctx.get("cacheSharePages")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| inherited.filter(|value| !value.is_empty()))
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
 /// A currently-published volume and the resources backing it.
 struct Published {
     /// Owned child handle when *this* process spawned the device. `None` for a
@@ -300,10 +309,8 @@ impl NodeService {
         // distinct data files and can share each other's clean pages off local
         // disk.  The blob identity defaults to the container/blob, so concurrent
         // mounts of the *same* blob share pages.
-        let share_pages = get("cacheSharePages")
-            .or_else(|| std::env::var("UBLK_CACHE_SHARE_PAGES").ok())
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
+        let inherited_share_pages = std::env::var("UBLK_CACHE_SHARE_PAGES").ok();
+        let share_pages = cache_share_pages(ctx, inherited_share_pages.as_deref());
         if share_pages {
             env.push(("UBLK_CACHE_INSTANCE".to_string(), volume_id.to_string()));
         }
@@ -798,7 +805,9 @@ impl Node for NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_env, child_blob_url, readopt_targets, split_opts, Published};
+    use super::{
+        cache_env, cache_share_pages, child_blob_url, readopt_targets, split_opts, Published,
+    };
     use crate::bloburl::parse_blob_url;
     use crate::csi::mount;
     use std::collections::HashMap;
@@ -833,9 +842,17 @@ mod tests {
         assert!(cache_env(&HashMap::new()).is_empty());
         // An explicitly-empty value is skipped (does not clobber the inherited
         // default with an empty override).
-        let ctx: HashMap<String, String> =
-            [("cacheDir".to_string(), String::new())].into_iter().collect();
+        let ctx: HashMap<String, String> = [("cacheDir".to_string(), String::new())]
+            .into_iter()
+            .collect();
         assert!(cache_env(&ctx).is_empty());
+    }
+
+    #[test]
+    fn empty_cache_share_pages_inherits_node_default() {
+        let ctx = HashMap::from([("cacheSharePages".to_string(), String::new())]);
+        assert!(cache_share_pages(&ctx, Some("true")));
+        assert!(!cache_share_pages(&ctx, Some("false")));
     }
 
     #[test]

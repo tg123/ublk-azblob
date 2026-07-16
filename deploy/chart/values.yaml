@@ -268,9 +268,11 @@ storageClass:
     # cacheDir: "/var/lib/ublk-azblob/cache"
     # Local-disk cache page size in bytes.
     # cachePageSize: "1048576"
-    # Max total cache bytes for volumes of this class (0 = unlimited).
+    # Max total cache bytes for all cache processes using cacheDir (0 = unlimited).
+    # Use a distinct cacheDir when classes need independent budgets.
     # cacheMaxBytes: "0"
-    # Cross-process clean-page sharing ("true"/"false").
+    # Cross-process clean-page sharing ("true"/"false"). Currently accepted but
+    # ignored by the shipped binary while sharing remains disabled.
     # cacheSharePages: "false"
     # Background warm-up: prefetch the blob into the cache on start ("true"/"false").
     # cacheWarmup: "false"

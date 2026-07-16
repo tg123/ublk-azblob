@@ -160,8 +160,8 @@ to the logical CPU count.
 | `storageClass.parameters.fsck` | Run `fsck` before mounting a writable, formatted volume: `"false"`/`"off"` (default, skip), `"true"`/`"preen"` (`fsck -a`), or `"force"` (`fsck -f -y`). Skipped for freshly-formatted and read-only volumes | `""` |
 | `storageClass.parameters.cacheDir` | Per-StorageClass local-disk cache directory (overrides node-wide `node.cache.hostPath`; must be mounted into the node plugin on every node) | `""` |
 | `storageClass.parameters.cachePageSize` | Per-StorageClass local-disk cache page size in bytes (overrides `node.cache.pageSize`) | `""` |
-| `storageClass.parameters.cacheMaxBytes` | Per-StorageClass max total cache bytes, `0` = unlimited (overrides `node.cache.maxBytes`) | `""` |
-| `storageClass.parameters.cacheSharePages` | Per-StorageClass cross-process clean-page sharing, `"true"`/`"false"` (overrides `node.cache.sharePages`) | `""` |
+| `storageClass.parameters.cacheMaxBytes` | Max total cache bytes across all processes using the same `cacheDir`, `0` = unlimited (overrides `node.cache.maxBytes`). Use distinct directories for independent class budgets | `""` |
+| `storageClass.parameters.cacheSharePages` | Cross-process clean-page sharing override, `"true"`/`"false"` (overrides `node.cache.sharePages`). **Currently disabled / no-op** | `""` |
 | `storageClass.parameters.cacheWarmup` | Per-StorageClass background cache warm-up on start, `"true"`/`"false"` (overrides `node.cache.warmup`) | `""` |
 | `storageClass.parameters.cacheWarmupBytes` | Per-StorageClass warm-up cap in bytes, `0` = auto (overrides `node.cache.warmupBytes`) | `""` |
 | `storageClass.parameters.cacheWarmupConcurrency` | Per-StorageClass warm-up fetch concurrency, `0` = auto | `""` |
