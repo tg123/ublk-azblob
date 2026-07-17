@@ -89,6 +89,36 @@ pub struct ControllerService {
     config: DriverConfig,
 }
 
+/// Copy each of `keys` present in `params` into `ctx` verbatim (including empty
+/// values). Used to forward StorageClass parameters the node needs (e.g. the
+/// coordination keys) through the volume context, since CSI only hands the node
+/// the controller-returned volume context. Consumers that treat an empty value
+/// as "unset" (e.g. the node's `tuning_env`) filter it out on their side.
+fn forward_params(
+    params: &HashMap<String, String>,
+    ctx: &mut HashMap<String, String>,
+    keys: &[&str],
+) {
+    for &key in keys {
+        if let Some(v) = params.get(key) {
+            ctx.insert(key.to_string(), v.clone());
+        }
+    }
+}
+
+/// Forward every per-volume tuning parameter (the shared
+/// [`super::TUNING_PARAMS`] table: Azure I/O concurrency / bandwidth, write-back
+/// buffer, flush timing and the local-disk cache) from the StorageClass
+/// parameters into the volume context, so the node's `child_env` can turn each
+/// into the matching `UBLK_*` environment for *this* volume's `run` child —
+/// letting different StorageClasses tune differently. CSI hands the node only
+/// the volume context (never the raw StorageClass parameters), so the controller
+/// must copy these through.
+fn forward_tuning(params: &HashMap<String, String>, ctx: &mut HashMap<String, String>) {
+    let keys: Vec<&str> = super::TUNING_PARAMS.iter().map(|(k, _)| *k).collect();
+    forward_params(params, ctx, &keys);
+}
+
 /// Expand variables in a template string
 fn expand_template(template: &str, pvc_name: &str, pvc_namespace: &str, pv_name: &str) -> String {
     template
@@ -294,6 +324,9 @@ impl Controller for ControllerService {
                 if let Some(v) = req.parameters.get(PARAM_OVERLAY_SCRATCH_DIR) {
                     volume_context.insert(PARAM_OVERLAY_SCRATCH_DIR.to_string(), v.clone());
                 }
+                // Per-StorageClass tuning (e.g. cache warm-up of the immutable
+                // golden image) applies to read-only template mounts too.
+                forward_tuning(&req.parameters, &mut volume_context);
                 return Ok(Response::new(CreateVolumeResponse {
                     volume: Some(Volume {
                         capacity_bytes: source_size as i64,
@@ -384,16 +417,21 @@ impl Controller for ControllerService {
         // parameters into the volume context, since CSI only hands the node the
         // volume context the controller returns — not the StorageClass parameters.
         // The node's `child_env` reads these keys to enable the cluster/blob lease.
-        for key in [
-            PARAM_COORDINATION,
-            PARAM_LEASE_NAMESPACE,
-            PARAM_RECOVERY_TIMEOUT_SECS,
-            PARAM_LEASE_DURATION_SECS,
-        ] {
-            if let Some(v) = req.parameters.get(key) {
-                volume_context.insert(key.to_string(), v.clone());
-            }
-        }
+        forward_params(
+            &req.parameters,
+            &mut volume_context,
+            &[
+                PARAM_COORDINATION,
+                PARAM_LEASE_NAMESPACE,
+                PARAM_RECOVERY_TIMEOUT_SECS,
+                PARAM_LEASE_DURATION_SECS,
+            ],
+        );
+        // Per-StorageClass tuning (I/O concurrency / bandwidth, write-back
+        // buffer, flush timing, local-disk cache), so different StorageClasses
+        // can tune differently. The node's `child_env` turns these into the
+        // per-volume `UBLK_*` env.
+        forward_tuning(&req.parameters, &mut volume_context);
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
