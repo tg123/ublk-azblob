@@ -49,6 +49,10 @@ const VERSION: u32 = 1;
 /// Fixed size of the metadata header in bytes.  The two bitmaps follow it.
 const HEADER_SIZE: u64 = 64;
 
+/// Lower bound for the concurrent cache-flush upload fan-out, in case
+/// `cpu_count()` reports an implausibly small value.
+const CACHE_FLUSH_MIN_CONCURRENCY: usize = 8;
+
 /// Configuration for the local-disk cache.
 #[derive(Debug, Clone)]
 pub struct FileCacheConfig {
@@ -126,6 +130,13 @@ struct CacheState {
     present: Vec<u8>,
     /// Bitmap: page is dirty (cached but not yet flushed to the inner backend).
     dirty: Vec<u8>,
+    /// Per-page generation counter, bumped on every write into the page
+    /// ([`dirty_page_region`]).  A concurrent flush snapshots a page's generation
+    /// before its (lock-free) upload and only clears the dirty bit afterwards if
+    /// the generation is unchanged — i.e. the page was not re-written while the
+    /// upload was in flight.  This lets `flush` release the lock during the slow
+    /// Azure round-trip and upload many pages concurrently without losing writes.
+    dirty_gen: Vec<u64>,
     /// Bytes of resident (present) page data this backend holds on disk.  Only
     /// meaningful when a budget is active.
     resident_bytes: u64,
@@ -345,6 +356,7 @@ impl FileCacheBackend {
             num_pages,
             present,
             dirty,
+            dirty_gen: vec![0u64; num_pages as usize],
             resident_bytes,
             lru,
         };
@@ -408,6 +420,7 @@ impl FileCacheBackend {
         state.num_pages = num_pages;
         state.present = vec![0u8; bitmap_bytes(num_pages)];
         state.dirty = vec![0u8; bitmap_bytes(num_pages)];
+        state.dirty_gen = vec![0u64; num_pages as usize];
         write_full_meta(
             &state.meta,
             self.page_size,
@@ -773,50 +786,6 @@ impl FileCacheBackend {
         }
     }
 
-    /// Flush a single dirty page to the inner backend and clear its dirty bit.
-    async fn flush_page(&self, state: &mut CacheState, page_idx: u64) -> anyhow::Result<()> {
-        if !bit_get(&state.dirty, page_idx) {
-            return Ok(());
-        }
-        let offset = page_idx * self.page_size;
-        let page_len = self.page_size.min(state.dev_size.saturating_sub(offset));
-        if page_len == 0 {
-            bit_set(&mut state.dirty, page_idx, false);
-            return Ok(());
-        }
-
-        let mut buf = vec![0u8; page_len as usize];
-        state
-            .data
-            .read_exact_at(&mut buf, offset)
-            .with_context(|| format!("read page {page_idx} from cache file"))?;
-
-        trace!(
-            page_idx,
-            offset,
-            len = page_len,
-            "flushing cached page to inner backend"
-        );
-        self.inner
-            .write(offset, Bytes::from(buf))
-            .await
-            .with_context(|| format!("flush page {page_idx} to inner backend"))?;
-
-        bit_set(&mut state.dirty, page_idx, false);
-        Self::persist_meta_bit(state, page_idx)?;
-        // Now clean again: the page becomes an eviction candidate.
-        if self.budget.is_some() {
-            state.lru.touch(page_idx, true);
-        }
-        // A freshly-flushed page is clean and resident, so peers caching the
-        // same blob may now read it from our data file (cross-process sharing).
-        if let Some(idx) = &self.index {
-            idx.publish(page_idx, page_len)
-                .with_context(|| format!("publish flushed page {page_idx}"))?;
-        }
-        Ok(())
-    }
-
     /// Mark a region of a page dirty after writing `payload` into the data file.
     ///
     /// The caller must have ensured the page is present.
@@ -847,6 +816,11 @@ impl FileCacheBackend {
 
         bit_set(&mut state.present, page_idx, true);
         bit_set(&mut state.dirty, page_idx, true);
+        // Bump the page generation so a flush whose upload is in flight for this
+        // page can detect the race and keep the page dirty (re-flush it later).
+        if let Some(g) = state.dirty_gen.get_mut(page_idx as usize) {
+            *g = g.wrapping_add(1);
+        }
         Self::persist_meta_bit(state, page_idx)?;
         // Account the page as resident but *not* evictable (it is dirty).  For a
         // page that was already present this just reclassifies it. A write always
@@ -1248,28 +1222,109 @@ impl BlobBackend for FileCacheBackend {
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        let dirty: Vec<u64> = (0..state.num_pages)
-            .filter(|&i| bit_get(&state.dirty, i))
-            .collect();
+        // Snapshot the set of dirty pages under a brief lock, then upload them to
+        // the inner backend *concurrently*, fanned out to
+        // `cpu_count().max(CACHE_FLUSH_MIN_CONCURRENCY)` in-flight uploads.
+        // Each upload reads its page bytes under a short lock, performs the slow
+        // Azure round-trip with the lock released, then re-acquires the lock to
+        // clear the dirty bit — but only if the page was not re-written in the
+        // meantime (detected via the per-page generation).  The previous
+        // implementation flushed strictly sequentially while holding the state
+        // lock across every round-trip, which serialized all writes and made
+        // large unmount/migration flushes take many minutes.
+        let dirty: Vec<u64> = {
+            let state = self.state.lock().await;
+            (0..state.num_pages)
+                .filter(|&i| bit_get(&state.dirty, i))
+                .collect()
+        };
 
         let flushed_any = !dirty.is_empty();
         if flushed_any {
+            // Match the central I/O gateway's concurrency budget (which auto-sizes
+            // to the logical CPU count) so the flush fully saturates it. The
+            // gateway's own semaphore is the real cap on concurrent Azure uploads,
+            // so submitting more than this would only queue, holding extra page
+            // buffers in memory; submitting fewer (the old fixed value) under-fed
+            // it.  Peak transient memory is roughly `page_size × concurrency`.
+            let concurrency = super::cpu_count().max(CACHE_FLUSH_MIN_CONCURRENCY);
             info!(
                 dirty_pages = dirty.len(),
-                "flushing dirty cache pages to inner backend"
+                concurrency, "flushing dirty cache pages to inner backend"
             );
-            with_class(IoClass::Flush, async {
-                for page_idx in dirty {
-                    self.flush_page(&mut state, page_idx).await?;
+
+            use futures::stream::StreamExt;
+            let mut stream = futures::stream::iter(dirty.into_iter().map(|page_idx| async move {
+                // Phase A: snapshot page bytes + generation under a brief lock.
+                let snapshot = {
+                    let state = self.state.lock().await;
+                    if !bit_get(&state.dirty, page_idx) {
+                        None
+                    } else {
+                        let offset = page_idx * self.page_size;
+                        let page_len = self.page_size.min(state.dev_size.saturating_sub(offset));
+                        if page_len == 0 {
+                            None
+                        } else {
+                            let mut buf = vec![0u8; page_len as usize];
+                            state
+                                .data
+                                .read_exact_at(&mut buf, offset)
+                                .with_context(|| format!("read page {page_idx} from cache file"))?;
+                            let generation =
+                                state.dirty_gen.get(page_idx as usize).copied().unwrap_or(0);
+                            Some((offset, page_len, generation, Bytes::from(buf)))
+                        }
+                    }
+                };
+                let Some((offset, page_len, generation, buf)) = snapshot else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+
+                // Phase B: upload to the inner backend without the lock held (the
+                // slow part — many of these run concurrently).
+                with_class(IoClass::Flush, self.inner.write(offset, buf))
+                    .await
+                    .with_context(|| format!("flush page {page_idx} to inner backend"))?;
+
+                // Phase C: clear the dirty bit + bookkeeping, unless the page was
+                // re-dirtied while its upload was in flight (keep it dirty so a
+                // later flush re-uploads the newer data).
+                let mut state = self.state.lock().await;
+                let current = state.dirty_gen.get(page_idx as usize).copied().unwrap_or(0);
+                if current != generation {
+                    return Ok(());
                 }
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
+                bit_set(&mut state.dirty, page_idx, false);
+                Self::persist_meta_bit(&state, page_idx)?;
+                // Now clean again: the page becomes an eviction candidate.
+                if self.budget.is_some() {
+                    state.lru.touch(page_idx, true);
+                }
+                // A freshly-flushed page is clean and resident, so peers caching
+                // the same blob may now read it from our data file.
+                if let Some(idx) = &self.index {
+                    idx.publish(page_idx, page_len)
+                        .with_context(|| format!("publish flushed page {page_idx}"))?;
+                }
+                Ok(())
+            }))
+            .buffer_unordered(concurrency);
+
+            let mut first_err: Option<anyhow::Error> = None;
+            while let Some(res) = stream.next().await {
+                if let Err(e) = res {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
         }
 
         // Propagate to the inner backend in case it buffers too.
-        drop(state);
         self.inner.flush().await?;
 
         // Flushing mutates the blob, changing its validity token.  Record the
@@ -1294,6 +1349,7 @@ impl BlobBackend for FileCacheBackend {
         let num_pages = state.num_pages;
         state.present = vec![0u8; bitmap_bytes(num_pages)];
         state.dirty = vec![0u8; bitmap_bytes(num_pages)];
+        state.dirty_gen = vec![0u64; num_pages as usize];
         // Forget all resident pages for budget/eviction accounting too.
         state.resident_bytes = 0;
         state.lru.clear();
@@ -1742,6 +1798,51 @@ mod tests {
         assert_eq!(
             inner.read(0, 512).await.unwrap(),
             Bytes::from(vec![0x02; 512])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_write_during_flush_keeps_page_dirty() {
+        // Regression test for the `dirty_gen` race that this backend's concurrent
+        // flush relies on: a write that lands while a page's upload is in flight
+        // must keep the page dirty so the newer value is re-flushed later, never
+        // silently dropped when the in-flight upload clears the dirty bit.
+        let dir = tmp_dir("flushrace");
+        let mem = Arc::new(MemBackend::new(512).unwrap());
+        let blk = BlockingBackend::new(mem.clone());
+        let (b, _) = open(blk.clone(), &dir, 512, 512);
+
+        // First write → page 0 dirty (generation 1).
+        b.write(0, Bytes::from(vec![0x01; 512])).await.unwrap();
+        assert_eq!(b.dirty_count().await, 1);
+
+        // Flush concurrently with a write injected *while the upload of the old
+        // value is paused mid-flight* (BlockingBackend pauses the first upload).
+        let flush = b.flush();
+        let inject = async {
+            blk.started.notified().await; // upload is now in flight (paused)
+            b.write(0, Bytes::from(vec![0x02; 512])).await.unwrap(); // re-dirty (gen 2)
+            blk.unblock_future_writes(); // the re-flush must complete normally
+            blk.release(); // let the paused upload of the OLD value finish
+        };
+        let (flush_res, ()) = tokio::join!(flush, inject);
+        flush_res.unwrap();
+
+        // The page was re-written during the upload, so it must remain dirty.
+        assert_eq!(
+            b.dirty_count().await,
+            1,
+            "page re-dirtied mid-flush must stay dirty"
+        );
+
+        // A second flush (no concurrent write) drains the latest value.
+        b.flush().await.unwrap();
+        assert_eq!(b.dirty_count().await, 0);
+        assert_eq!(
+            mem.read(0, 512).await.unwrap(),
+            Bytes::from(vec![0x02; 512]),
+            "the newest value must reach the inner backend"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2283,6 +2384,67 @@ mod tests {
             self.inner.read(offset, len).await
         }
         async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            self.inner.write(offset, data).await
+        }
+        async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {
+            self.inner.clear(offset, len).await
+        }
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+        async fn delete(&self) -> anyhow::Result<()> {
+            self.inner.delete().await
+        }
+        async fn size(&self) -> anyhow::Result<u64> {
+            self.inner.size().await
+        }
+    }
+
+    /// A `BlobBackend` decorator whose `write` can be paused mid-flush. While
+    /// `blocking` is set, the first upload signals `started` and then waits on
+    /// `gate` until the test releases it, so a concurrent cache write can be
+    /// injected while the upload is in flight — exercising the `dirty_gen` race
+    /// in [`FileCacheBackend::flush`]. Reads and other ops are delegated as-is.
+    struct BlockingBackend {
+        inner: Arc<dyn BlobBackend>,
+        started: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
+        blocking: std::sync::atomic::AtomicBool,
+    }
+
+    impl BlockingBackend {
+        fn new(inner: Arc<dyn BlobBackend>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                started: tokio::sync::Notify::new(),
+                gate: tokio::sync::Semaphore::new(0),
+                blocking: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+        /// Stop pausing subsequent writes (so the re-flush completes normally).
+        fn unblock_future_writes(&self) {
+            self.blocking
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Let the currently-paused in-flight upload proceed.
+        fn release(&self) {
+            self.gate.add_permits(1);
+        }
+    }
+
+    #[async_trait]
+    impl BlobBackend for BlockingBackend {
+        async fn create(&self, size: u64) -> anyhow::Result<()> {
+            self.inner.create(size).await
+        }
+        async fn read(&self, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+            self.inner.read(offset, len).await
+        }
+        async fn write(&self, offset: u64, data: Bytes) -> anyhow::Result<()> {
+            if self.blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                self.started.notify_one();
+                self.gate.acquire().await.unwrap().forget();
+            }
             self.inner.write(offset, data).await
         }
         async fn clear(&self, offset: u64, len: u64) -> anyhow::Result<()> {

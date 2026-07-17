@@ -176,6 +176,26 @@ to the logical CPU count.
 | `storageClass.parameters.overlay` | Ephemeral overlay over an immutable snapshot template: mount the snapshot read-only as the overlayfs lower and stack a writable node-local upper, so pod writes are kept local and discarded on unpublish (never reach/copy the golden image). Snapshot `templateBlobUrl` only; rejected on writable volumes; needs the `overlay` kernel filesystem | `""` |
 | `storageClass.parameters.overlayScratchDir` | Node-local filesystem backing the ephemeral overlay's writable scratch (overlayfs `upperdir`/`workdir`). Unset ⇒ scratch lives next to the CSI target (kubelet dir); set ⇒ steer pod-local writes onto a chosen mount, e.g. an SSD (large disk-backed scratch) or tmpfs (RAM-backed). Operator must pre-create/mount the path on every node; `upperdir`+`workdir` always live together in a per-volume subdir removed on unpublish. Only meaningful with `overlay` | `""` |
 | `storageClass.parameters.fsck` | Run `fsck` before mounting a writable, formatted volume: `"false"`/`"off"` (default, skip), `"true"`/`"preen"` (`fsck -a`), or `"force"` (`fsck -f -y`). Skipped for freshly-formatted and read-only volumes | `""` |
+| `storageClass.parameters.ioConcurrency` | Per-StorageClass total in-flight Azure operations, `0` = auto (overrides node-wide `io.concurrency`) | `""` |
+| `storageClass.parameters.downloadConcurrency` | Per-StorageClass download slice of the I/O budget, `0` = auto (overrides `io.downloadConcurrency`) | `""` |
+| `storageClass.parameters.uploadConcurrency` | Per-StorageClass upload slice of the I/O budget, `0` = auto (overrides `io.uploadConcurrency`) | `""` |
+| `storageClass.parameters.downloadBandwidth` | Per-StorageClass download bandwidth cap in bytes/sec, `0` = unlimited (overrides `io.downloadBandwidth`) | `""` |
+| `storageClass.parameters.uploadBandwidth` | Per-StorageClass upload bandwidth cap in bytes/sec, `0` = unlimited (overrides `io.uploadBandwidth`) | `""` |
+| `storageClass.parameters.pageSize` | Per-StorageClass in-memory write-back buffer page size in bytes; `"0"` disables buffering (write-through) | `""` |
+| `storageClass.parameters.maxDirtyPages` | Per-StorageClass max dirty (unflushed) buffer pages held in memory before back-pressure | `""` |
+| `storageClass.parameters.maxCachedPages` | Per-StorageClass max total (clean + dirty) buffer pages cached in memory | `""` |
+| `storageClass.parameters.idleFlushSecs` | Per-StorageClass flush after this many seconds idle | `""` |
+| `storageClass.parameters.forceFlushTimeoutSecs` | Per-StorageClass max seconds between forced flushes | `""` |
+| `storageClass.parameters.flushIoTimeoutSecs` | Per-StorageClass per-flush I/O timeout in seconds, `0` = auto | `""` |
+| `storageClass.parameters.flushConcurrency` | Per-StorageClass flush upload concurrency, `0` = auto | `""` |
+| `storageClass.parameters.cacheDir` | Per-StorageClass local-disk cache directory (overrides node-wide `node.cache.hostPath`; must be mounted into the node plugin on every node) | `""` |
+| `storageClass.parameters.cachePageSize` | Per-StorageClass local-disk cache page size in bytes (overrides `node.cache.pageSize`) | `""` |
+| `storageClass.parameters.cacheMaxBytes` | Max total cache bytes across all processes using the same `cacheDir`, `0` = unlimited (overrides `node.cache.maxBytes`). Use distinct directories for independent class budgets | `""` |
+| `storageClass.parameters.cacheSharePages` | Cross-process clean-page sharing override, `"true"`/`"false"` (overrides `node.cache.sharePages`). Sharing is currently disabled, but `"true"` still selects a stable per-volume cache file name | `""` |
+| `storageClass.parameters.cacheBlobIdentity` | Per-StorageClass shared-cache identity; defaults to the container/blob so mounts of the same blob share clean pages | `""` |
+| `storageClass.parameters.cacheWarmup` | Per-StorageClass background cache warm-up on start, `"true"`/`"false"` (overrides `node.cache.warmup`) | `""` |
+| `storageClass.parameters.cacheWarmupBytes` | Per-StorageClass warm-up cap in bytes, `0` = auto (overrides `node.cache.warmupBytes`) | `""` |
+| `storageClass.parameters.cacheWarmupConcurrency` | Per-StorageClass warm-up fetch concurrency, `0` = auto | `""` |
 | `storageClass.parameters.templateBlobUrl` | Golden-image template blob URL (optional SAS; `?snapshot=` ⇒ mount the immutable snapshot directly read-only, no copy/lock/lease; non-snapshot ⇒ copy into the per-PVC blob read-write and skip format) | `""` |
 
 ### Global Secret Configuration (secretSearchMode: global)

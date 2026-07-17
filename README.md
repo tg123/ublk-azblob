@@ -568,7 +568,21 @@ Key decisions:
    clean cache actually survives depends on the host path being a real
    node-persistent mount — an ephemeral `DirectoryOrCreate` is lost to pod churn
    (this is exactly the e2e-only caveat that made the cache-reload test
-   environment-sensitive).
+   environment-sensitive). The node DaemonSet sets node-wide defaults, but a
+   `StorageClass` can override them per-volume: not just the cache knobs
+   (`cacheDir`, `cachePageSize`, `cacheMaxBytes`, `cacheSharePages`,
+   `cacheBlobIdentity`, `cacheWarmup`, `cacheWarmupBytes`,
+   `cacheWarmupConcurrency`) but also the Azure I/O gateway (`ioConcurrency`,
+   `downloadConcurrency`, `uploadConcurrency`, `downloadBandwidth`,
+   `uploadBandwidth`), the in-memory write-back buffer (`pageSize`,
+   `maxDirtyPages`, `maxCachedPages`) and flush timing (`idleFlushSecs`,
+   `forceFlushTimeoutSecs`, `flushIoTimeoutSecs`, `flushConcurrency`). The
+   controller forwards each through the volume context and the node turns it into
+   the child's matching `UBLK_*` env — so different classes can tune differently.
+   `cacheMaxBytes` applies to every process using the same cache directory, so
+   classes need distinct `cacheDir` values for independent budgets. Cross-process
+   sharing is currently disabled, but setting `cacheSharePages` to true still
+   assigns a stable per-volume cache file name.
 
 The CSI protobuf is vendored at `ublk-azblob/proto/csi/csi.proto` and compiled
 by `build.rs` **only** when the `csi` feature is enabled, so the default build

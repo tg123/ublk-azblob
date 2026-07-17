@@ -65,6 +65,52 @@ pub const DRIVER_NAME: &str = "azblob.ublk.csi.tg123.github.io";
 /// Driver version reported by `GetPluginInfo` (the crate version).
 pub const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Per-StorageClass tuning knobs, mapped from their `StorageClass` `parameters`
+/// key to the `UBLK_*` environment variable each becomes for *that* volume's
+/// `run` child process.
+///
+/// These are the `run` tuning flags that make sense to vary per volume: Azure
+/// I/O concurrency / bandwidth, the in-memory write-back buffer, flush timing,
+/// and the local-disk cache. The controller forwards any of these it finds in
+/// the StorageClass `parameters` into the volume context (CSI hands the node
+/// only the volume context, never the raw parameters); the node's `child_env`
+/// then turns each present, non-empty key into the matching environment for the
+/// volume's child, overriding the node DaemonSet's inherited default — so
+/// different StorageClasses can tune differently.
+///
+/// Cluster-coordination keys (`coordination`, `leaseNamespace`, …) are handled
+/// separately by `child_env` and are intentionally *not* listed here.
+///
+/// NOTE: the Helm chart mirrors this list in the `ublk-azblob-csi.tuningParameters`
+/// template (`deploy/chart/templates/_helpers.tpl`); keep the two in sync when
+/// adding or removing a key.
+pub(crate) const TUNING_PARAMS: &[(&str, &str)] = &[
+    // Azure I/O concurrency & bandwidth caps.
+    ("ioConcurrency", "UBLK_IO_CONCURRENCY"),
+    ("downloadConcurrency", "UBLK_DOWNLOAD_CONCURRENCY"),
+    ("uploadConcurrency", "UBLK_UPLOAD_CONCURRENCY"),
+    ("downloadBandwidth", "UBLK_DOWNLOAD_BANDWIDTH"),
+    ("uploadBandwidth", "UBLK_UPLOAD_BANDWIDTH"),
+    // In-memory write-back buffer (0 pageSize = write-through).
+    ("pageSize", "UBLK_PAGE_SIZE"),
+    ("maxDirtyPages", "UBLK_MAX_DIRTY_PAGES"),
+    ("maxCachedPages", "UBLK_MAX_CACHED_PAGES"),
+    // Flush timing / concurrency.
+    ("idleFlushSecs", "UBLK_IDLE_FLUSH_SECS"),
+    ("forceFlushTimeoutSecs", "UBLK_FORCE_FLUSH_TIMEOUT_SECS"),
+    ("flushIoTimeoutSecs", "UBLK_FLUSH_IO_TIMEOUT_SECS"),
+    ("flushConcurrency", "UBLK_FLUSH_CONCURRENCY"),
+    // Local-disk cache.
+    ("cacheDir", "UBLK_CACHE_DIR"),
+    ("cachePageSize", "UBLK_CACHE_PAGE_SIZE"),
+    ("cacheMaxBytes", "UBLK_CACHE_MAX_BYTES"),
+    ("cacheSharePages", "UBLK_CACHE_SHARE_PAGES"),
+    ("cacheBlobIdentity", "UBLK_CACHE_BLOB_IDENTITY"),
+    ("cacheWarmup", "UBLK_CACHE_WARMUP"),
+    ("cacheWarmupBytes", "UBLK_CACHE_WARMUP_BYTES"),
+    ("cacheWarmupConcurrency", "UBLK_CACHE_WARMUP_CONCURRENCY"),
+];
+
 /// Which CSI services this process should serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Role {
@@ -149,6 +195,9 @@ pub async fn run_csi(
     if matches!(role, Role::Node | Role::All) {
         info!(node_id = %node_id, "enabling CSI node service");
         let node = node::NodeService::new(node_id, config);
+        // Re-adopt any volumes whose device survived a previous plugin instance,
+        // so their NodeUnpublishVolume still tears the device/overlay down.
+        node.recover();
         builder = builder.add_service(NodeServer::new(node));
     }
 
