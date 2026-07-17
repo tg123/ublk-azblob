@@ -32,6 +32,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: chart-release
+  cancel-in-progress: false
+
 jobs:
   release:
     name: package + publish chart (GitHub Pages)
@@ -50,6 +54,22 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
+      - name: Prepare GitHub Pages branch
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git worktree add --detach gh-pages-init
+            cd gh-pages-init
+            git switch --orphan gh-pages
+            touch .nojekyll
+            git add .nojekyll
+            git commit -m "Initialize Helm chart repository"
+            git push origin HEAD:gh-pages
+            cd ..
+            git worktree remove gh-pages-init
+          fi
+          git fetch origin gh-pages:refs/remotes/origin/gh-pages
+
       - name: Run chart-releaser
         uses: helm/chart-releaser-action@v1.7.0
         with:
@@ -61,14 +81,14 @@ jobs:
       - name: Publish Artifact Hub repository metadata
         run: |
           set -euo pipefail
-          git fetch origin gh-pages
-          git worktree add gh-pages gh-pages
+          git fetch origin gh-pages:refs/remotes/origin/gh-pages
+          git worktree add --detach gh-pages origin/gh-pages
           cp deploy/artifacthub-repo.yml gh-pages/artifacthub-repo.yml
           cd gh-pages
           if [ -n "$(git status --porcelain artifacthub-repo.yml)" ]; then
             git add artifacthub-repo.yml
             git commit -m "Update artifacthub-repo.yml"
-            git push origin gh-pages
+            git push origin HEAD:gh-pages
           else
             echo "artifacthub-repo.yml already up to date"
           fi
